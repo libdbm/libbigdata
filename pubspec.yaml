@@ -1,6 +1,6 @@
 name: libbigdata
 description: A pure Dart library for big data manipulation with DataFrame API and query engine.
-version: 1.0.0
+version: 1.0.1
 repository: https://github.com/libdbm/libbigdata
 issue_tracker: https://github.com/libdbm/libbigdata/issues
 

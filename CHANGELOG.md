@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.1
+
+- Fix a small linting issue.
+
 ## 1.0.0
 
 First public release.
