@@ -1,0 +1,3 @@
+{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["appendOnly","invariants","deletionVectors"]}}
+{"remove":{"path":"part-00000-ec6b8f66-5de1-5a25-881b-720f886eba97.parquet","deletionTimestamp":1781981476404,"dataChange":true}}
+{"add":{"path":"part-00000-ec6b8f66-5de1-5a25-881b-720f886eba97.parquet","partitionValues":{},"size":319,"modificationTime":1781981476376,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"id\":0,\"name\":\"n0\"},\"maxValues\":{\"id\":9,\"name\":\"n9\"},\"nullCount\":{\"id\":0,\"name\":0}}","deletionVector":{"storageType":"u","pathOrInlineDv":"&kU3COZ6+IWg0Z?eQ#@z","offset":1,"sizeInBytes":42,"cardinality":5}}}

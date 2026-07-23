@@ -1,0 +1,49 @@
+# https://dart.dev/guides/libraries/private-files
+#
+# NOTE: this file governs GitHub. It does NOT govern the published pub.dev
+# archive — `.pubignore` takes precedence over `.gitignore` and is what keeps
+# the archive at ~450 KB. Both files are load-bearing; editing one does not
+# change the other.
+
+# Created by `dart pub`
+.dart_tool/
+
+# Build output and compiled binaries
+build/
+*.exe
+
+# Resolved versions are not meaningful for a library package.
+pubspec.lock
+
+# Editor / IDE state
+.idea/
+.vscode/
+*.iml
+
+# AI assistant state and contributor instructions (local-only)
+.claude/
+.junie/
+.cursor/
+.aider*
+CLAUDE.md
+AGENTS.md
+
+# Generated data and benchmark artifacts
+/*.parquet
+benchmark/work/
+benchmark/bin/
+benchmark/results/
+benchmark/java/target/
+benchmark/java/dependency-reduced-pom.xml
+
+# Large test fixtures, DELETED 2026-07-22 (~885 MB, unreferenced by any test or
+# script, and individually over GitHub's 100 MB per-file limit). These rules
+# remain as a guard so re-downloading the datasets cannot re-bloat the repo.
+test/fixtures/citations/
+test/fixtures/shopping/
+test/fixtures/financial_data.parquet
+test/fixtures/ncr_ride_bookings.csv
+
+# Logs and OS cruft
+logs/
+.DS_Store

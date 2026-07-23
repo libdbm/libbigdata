@@ -1,0 +1,10 @@
+# Keep the build context small. (Paths are relative to repo root, the build context.)
+.dart_tool/
+build/
+benchmark/work/
+benchmark/results/
+benchmark/java/target/
+benchmark/bin/
+test/fixtures/parquet-testing/
+out_*.parquet
+*.exe

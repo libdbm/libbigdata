@@ -1,0 +1,36 @@
+# Files excluded from the published pub.dev archive.
+#
+# This is NOT redundant with .gitignore: pub only honours .gitignore inside a
+# git repository, and this project is not under version control, so without
+# this file pub packs everything (test/fixtures alone is ~900 MB, against
+# pub.dev's 100 MB limit).
+
+# Tests and their fixtures.
+test/
+dart_test.yaml
+
+# Benchmarks, including the compiled Java comparison jar.
+benchmark/
+
+# Interop harness (requires python + pyspark/deltalake/pyiceberg).
+tool/
+
+# Build and editor state.
+.dart_tool/
+.idea/
+build/
+
+# Agent and contributor instructions.
+.claude/
+AGENTS.md
+CLAUDE.md
+
+# Local build helpers.
+build.sh
+Makefile
+
+# Resolved versions are not meaningful for a library package.
+pubspec.lock
+
+# Root-level benchmark output (.gitignore has this too, but is inert with no git repo).
+/*.parquet
