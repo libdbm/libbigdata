@@ -13,7 +13,17 @@ class RowGroupReader {
   final List<thrift.SchemaElement> schema;
   final ParquetReaderOptions options;
 
-  RowGroupReader(this.reader, this.rowGroup, this.schema, this.options);
+  /// The file's leaf paths and levels, built once per file and shared by every
+  /// row group.
+  final SchemaLayout layout;
+
+  RowGroupReader(
+    this.reader,
+    this.rowGroup,
+    this.schema,
+    this.options,
+    this.layout,
+  );
 
   /// Read all columns in the row group into [Column]s keyed by column name.
   Future<Map<String, Column>> read() async {
@@ -31,8 +41,7 @@ class RowGroupReader {
         column.element,
         options,
         name: column.name,
-        allElements: schema,
-        elementIndex: column.index,
+        levels: layout.levels(column.index),
       );
 
       data[column.name] = await columnReader.read();
@@ -42,7 +51,7 @@ class RowGroupReader {
   }
 
   /// Raw per-leaf decode (values + rep/def levels, no record assembly) keyed by
-  /// dotted leaf path — drives the multi-level [DremelAssembler]. Reads ALL leaf
+  /// dotted leaf path: drives the multi-level [DremelAssembler]. Reads ALL leaf
   /// columns (no projection; nested reassembly needs every leaf).
   Future<Map<String, RawLeaf>> readRaw() async {
     final out = <String, RawLeaf>{};
@@ -53,8 +62,7 @@ class RowGroupReader {
         column.element,
         options,
         name: column.name,
-        allElements: schema,
-        elementIndex: column.index,
+        levels: layout.levels(column.index),
       );
       out[column.name] = await columnReader.readRaw();
     }
@@ -70,16 +78,15 @@ class RowGroupReader {
       if (options.columns != null && !options.columns!.contains(column.name)) {
         continue;
       }
-      final cr = ColumnReader(
+      final columnReader = ColumnReader(
         reader,
         column.chunk,
         column.element,
         options,
         name: column.name,
-        allElements: schema,
-        elementIndex: column.index,
+        levels: layout.levels(column.index),
       );
-      cursors.add((name: column.name, cursor: cr.cursor()));
+      cursors.add((name: column.name, cursor: columnReader.cursor()));
     }
     return RowGroupCursor(
       cursors,
@@ -94,7 +101,7 @@ class RowGroupReader {
 
     // Leaf paths line up with column chunks in document order; use them as
     // unique column names so nested leaves don't collide.
-    final paths = SchemaLevels.leafPaths(schema);
+    final paths = layout.paths;
 
     int chunkIndex = 0;
     for (int i = 0; i < schema.length; i++) {
@@ -126,58 +133,59 @@ class RowGroupReader {
 /// Lockstep cursor over a row group's selected column cursors. Emits ~`size`-row
 /// column maps until the group is exhausted.
 class RowGroupCursor {
-  final List<({String name, ColumnCursor cursor})> _cols;
-  final int _numRows;
+  final List<({String name, ColumnCursor cursor})> _columns;
+  final int _rows;
   final bool _tolerant;
   int _emitted = 0;
 
-  RowGroupCursor(this._cols, this._numRows, this._tolerant);
+  RowGroupCursor(this._columns, this._rows, this._tolerant);
 
   /// Next ~[size]-row slice of the selected columns, or null when exhausted.
   Future<Map<String, Column>?> next(int size) async {
     if (size <= 0) throw ArgumentError.value(size, 'size', 'must be > 0');
-    if (_cols.isEmpty) {
+    if (_columns.isEmpty) {
       // No columns selected (e.g. COUNT(*)): still surface the row count as
       // empty-column batches so consumers see the right number of rows.
-      if (_emitted >= _numRows) return null;
-      final take = (_numRows - _emitted).clamp(0, size);
+      if (_emitted >= _rows) return null;
+      final take = (_rows - _emitted).clamp(0, size);
       _emitted += take;
       return <String, Column>{};
     }
-    for (final c in _cols) {
-      await c.cursor.fill(size);
+    for (final column in _columns) {
+      await column.cursor.fill(size);
     }
     var ready = -1;
-    for (final c in _cols) {
-      final r = c.cursor.readyRows;
-      if (ready < 0 || r < ready) ready = r;
+    for (final column in _columns) {
+      final rows = column.cursor.readyRows;
+      if (ready < 0 || rows < ready) ready = rows;
     }
     if (ready <= 0) {
       // All columns exhausted. A group that emitted fewer than its declared
-      // rows is a truncated file: fail loud, or — in tolerant mode — pad the
+      // rows is a truncated file: fail loud, or (in tolerant mode) pad the
       // remaining tail with NULLs (matching the eager typed reader) so a
       // streaming read reports the same row count as an eager one.
-      if (_emitted < _numRows) {
+      if (_emitted < _rows) {
         if (!_tolerant) {
           throw FormatException(
-            'Parquet row group truncated: $_emitted of $_numRows rows',
+            'Parquet row group truncated: $_emitted of $_rows rows',
           );
         }
         // Per column: emit its own remaining real rows, then NULL-pad the
         // shortfall. A column whose chunk is intact (still has ready rows) keeps
-        // its tail; only genuinely short columns pad — matching the eager reader,
+        // its tail; only genuinely short columns pad: matching the eager reader,
         // which pads each column to its own declared length.
-        final take = (_numRows - _emitted).clamp(0, size);
+        final take = (_rows - _emitted).clamp(0, size);
         _emitted += take;
         return <String, Column>{
-          for (final c in _cols) c.name: c.cursor.takeOrPad(take),
+          for (final column in _columns)
+            column.name: column.cursor.takeOrPad(take),
         };
       }
       return null;
     }
     final take = ready < size ? ready : size;
     final out = <String, Column>{
-      for (final c in _cols) c.name: c.cursor.take(take),
+      for (final column in _columns) column.name: column.cursor.take(take),
     };
     _emitted += take;
     return out;

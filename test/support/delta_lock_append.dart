@@ -2,6 +2,8 @@
 // single row to the Delta table at args[0] with value args[1], using the
 // FileLockDeltaCommitCoordinator. Run as a SEPARATE OS process (fcntl locks are
 // per-process), several concurrently, to prove no commit is lost.
+import 'dart:io';
+
 import 'package:libbigdata/libbigdata.dart';
 
 Future<void> main(List<String> args) async {
@@ -11,7 +13,7 @@ Future<void> main(List<String> args) async {
     path,
     coordinator: const FileLockDeltaCommitCoordinator(),
   );
-  await writer.write(
+  final outcome = await writer.write(
     Table(
       name: 't',
       columns: [
@@ -22,4 +24,8 @@ Future<void> main(List<String> args) async {
       ),
     ),
   );
+  if (outcome case Err(:final error)) {
+    stderr.writeln(error);
+    exit(1);
+  }
 }

@@ -1,4 +1,4 @@
-// GENERATED from pyiceberg-written manifests — canonical Iceberg Avro
+// GENERATED from pyiceberg-written manifests: canonical Iceberg Avro
 // schemas (carry the field-id attributes Spark/pyiceberg/DuckDB require).
 // Captured from pyiceberg-written manifests; do not hand-edit.
 

@@ -5,9 +5,12 @@ import 'dart:io';
 import '../../core/table.dart';
 import '../../core/schema.dart';
 import '../../core/decimal.dart';
+import '../../core/encoding.dart' show resolveEncoding;
 import '../../core/paths.dart';
-import '../../core/ids.dart' as ids;
 import 'json_reader.dart' show JsonOptions;
+import 'package:meta/meta.dart';
+import '../../core/failure.dart';
+import '../../core/result.dart';
 
 /// Make non-JSON-native values encodable: temporal columns hold [DateTime]
 /// (→ ISO-8601) and a decimal arrives from [Table.row] as a [Decimal]
@@ -17,11 +20,13 @@ import 'json_reader.dart' show JsonOptions;
 /// Decimals and BigInts are emitted as QUOTED STRINGS, on purpose: a JSON number
 /// is IEEE-754 double on essentially every consumer, so `12345678901234567890`
 /// or `0.30` would silently round. Dart's [JsonEncoder] also cannot emit a raw
-/// unquoted decimal token — only a double — so a string is the sole exact wire
+/// unquoted decimal token (only a double) so a string is the sole exact wire
 /// form. A consumer that wants a number parses the string; a round-trip back
 /// through [JsonReader] re-infers the field as `string` (it has no schema to say
 /// otherwise). This is a deliberate exactness-over-type-fidelity tradeoff.
 Object? _toEncodable(Object? value) {
+  // JSON has no NaN or infinity; they write as null.
+  if (value is double && !value.isFinite) return null;
   if (value is DateTime) return value.toUtc().toIso8601String();
   if (value is Decimal) return value.toString();
   if (value is BigInt) return value.toString();
@@ -29,7 +34,7 @@ Object? _toEncodable(Object? value) {
 }
 
 /// JSON writer for exporting data to JSON format
-class JsonWriter {
+final class JsonWriter {
   final JsonOptions options;
   late final JsonEncoder _encoder;
 
@@ -46,43 +51,44 @@ class JsonWriter {
   /// `execute(maxRows: null, maxBytes: null)` + one giant encoded string). JSON
   /// Lines and compact arrays stream; a PRETTY-PRINTED array keeps the buffered
   /// path (human-readable output, typically small).
-  Future<void> writeFile(Stream<Table> batches, String path) async {
-    final useJsonLines =
-        options.jsonLines ||
-        path.endsWith('.jsonl') ||
-        path.endsWith('.ndjson');
-    if (!useJsonLines && options.prettyPrint) {
-      await _writeTableToFile(await _collect(batches), path, false);
+  ///
+  /// Like every write here, a failure is reported as an [Err] ([Kind.io] when
+  /// the file cannot be written), with no partial file left behind.
+  @useResult
+  Future<Result<void, ErrorDetails>> writeFile(
+    Stream<Table> batches,
+    String path,
+  ) => capture(() => _writeFile(batches, path));
+
+  /// Whether [path] gets JSON Lines: by the options, or by its `.jsonl` or
+  /// `.ndjson` extension, which the reader goes by too.
+  bool _lines(String path) =>
+      options.jsonLines || path.endsWith('.jsonl') || path.endsWith('.ndjson');
+
+  Future<void> _writeFile(Stream<Table> batches, String path) async {
+    final delimited = _lines(path);
+    if (!delimited && options.prettyPrint) {
+      await _write(await _collect(batches), path, false);
       return;
     }
-    final temp = '$path.${ids.token()}.tmp';
-    final sink = File(temp).openWrite();
-    try {
-      await _streamJson(batches, sink, jsonLines: useJsonLines);
-      await sink.flush();
-      await sink.close();
-      await syncFile(temp); // IOSink.flush is not an fsync
-      await replaceAtomic(File(temp), path);
-    } catch (_) {
-      try {
-        await sink.close();
-      } catch (_) {
-        /* already closing/closed */
-      }
-      final f = File(temp);
-      if (await f.exists()) await f.delete();
-      rethrow;
-    }
+    await publishSink(
+      path,
+      (sink) => _stream(batches, sink, jsonLines: delimited),
+      encoding: _encoding,
+    );
   }
 
   /// Write DataFrame as JSON Lines to a caller-provided sink, streaming.
-  Future<void> writeJsonLinesToStream(Stream<Table> batches, IOSink sink) =>
-      _streamJson(batches, sink, jsonLines: true);
+  @useResult
+  Future<Result<void, ErrorDetails>> writeJsonLinesToStream(
+    Stream<Table> batches,
+    IOSink sink,
+  ) => capture(() => _stream(batches, sink, jsonLines: true));
 
   /// Stream a DataFrame to [sink] as JSON Lines (one compact object per line) or
   /// a compact array (`[`, comma-separated elements, `]`), batch-by-batch so the
   /// whole result is never materialized.
-  Future<void> _streamJson(
+  Future<void> _stream(
     Stream<Table> batches,
     IOSink sink, {
     required bool jsonLines,
@@ -95,7 +101,7 @@ class JsonWriter {
       for (int i = 0; i < table.rowCount; i++) {
         if (wrote) buffer.write(jsonLines ? '\n' : ',');
         wrote = true;
-        buffer.write(encoder.convert(_jsonRow(table, i)));
+        buffer.write(encoder.convert(_row(table, i)));
         if (buffer.length >= 1 << 20) {
           sink.write(buffer.toString());
           buffer.clear();
@@ -107,15 +113,15 @@ class JsonWriter {
   }
 
   /// Write [table] rows as JSON Lines to [sink]. Encodes compactly (pretty-print
-  /// would break the line-delimited format) and flushes in ~1MB batches — a
+  /// would break the line-delimited format) and flushes in ~1MB batches: a
   /// per-row IOSink.write is ~25x slower for large files.
-  void _writeRowsJsonLines(Table table, IOSink sink) {
+  void _writeLines(Table table, IOSink sink) {
     final encoder = JsonEncoder(_toEncodable);
     final buffer = StringBuffer();
     final n = table.rowCount;
     for (int i = 0; i < n; i++) {
       if (i > 0) buffer.write('\n');
-      buffer.write(encoder.convert(_jsonRow(table, i)));
+      buffer.write(encoder.convert(_row(table, i)));
       if (buffer.length >= 1 << 20) {
         sink.write(buffer.toString());
         buffer.clear();
@@ -126,47 +132,33 @@ class JsonWriter {
 
   /// Build row [i] as a JSON object, dropping nulls per [options]. Decimal and
   /// DateTime are rendered by the encoder ([_toEncodable]).
-  Map<String, dynamic> _jsonRow(Table table, int i) {
+  Map<String, dynamic> _row(Table table, int i) {
     final row = table.row(i);
     return options.includeNulls ? row : _removeNulls(row);
   }
 
   /// Write Table to JSON file
-  Future<void> writeTable(Table table, String path) async {
-    await _writeTableToFile(table, path, options.jsonLines);
-  }
+  @useResult
+  Future<Result<void, ErrorDetails>> writeTable(Table table, String path) =>
+      capture(() => _write(table, path, _lines(path)));
 
   /// Write [table] to [path], crash-safely: encode into a temp file and
   /// atomically replace the destination on success, so a mid-write failure can't
   /// destroy the previous good output.
-  Future<void> _writeTableToFile(
-    Table table,
-    String path,
-    bool jsonLines,
-  ) async {
-    final temp = '$path.${ids.token()}.tmp';
-    final file = File(temp);
-
-    try {
-      if (jsonLines) {
-        final sink = file.openWrite();
-        try {
-          _writeRowsJsonLines(table, sink);
-        } finally {
-          await sink.flush();
-          await sink.close();
-        }
-        await syncFile(temp); // IOSink.flush is not an fsync
-      } else {
-        await file.writeAsString(
-          _encoder.convert(_tableToJsonList(table)),
-          flush: true,
-        );
-      }
-      await replaceAtomic(file, path);
-    } catch (_) {
-      if (await file.exists()) await file.delete();
-      rethrow;
+  Future<void> _write(Table table, String path, bool jsonLines) async {
+    if (jsonLines) {
+      await publishSink(
+        path,
+        (sink) async => _writeLines(table, sink),
+        encoding: _encoding,
+      );
+    } else {
+      await publish(
+        path,
+        (temp) => File(
+          temp,
+        ).writeAsString(_encoder.convert(_rows(table)), encoding: _encoding),
+      );
     }
   }
 
@@ -175,8 +167,8 @@ class JsonWriter {
   /// which recopies all prior rows each step (O(n^2) over the stream).
   Future<Table> _collect(Stream<Table> batches) async {
     final tables = <Table>[];
-    await for (final b in batches) {
-      tables.add(b);
+    await for (final batch in batches) {
+      tables.add(batch);
     }
     return tables.isEmpty
         ? Table.empty('json_data', Schema(fields: const []))
@@ -193,23 +185,26 @@ class JsonWriter {
       final encoder = JsonEncoder(_toEncodable);
       for (int i = 0; i < table.rowCount; i++) {
         if (i > 0) buffer.write('\n');
-        buffer.write(encoder.convert(_jsonRow(table, i)));
+        buffer.write(encoder.convert(_row(table, i)));
       }
       return buffer.toString();
     } else {
-      final rows = _tableToJsonList(table);
+      final rows = _rows(table);
       return _encoder.convert(rows);
     }
   }
 
   /// Convert table to list of JSON objects
-  List<Map<String, dynamic>> _tableToJsonList(Table table) {
+  List<Map<String, dynamic>> _rows(Table table) {
     final rows = <Map<String, dynamic>>[];
     for (int i = 0; i < table.rowCount; i++) {
-      rows.add(_jsonRow(table, i));
+      rows.add(_row(table, i));
     }
     return rows;
   }
+
+  /// The configured [JsonOptions.encoding].
+  Encoding get _encoding => resolveEncoding(options.encoding);
 
   /// Remove null values from a row
   Map<String, dynamic> _removeNulls(Map<String, dynamic> row) {
@@ -218,17 +213,21 @@ class JsonWriter {
 }
 
 extension TableJsonWriterExtension on Table {
-  /// Write this table to a JSON file
-  Future<void> writeJson(String filePath, [JsonOptions? options]) async {
-    final writer = JsonWriter(options);
-    await writer.writeTable(this, filePath);
-  }
+  /// Write this table to a JSON file, reporting a failure as
+  /// [JsonWriter.writeTable] does.
+  @useResult
+  Future<Result<void, ErrorDetails>> writeJson(
+    String filePath, [
+    JsonOptions? options,
+  ]) => JsonWriter(options).writeTable(this, filePath);
 
   /// Write this table to a JSON Lines file
-  Future<void> writeJsonLines(String filePath, [JsonOptions? options]) async {
-    final writer = JsonWriter(options ?? JsonOptions.jsonLines());
-    await writer.writeTable(this, filePath);
-  }
+  @useResult
+  Future<Result<void, ErrorDetails>> writeJsonLines(
+    String filePath, [
+    JsonOptions? options,
+  ]) =>
+      JsonWriter(options ?? JsonOptions.jsonLines()).writeTable(this, filePath);
 
   /// Convert this table to JSON string
   String toJson([JsonOptions? options]) {

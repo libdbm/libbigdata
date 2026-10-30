@@ -10,9 +10,233 @@ import 'package:libbigdata/src/formats/delta/deletion_vector.dart';
 import 'package:libbigdata/src/formats/delta/delta_log.dart';
 import 'package:libbigdata/src/formats/delta/delta_schema.dart';
 import 'package:libbigdata/src/formats/delta/roaring_bitmap.dart';
+import 'package:libbigdata/src/sql/execution/dml.dart';
 import 'package:test/test.dart';
 
+import 'support/results.dart';
+
 void main() {
+  group('commit coordinator claims and conflicts', () {
+    late Directory dir;
+    late String path;
+    setUp(() {
+      dir = Directory.systemTemp.createTempSync('delta_claims_');
+      path = '${dir.path}/t';
+    });
+    tearDown(() => dir.deleteSync(recursive: true));
+
+    Table ids(List<int> values) => Table(
+      name: 't',
+      columns: [
+        NumericColumn.int64(name: 'id', values: values, nullable: false),
+      ],
+      schema: Schema(
+        fields: [Field(name: 'id', dataType: DataType.int64, nullable: false)],
+      ),
+    );
+
+    /// A fresh 0-byte claim on [version], as a writer that crashed between
+    /// claiming the slot and publishing leaves behind.
+    void crashedClaim(int version) => File(
+      '$path/_delta_log/${version.toString().padLeft(20, '0')}.json',
+    ).writeAsBytesSync(const []);
+
+    Future<Set<Object?>> read() async =>
+        (await DeltaTable(path).read().ok).column('id')!.toList().toSet();
+
+    test('under the file lock a crashed claim is reclaimed at once', () async {
+      await DeltaWriter(path).write(ids([1])).ok;
+      crashedClaim(1);
+      final watch = Stopwatch()..start();
+      final version = await DeltaWriter(
+        path,
+        coordinator: const FileLockDeltaCommitCoordinator(),
+      ).write(ids([2]), mode: DeltaWriteMode.append).ok;
+      expect(version, 1, reason: 'the crashed slot is reused');
+      expect(watch.elapsed, lessThan(const Duration(seconds: 2)));
+      expect(await read(), {1, 2});
+    });
+
+    test('exhausted retries return a conflict', () async {
+      await DeltaWriter(path).write(ids([1])).ok;
+      crashedClaim(1); // fresh: the default coordinator must contend with it
+      await expectLater(
+        DeltaWriter(
+          path,
+          coordinator: const FilesystemDeltaCommitCoordinator(maxRetries: 0),
+        ).write(ids([2]), mode: DeltaWriteMode.append),
+        failsWith(Kind.conflict),
+      );
+      // Its data file is cleaned up rather than left as an orphan.
+      final parts = Directory(
+        path,
+      ).listSync().whereType<File>().where((f) => f.path.endsWith('.parquet'));
+      expect(parts.length, 1);
+    });
+
+    test('a concurrent appendOnly=true commit aborts a DELETE', () async {
+      await DeltaWriter(path).write(ids([1, 2, 3])).ok;
+      final log = DeltaLog(path);
+      final meta =
+          (await log.snapshot()).metadata.toJson()['metaData']
+              as Map<String, dynamic>;
+      // Another writer turns on appendOnly while the DELETE is in flight.
+      final concurrent = _BeforeCommit(() async {
+        await log.commit(1, [
+          {
+            'metaData': {
+              ...meta,
+              'configuration': {
+                ...(meta['configuration'] as Map? ?? const {}),
+                'delta.appendOnly': 'true',
+              },
+            },
+          },
+        ]);
+      });
+      await expectLater(
+        DeltaWriter(
+          path,
+          coordinator: concurrent,
+        ).delete((row) => row['id'] == 2),
+        failsWith(Kind.conflict),
+      );
+      expect(await read(), {1, 2, 3});
+    });
+  });
+
+  group('Parquet checkpoints', () {
+    late Directory dir;
+    late String table;
+    setUp(() {
+      dir = Directory.systemTemp.createTempSync('delta_checkpoint_');
+      table = '${dir.path}/t';
+      // A delta-rs table: commits 0..11 with a delete at 9 and a standard
+      // `_last_checkpoint` + `9.checkpoint.parquet`. Copied so tests may damage
+      // it.
+      copyDirectory(Directory('test/fixtures/delta/rs_checkpoint'), table);
+    });
+    tearDown(() => dir.deleteSync(recursive: true));
+
+    const live = [
+      0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, //
+      100, 101, 102, 103,
+    ];
+
+    Future<List<Object?>> ids({int? version}) async {
+      final rows = (await DeltaTable(
+        table,
+      ).read(version: version).ok).column('id')!;
+      return rows.toList()..sort((a, b) => (a as int).compareTo(b as int));
+    }
+
+    test('a table with a Parquet checkpoint reads correctly', () async {
+      expect(await ids(), live);
+    });
+
+    test('the read starts at the checkpoint, not version 0', () async {
+      // A commit before the checkpoint is never replayed, so garbage there
+      // must not matter.
+      File(
+        '$table/_delta_log/00000000000000000002.json',
+      ).writeAsStringSync('not json\n');
+      expect(await ids(), live);
+      expect(await ids(version: 10), live.where((id) => id < 102).toList());
+    });
+
+    /// Delete the JSON commits [from] to [to] from [path]'s log, as an engine's
+    /// log retention does once a checkpoint covers them.
+    void clean(String path, int from, int to) {
+      for (var v = from; v <= to; v++) {
+        File(
+          '$path/_delta_log/${v.toString().padLeft(20, '0')}.json',
+        ).deleteSync();
+      }
+    }
+
+    test('a cleaned-up log reads from the checkpoint', () async {
+      clean(table, 0, 9);
+      expect(await ids(), live);
+    });
+
+    test('a 2-part checkpoint reads with earlier commits cleaned up', () async {
+      final multipart = '${dir.path}/multipart';
+      copyDirectory(Directory('test/fixtures/delta/rs_multipart'), multipart);
+      clean(multipart, 0, 9);
+      final rows =
+          (await DeltaTable(multipart).read().ok).column('id')!.toList()
+            ..sort((a, b) => (a as int).compareTo(b as int));
+      expect(rows, live);
+    });
+
+    test(
+      'checkpoints are found by listing, not only _last_checkpoint',
+      () async {
+        // delta-rs: commits 0..9 append ids 2v and 2v+1, checkpoints at 7
+        // and 9, then commits 0..6 deleted by log cleanup.
+        final cleaned = '${dir.path}/cleaned';
+        copyDirectory(Directory('test/fixtures/delta/rs_cleaned'), cleaned);
+        Future<int> count({int? version}) async =>
+            (await DeltaTable(cleaned).read(version: version).ok).rowCount;
+        expect(await count(), 20);
+        // Before the checkpoint _last_checkpoint names.
+        expect(await count(version: 7), 16);
+        expect(await count(version: 8), 18);
+        File('$cleaned/_delta_log/_last_checkpoint').deleteSync();
+        expect(await count(), 20);
+        expect(await count(version: 7), 16);
+      },
+    );
+
+    test('a gap after the checkpoint still throws', () async {
+      clean(table, 10, 10);
+      await expectLater(
+        DeltaTable(table).read(),
+        failsWith(Kind.corrupt, contains('version 10 is missing')),
+      );
+    });
+
+    test(
+      'a V2 checkpoint with sidecar files is rejected, not misread',
+      () async {
+        final checkpoint =
+            '$table/_delta_log/00000000000000000009.checkpoint.parquet';
+        await ParquetWriter(checkpoint)
+            .write(
+              Table(
+                name: 'checkpoint',
+                schema: Schema(
+                  fields: [
+                    Field(
+                      name: 'sidecar',
+                      dataType: DataType.struct,
+                      nullable: true,
+                      children: [
+                        Field(name: 'path', dataType: DataType.string),
+                      ],
+                    ),
+                  ],
+                ),
+                columns: [
+                  ListColumn(
+                    name: 'sidecar',
+                    dataType: DataType.struct,
+                    data: [
+                      {'path': 'abc.parquet'},
+                    ],
+                  ),
+                ],
+              ),
+            )
+            .ok;
+        await expectLater(
+          DeltaTable(table).read(),
+          failsWith(Kind.unsupported),
+        );
+      },
+    );
+  });
+
   group('core: write / read / time-travel', () {
     Table ids(List<int> ids) => Table(
       name: 't',
@@ -37,7 +261,7 @@ void main() {
       void roundTrip(Set<int> values, String reason) {
         final bytes = Roaring.serializeTreemap(values);
         expect(
-          Roaring.deserializeTreemap(bytes),
+          Roaring.deserializeToBitmap(bytes).values.toSet(),
           equals(values),
           reason: reason,
         );
@@ -70,8 +294,8 @@ void main() {
       tearDown(() => dir.deleteSync(recursive: true));
 
       test('create then read round-trips', () async {
-        await DeltaWriter(path).write(ids([1, 2, 3]));
-        final t = await (await DataFrameIO.readDelta(path)).execute();
+        await DeltaWriter(path).write(ids([1, 2, 3])).ok;
+        final t = await (await DataFrameIO.readDelta(path).ok).execute().ok;
         expect(t.rowCount, 3);
         expect(t.column('id')!.toList(), [1, 2, 3]);
         expect(t.column('name')!.toList(), ['n1', 'n2', 'n3']);
@@ -80,10 +304,12 @@ void main() {
 
       test('append accumulates files; time travel sees each version', () async {
         final w = DeltaWriter(path);
-        await w.write(ids([1, 2])); // v0
-        await w.write(ids([3, 4])); // v1 (append)
+        await w.write(ids([1, 2])).ok; // v0
+        await w.write(ids([3, 4])).ok; // v1 (append)
 
-        final latest = await (await DataFrameIO.readDelta(path)).execute();
+        final latest = await (await DataFrameIO.readDelta(
+          path,
+        ).ok).execute().ok;
         expect(latest.rowCount, 4);
         expect((latest.column('id')!.toList().cast<int>()..sort()), [
           1,
@@ -95,16 +321,16 @@ void main() {
         final v0 = await (await DataFrameIO.readDelta(
           path,
           version: 0,
-        )).execute();
+        ).ok).execute().ok;
         expect(v0.rowCount, 2);
         expect(v0.column('id')!.toList(), [1, 2]);
       });
 
       test('overwrite replaces all data', () async {
         final w = DeltaWriter(path);
-        await w.write(ids([1, 2, 3]));
-        await w.write(ids([9]), mode: DeltaWriteMode.overwrite);
-        final t = await (await DataFrameIO.readDelta(path)).execute();
+        await w.write(ids([1, 2, 3])).ok;
+        await w.write(ids([9]), mode: DeltaWriteMode.overwrite).ok;
+        final t = await (await DataFrameIO.readDelta(path).ok).execute().ok;
         expect(t.column('id')!.toList(), [9]);
       });
     });
@@ -122,13 +348,15 @@ void main() {
         'delete marks rows; read excludes them; time travel restores',
         () async {
           final w = DeltaWriter(path);
-          await w.write(ids(List.generate(1000, (i) => i))); // v0
-          final v = await w.delete(
-            (row) => (row['id'] as int) >= 500,
-          ); // v1, DV
+          await w.write(ids(List.generate(1000, (i) => i))).ok; // v0
+          final v = await w
+              .delete((row) => (row['id'] as int) >= 500)
+              .ok; // v1, DV
           expect(v, 1);
 
-          final after = await (await DataFrameIO.readDelta(path)).execute();
+          final after = await (await DataFrameIO.readDelta(
+            path,
+          ).ok).execute().ok;
           expect(after.rowCount, 500);
           final vals = after.column('id')!.toList().cast<int>();
           expect(vals.first, 0);
@@ -138,7 +366,7 @@ void main() {
           final before = await (await DataFrameIO.readDelta(
             path,
             version: 0,
-          )).execute();
+          ).ok).execute().ok;
           expect(before.rowCount, 1000);
         },
       );
@@ -147,10 +375,10 @@ void main() {
         'a second delete merges with the existing deletion vector',
         () async {
           final w = DeltaWriter(path);
-          await w.write(ids(List.generate(10, (i) => i))); // v0
-          await w.delete((row) => (row['id'] as int) == 0); // v1
-          await w.delete((row) => (row['id'] as int) == 9); // v2 (merges)
-          final t = await (await DataFrameIO.readDelta(path)).execute();
+          await w.write(ids(List.generate(10, (i) => i))).ok; // v0
+          await w.delete((row) => (row['id'] as int) == 0).ok; // v1
+          await w.delete((row) => (row['id'] as int) == 9).ok; // v2 (merges)
+          final t = await (await DataFrameIO.readDelta(path).ok).execute().ok;
           expect(t.column('id')!.toList(), [1, 2, 3, 4, 5, 6, 7, 8]);
         },
       );
@@ -201,28 +429,28 @@ void main() {
 
     group('append schema validation', () {
       test('a matching-schema append succeeds', () async {
-        await DeltaWriter(tbl).write(t([0, 1]));
-        await DeltaWriter(tbl).write(t([2, 3]));
-        expect((await DeltaTable(tbl).read()).rowCount, 4);
+        await DeltaWriter(tbl).write(t([0, 1])).ok;
+        await DeltaWriter(tbl).write(t([2, 3])).ok;
+        expect((await DeltaTable(tbl).read().ok).rowCount, 4);
       });
 
       test('a mismatched-schema append throws', () async {
-        await DeltaWriter(tbl).write(t([0, 1]));
+        await DeltaWriter(tbl).write(t([0, 1])).ok;
         await expectLater(
           DeltaWriter(tbl).write(wide([2])),
-          throwsA(isA<StateError>()),
+          failsWith(Kind.schema),
         );
-        expect((await DeltaTable(tbl).read()).rowCount, 2); // unchanged
+        expect((await DeltaTable(tbl).read().ok).rowCount, 2); // unchanged
       });
 
       test(
         'an append revalidates schema against the latest snapshot at commit time',
         () async {
-          await DeltaWriter(tbl).write(t([0, 1])); // v0, schema {id,name}
+          await DeltaWriter(tbl).write(t([0, 1])).ok; // v0, schema {id,name}
 
           // Simulate an EXTERNAL writer evolving the schema (a Metadata-only
           // commit at v1). The append below claims v2, so it must revalidate
-          // against THIS latest snapshot — not the schema it saw earlier.
+          // against THIS latest snapshot, not the schema it saw earlier.
           await DeltaLog(tbl).commit(1, [
             Metadata(
               id: 'external',
@@ -233,7 +461,7 @@ void main() {
 
           await expectLater(
             DeltaWriter(tbl).write(t([2, 3])), // still schema {id,name}
-            throwsA(isA<StateError>()),
+            failsWith(Kind.schema),
           );
 
           // The rejected append must leave no orphaned data file behind (only
@@ -254,15 +482,20 @@ void main() {
       // serialize the second sees the key and UPDATEs. Either way the key is
       // present exactly once (without the conflict check, a race duplicates it).
       test('concurrent upserts of the same key never duplicate it', () async {
-        await DeltaWriter(tbl).write(t([0, 1, 2]));
+        await DeltaWriter(tbl).write(t([0, 1, 2])).ok;
         final source = t([9], ['s9']);
-        Future<int?> upsert() => DeltaWriter(tbl)
-            .merge(source, on: ['id'], whenNotMatchedInsert: true)
-            .catchError((e) => e is StateError ? -1 : throw e);
+        Future<Result<int, ErrorDetails>> upsert() => DeltaWriter(
+          tbl,
+        ).merge(source, on: ['id'], whenNotMatchedInsert: true);
 
-        await Future.wait([upsert(), upsert()]);
+        // A writer that read a stale basis aborts with a conflict.
+        for (final outcome in await Future.wait([upsert(), upsert()])) {
+          if (outcome case Err(:final error)) {
+            expect(error.kind, Kind.conflict, reason: error.message);
+          }
+        }
 
-        final rows = (await DeltaTable(tbl).read()).toRows();
+        final rows = (await DeltaTable(tbl).read().ok).toRows();
         expect(rows.where((r) => r['id'] == 9).length, 1);
         expect(rows.length, 4); // 0,1,2 + a single 9
       });
@@ -278,9 +511,9 @@ void main() {
       }
 
       test('a trailing 0-byte commit is ignored on read', () async {
-        await DeltaWriter(tbl).write(t([0, 1])); // v0
+        await DeltaWriter(tbl).write(t([0, 1])).ok; // v0
         crashClaim(1); // 0-byte v1
-        final rows = (await DeltaTable(tbl).read()).toRows();
+        final rows = (await DeltaTable(tbl).read().ok).toRows();
         expect(rows.map((r) => r['id']).toList()..sort(), [
           0,
           1,
@@ -288,43 +521,47 @@ void main() {
       });
 
       test('a fresh 0-byte tail is contended, not advanced past', () async {
-        await DeltaWriter(tbl).write(t([0, 1])); // v0
-        // A fresh claim is indistinguishable from a live in-flight commit;
-        // advancing to v2 would gap the log and commit against stale state, so
-        // the writer contends and fails rather than skipping it.
+        await DeltaWriter(tbl).write(t([0, 1])).ok; // v0
+        // Without the file lock a fresh claim is indistinguishable from a
+        // live in-flight commit; advancing to v2 would gap the log and commit
+        // against stale state, so the writer contends and fails rather than
+        // skipping it. (Under the default file lock it is reclaimed instead.)
         crashClaim(1);
         await expectLater(
-          DeltaWriter(tbl, maxRetries: 2).write(t([2])),
-          throwsA(isA<StateError>()),
+          DeltaWriter(
+            tbl,
+            coordinator: const FilesystemDeltaCommitCoordinator(maxRetries: 2),
+          ).write(t([2])),
+          failsWith(Kind.conflict),
         );
       });
 
       test('the table self-heals once a stale crash orphan ages out', () async {
-        await DeltaWriter(tbl).write(t([0, 1])); // v0
+        await DeltaWriter(tbl).write(t([0, 1])).ok; // v0
         crashClaim(1);
         // Age the orphan past the reclaim window (a real crash), so the next
         // write reclaims v1 and appends contiguously.
         final claim = '$tbl/_delta_log/${DeltaLog.commitFileName(1)}';
         final r = await Process.run('touch', ['-t', '202001010000', claim]);
         expect(r.exitCode, 0, reason: 'touch failed: ${r.stderr}');
-        await DeltaWriter(tbl).write(t([2]));
-        final rows = (await DeltaTable(tbl).read()).toRows();
+        await DeltaWriter(tbl).write(t([2])).ok;
+        final rows = (await DeltaTable(tbl).read().ok).toRows();
         expect(rows.map((r) => r['id']).toList()..sort(), [0, 1, 2]);
       });
 
       test('explicitly reading an incomplete version throws', () async {
-        await DeltaWriter(tbl).write(t([0])); // v0
+        await DeltaWriter(tbl).write(t([0])).ok; // v0
         crashClaim(1);
         await expectLater(
           DeltaTable(tbl).read(version: 1),
-          throwsA(isA<StateError>()),
+          failsWith(Kind.corrupt),
         );
       });
 
       test(
         'checkpoint sweeps a stale 0-byte orphan but keeps a recent claim',
         () async {
-          await DeltaWriter(tbl).write(t([0, 1])); // v0
+          await DeltaWriter(tbl).write(t([0, 1])).ok; // v0
           crashClaim(1); // will be backdated → stale, should be swept
           crashClaim(2); // fresh → within TTL, must be preserved
           final stale = '$tbl/_delta_log/${DeltaLog.commitFileName(1)}';
@@ -366,7 +603,7 @@ void main() {
       final t = await (await DataFrameIO.readDelta(
         path,
         version: version,
-      )).execute();
+      ).ok).execute().ok;
       return {for (final r in t.toRows()) r['id'] as int: r['name'] as String?};
     }
 
@@ -381,7 +618,7 @@ void main() {
     test('the default writer is fenced (holds the commit lock)', () async {
       await DeltaWriter(
         path,
-      ).write(t([1, 2])); // default = FileLock coordinator
+      ).write(t([1, 2])).ok; // default = FileLock coordinator
       expect(await read(path), {1: 'n1', 2: 'n2'});
       expect(File('$path/_delta_log/_commit.lock').existsSync(), isTrue);
     });
@@ -391,10 +628,10 @@ void main() {
         'updates matching rows; time travel preserves the original',
         () async {
           final w = DeltaWriter(path);
-          await w.write(t([0, 1, 2, 3, 4])); // v0
+          await w.write(t([0, 1, 2, 3, 4])).ok; // v0
           final v = await w.update((r) => (r['id'] as int) >= 3, {
             'name': (r) => 'X',
-          });
+          }).ok;
           expect(v, 1);
 
           final after = await read(path);
@@ -406,9 +643,11 @@ void main() {
 
       test('no match is a no-op (-1)', () async {
         final w = DeltaWriter(path);
-        await w.write(t([0, 1, 2]));
+        await w.write(t([0, 1, 2])).ok;
         expect(
-          await w.update((r) => (r['id'] as int) > 100, {'name': (r) => 'X'}),
+          await w.update((r) => (r['id'] as int) > 100, {
+            'name': (r) => 'X',
+          }).ok,
           -1,
         );
       });
@@ -418,25 +657,25 @@ void main() {
         // predicate can't decide differently between the "is this file affected"
         // scan and the rewrite (the old two-pass design ran it twice).
         final w = DeltaWriter(path);
-        await w.write(t([0, 1, 2, 3, 4]));
+        await w.write(t([0, 1, 2, 3, 4])).ok;
         final calls = <int, int>{};
         await w.update((r) {
           final id = r['id'] as int;
           calls[id] = (calls[id] ?? 0) + 1;
           return id >= 3;
-        }, {'name': (r) => 'X'});
+        }, {'name': (r) => 'X'}).ok;
         expect(calls, {0: 1, 1: 1, 2: 1, 3: 1, 4: 1});
       });
 
       test('a no-match update leaves the data files byte-identical', () async {
         final w = DeltaWriter(path);
-        await w.write(t([0, 1, 2]));
+        await w.write(t([0, 1, 2])).ok;
         Map<String, List<int>> dataFiles() => {
           for (final f in Directory(path).listSync().whereType<File>())
             if (f.path.endsWith('.parquet')) f.path: f.readAsBytesSync(),
         };
         final before = dataFiles();
-        await w.update((r) => (r['id'] as int) > 100, {'name': (r) => 'X'});
+        await w.update((r) => (r['id'] as int) > 100, {'name': (r) => 'X'}).ok;
         final after = dataFiles();
         expect(after.keys.toSet(), before.keys.toSet());
         for (final entry in before.entries) {
@@ -446,9 +685,9 @@ void main() {
 
       test('update applies on top of a deletion vector', () async {
         final w = DeltaWriter(path);
-        await w.write(t([0, 1, 2, 3, 4]));
-        await w.delete((r) => (r['id'] as int) == 2); // DV removes id 2
-        await w.update((r) => (r['id'] as int) >= 3, {'name': (r) => 'X'});
+        await w.write(t([0, 1, 2, 3, 4])).ok;
+        await w.delete((r) => (r['id'] as int) == 2).ok; // DV removes id 2
+        await w.update((r) => (r['id'] as int) >= 3, {'name': (r) => 'X'}).ok;
         expect(await read(path), {0: 'n0', 1: 'n1', 3: 'X', 4: 'X'});
       });
 
@@ -460,14 +699,14 @@ void main() {
           // rows out, a misaligned index would update the WRONG rows or double-
           // evaluate. >10000 rows forces multiple batches in _liveStream.
           final w = DeltaWriter(path);
-          await w.write(t([for (var i = 0; i < 25000; i++) i]));
-          await w.delete((r) => (r['id'] as int) % 100 == 0); // 250 deleted
+          await w.write(t([for (var i = 0; i < 25000; i++) i])).ok;
+          await w.delete((r) => (r['id'] as int) % 100 == 0).ok; // 250 deleted
           final calls = <int, int>{};
           await w.update((r) {
             final id = r['id'] as int;
             calls[id] = (calls[id] ?? 0) + 1;
             return id % 3 == 0;
-          }, {'name': (r) => 'X'});
+          }, {'name': (r) => 'X'}).ok;
 
           // Exactly the 24750 LIVE rows, each evaluated exactly once.
           expect(calls.length, 24750);
@@ -492,15 +731,17 @@ void main() {
         'rejects update on a partitioned table (would null partitions)',
         () async {
           final w = DeltaWriter(path);
-          await w.write(
-            _regioned([1, 2, 3], ['US', 'US', 'EU']),
-            partitionBy: ['region'],
-          );
+          await w
+              .write(
+                _regioned([1, 2, 3], ['US', 'US', 'EU']),
+                partitionBy: ['region'],
+              )
+              .ok;
           // The copy-on-write rewrite would null-fill the region column for the
           // whole rewritten partition; fail loud instead of corrupting it.
           await expectLater(
             w.update((r) => (r['id'] as int) == 1, {'name': (r) => 'X'}),
-            throwsA(isA<UnsupportedError>()),
+            failsWith(Kind.unsupported),
           );
         },
       );
@@ -509,14 +750,16 @@ void main() {
     group('DeltaWriter.merge', () {
       test('upsert: update matched + insert not-matched', () async {
         final w = DeltaWriter(path);
-        await w.write(t([0, 1, 2, 3, 4])); // v0
+        await w.write(t([0, 1, 2, 3, 4])).ok; // v0
         final src = t([3, 5], ['s3', 's5']);
-        await w.merge(
-          src,
-          on: ['id'],
-          whenMatchedUpdate: {'name': (t, s) => s['name']},
-          whenNotMatchedInsert: true,
-        );
+        await w
+            .merge(
+              src,
+              on: ['id'],
+              whenMatchedUpdate: {'name': (t, s) => s['name']},
+              whenNotMatchedInsert: true,
+            )
+            .ok;
         expect(await read(path), {
           0: 'n0',
           1: 'n1',
@@ -529,21 +772,23 @@ void main() {
 
       test('matched delete + no insert', () async {
         final w = DeltaWriter(path);
-        await w.write(t([0, 1, 2, 3, 4]));
+        await w.write(t([0, 1, 2, 3, 4])).ok;
         final src = t([2, 3], ['x', 'y']);
-        await w.merge(
-          src,
-          on: ['id'],
-          whenMatchedDelete: true,
-          whenNotMatchedInsert: false,
-        );
+        await w
+            .merge(
+              src,
+              on: ['id'],
+              whenMatchedDelete: true,
+              whenNotMatchedInsert: false,
+            )
+            .ok;
         expect((await read(path)).keys.toList()..sort(), [0, 1, 4]);
       });
 
       test('insert-only when nothing matches', () async {
         final w = DeltaWriter(path);
-        await w.write(t([0, 1]));
-        await w.merge(t([7, 8], ['s7', 's8']), on: ['id']);
+        await w.write(t([0, 1])).ok;
+        await w.merge(t([7, 8], ['s7', 's8']), on: ['id']).ok;
         expect(await read(path), {0: 'n0', 1: 'n1', 7: 's7', 8: 's8'});
       });
 
@@ -551,17 +796,19 @@ void main() {
         'rejects merge on a partitioned table (would null partitions)',
         () async {
           final w = DeltaWriter(path);
-          await w.write(
-            _regioned([1, 2, 3], ['US', 'US', 'EU']),
-            partitionBy: ['region'],
-          );
+          await w
+              .write(
+                _regioned([1, 2, 3], ['US', 'US', 'EU']),
+                partitionBy: ['region'],
+              )
+              .ok;
           await expectLater(
             w.merge(
               _regioned([1], ['US']),
               on: ['id'],
               whenMatchedUpdate: {'name': (t, s) => s['name']},
             ),
-            throwsA(isA<UnsupportedError>()),
+            failsWith(Kind.unsupported),
           );
         },
       );
@@ -575,10 +822,12 @@ void main() {
         'delete spanning a batch boundary excludes exactly the right rows',
         () async {
           final w = DeltaWriter(path);
-          await w.write(t([for (int i = 0; i < 15000; i++) i]));
-          await w.delete(
-            (r) => (r['id'] as int) >= 9000 && (r['id'] as int) < 11000,
-          );
+          await w.write(t([for (int i = 0; i < 15000; i++) i])).ok;
+          await w
+              .delete(
+                (r) => (r['id'] as int) >= 9000 && (r['id'] as int) < 11000,
+              )
+              .ok;
           final rows = await read(path);
           expect(rows.length, 13000);
           expect(rows.containsKey(8999), isTrue);
@@ -592,11 +841,11 @@ void main() {
         'update across a batch boundary rewrites exactly the matching rows',
         () async {
           final w = DeltaWriter(path);
-          await w.write(t([for (int i = 0; i < 15000; i++) i]));
+          await w.write(t([for (int i = 0; i < 15000; i++) i])).ok;
           final v = await w.update(
             (r) => (r['id'] as int) >= 9500 && (r['id'] as int) < 10500,
             {'name': (r) => 'X'},
-          );
+          ).ok;
           expect(v, 1);
           final rows = await read(path);
           expect(rows.length, 15000);
@@ -611,13 +860,15 @@ void main() {
         'merge delete that empties a file tombstones with no replacement',
         () async {
           final w = DeltaWriter(path);
-          await w.write(t([1, 2, 3]));
-          await w.merge(
-            t([1, 2, 3]),
-            on: ['id'],
-            whenMatchedDelete: true,
-            whenNotMatchedInsert: false,
-          );
+          await w.write(t([1, 2, 3])).ok;
+          await w
+              .merge(
+                t([1, 2, 3]),
+                on: ['id'],
+                whenMatchedDelete: true,
+                whenNotMatchedInsert: false,
+              )
+              .ok;
           // Empty result means the original file was tombstoned with no replacement.
           expect(await read(path), isEmpty);
         },
@@ -649,7 +900,7 @@ void main() {
       final t = await (await DataFrameIO.readDelta(
         path,
         version: version,
-      )).execute();
+      ).ok).execute().ok;
       return {for (final r in t.toRows()) r['id'] as int};
     }
 
@@ -665,7 +916,7 @@ void main() {
       test(
         'commit throws CommitConflict when the version is already claimed',
         () async {
-          await DeltaWriter(path).write(t([0])); // v0 exists
+          await DeltaWriter(path).write(t([0])).ok; // v0 exists
           final log = DeltaLog(path);
           // Version 0 is taken: a second claim must conflict, not clobber.
           await expectLater(
@@ -692,14 +943,14 @@ void main() {
             timeout: Duration(milliseconds: 50),
           );
           // With the lock held, the coordinator fails loud instead of hanging
-          // forever — its build never runs.
+          // forever; its build never runs.
           await expectLater(
             coordinator.commit(
               log: log,
               label: 'x',
               build: (v) async => const [],
             ),
-            throwsA(isA<TimeoutException>()),
+            failsWith(Kind.timeout),
           );
           release.complete();
           await holder;
@@ -707,7 +958,7 @@ void main() {
       );
 
       test('a failed checkpoint leaves no temp file (finding 9)', () async {
-        await DeltaWriter(path).write(t([0, 1])); // v0
+        await DeltaWriter(path).write(t([0, 1])).ok; // v0
         final log = DeltaLog(path);
         // Block the checkpoint's final rename by putting a DIRECTORY at the
         // checkpoint path, so replaceAtomic(temp, checkpointPath) throws.
@@ -728,7 +979,7 @@ void main() {
 
         await expectLater(
           DeltaWriter(path).write(t([1, 2, 3])),
-          throwsA(isA<Exception>()),
+          failsWith(Kind.io),
         );
 
         final orphans = Directory(path).listSync().whereType<File>().where(
@@ -744,9 +995,11 @@ void main() {
       });
 
       test('commits and mutations leave no _delta_log temp files', () async {
-        await DeltaWriter(path).write(t([1, 2, 3]));
-        await DeltaWriter(path).delete((r) => r['id'] == 2);
-        await DeltaWriter(path).write(t([4]), mode: DeltaWriteMode.overwrite);
+        await DeltaWriter(path).write(t([1, 2, 3])).ok;
+        await DeltaWriter(path).delete((r) => r['id'] == 2).ok;
+        await DeltaWriter(
+          path,
+        ).write(t([4]), mode: DeltaWriteMode.overwrite).ok;
         final temps = Directory(
           '$path/_delta_log',
         ).listSync().whereType<File>().where((f) => f.path.endsWith('.tmp'));
@@ -757,7 +1010,7 @@ void main() {
         'concurrent appends produce distinct versions and the full union',
         () async {
           final w = DeltaWriter(path);
-          await w.write(t([0])); // v0
+          await w.write(t([0])).ok; // v0
           final versions = await Future.wait([
             w.write(t([1])),
             w.write(t([2])),
@@ -773,7 +1026,7 @@ void main() {
       Future<void> appendMany(int n) async {
         final w = DeltaWriter(path);
         for (int i = 0; i < n; i++) {
-          await w.write(t([i]));
+          await w.write(t([i])).ok;
         }
       }
 
@@ -836,16 +1089,18 @@ void main() {
     tearDown(() => dir.deleteSync(recursive: true));
 
     Future<Set<int>> ids() async {
-      final table = await (await DataFrameIO.readDelta(path)).execute();
+      final table = await (await DataFrameIO.readDelta(path).ok).execute().ok;
       return {for (final r in table.toRows()) r['id'] as int};
     }
 
     test('overwrite after a delete replaces ALL prior data', () async {
       final w = DeltaWriter(path);
-      await w.write(t([0, 1, 2])); // v0
-      await w.delete((row) => (row['id'] as int) == 0); // v1: file gains a DV
+      await w.write(t([0, 1, 2])).ok; // v0
+      await w
+          .delete((row) => (row['id'] as int) == 0)
+          .ok; // v1: file gains a DV
       expect(await ids(), {1, 2});
-      await w.write(t([9]), mode: DeltaWriteMode.overwrite); // v2
+      await w.write(t([9]), mode: DeltaWriteMode.overwrite).ok; // v2
       // A tombstone is matched by (path, deletionVector); one built without the
       // DV matches nothing, leaving the old file live next to the new one.
       expect(await ids(), {9});
@@ -853,20 +1108,20 @@ void main() {
 
     test('overwrite after a delete still time-travels', () async {
       final w = DeltaWriter(path);
-      await w.write(t([0, 1, 2]));
-      await w.delete((row) => (row['id'] as int) == 0);
-      await w.write(t([9]), mode: DeltaWriteMode.overwrite);
+      await w.write(t([0, 1, 2])).ok;
+      await w.delete((row) => (row['id'] as int) == 0).ok;
+      await w.write(t([9]), mode: DeltaWriteMode.overwrite).ok;
       final v1 = await (await DataFrameIO.readDelta(
         path,
         version: 1,
-      )).execute();
+      ).ok).execute().ok;
       expect({for (final r in v1.toRows()) r['id'] as int}, {1, 2});
     });
 
     test('overwrite with no deletion vector still replaces data', () async {
       final w = DeltaWriter(path);
-      await w.write(t([0, 1, 2]));
-      await w.write(t([9]), mode: DeltaWriteMode.overwrite);
+      await w.write(t([0, 1, 2])).ok;
+      await w.write(t([9]), mode: DeltaWriteMode.overwrite).ok;
       expect(await ids(), {9});
     });
   });
@@ -890,14 +1145,14 @@ void main() {
 
     test('a file tombstoned before a checkpoint survives vacuum', () async {
       final w = DeltaWriter(path);
-      await w.write(t([0, 1, 2])); // v0: creates the file time travel needs
+      await w.write(t([0, 1, 2])).ok; // v0: creates the file time travel needs
       await w.update((row) => (row['id'] as int) == 0, {
         'id': (row) => 100,
-      }); // v1: tombstones v0's file (rewrite)
+      }).ok; // v1: tombstones v0's file (rewrite)
       // Commit past the checkpoint interval (10) so _maybeCheckpoint fires and
-      // the checkpoint — which records live adds only — hides v1's tombstone.
+      // the checkpoint (which records live adds only) hides v1's tombstone.
       for (var i = 0; i < 10; i++) {
-        await w.write(t([10 + i]));
+        await w.write(t([10 + i])).ok;
       }
       expect(
         File(DeltaLog(path).checkpointPath(10)).existsSync(),
@@ -911,14 +1166,14 @@ void main() {
       final v0 = await (await DataFrameIO.readDelta(
         path,
         version: 0,
-      )).execute();
+      ).ok).execute().ok;
       expect({for (final r in v0.toRows()) r['id'] as int}, {0, 1, 2});
     });
 
     test('a genuine orphan is still removed after a checkpoint', () async {
       final w = DeltaWriter(path);
       for (var i = 0; i < 11; i++) {
-        await w.write(t([i]));
+        await w.write(t([i])).ok;
       }
       final orphan = File('$path/part-00000-orphan.parquet')
         ..writeAsBytesSync([1, 2, 3]);
@@ -930,7 +1185,7 @@ void main() {
   // The Delta protocol's "Partition Value Serialization" governs the
   // partitionValues MAP; the Hive `col=value` PATH is a different convention.
   // One encoder served both, so our writer and reader agreed with each other
-  // while both deviated from the spec — a closed loop only a real engine breaks.
+  // while both deviated from the spec: a closed loop only a real engine breaks.
   group('partition value serialization', () {
     late Directory dir;
     late String path;
@@ -984,7 +1239,7 @@ void main() {
             partitioned('region', DataType.string, ['US', 'EU']),
             partitionBy: ['id', 'region'], // both columns
           ),
-          throwsArgumentError,
+          failsWith(Kind.invalid),
         );
         // Nothing was committed.
         expect(Directory('$path/_delta_log').existsSync(), isFalse);
@@ -992,11 +1247,13 @@ void main() {
     );
 
     test('partitioning by a strict subset still round-trips', () async {
-      await DeltaWriter(path).write(
-        partitioned('region', DataType.string, ['US', 'EU']),
-        partitionBy: ['region'], // id remains a data column
-      );
-      final rows = await DeltaTable(path).read();
+      await DeltaWriter(path)
+          .write(
+            partitioned('region', DataType.string, ['US', 'EU']),
+            partitionBy: ['region'], // id remains a data column
+          )
+          .ok;
+      final rows = await DeltaTable(path).read().ok;
       expect(rows.rowCount, 2);
     });
 
@@ -1010,10 +1267,12 @@ void main() {
             .length;
 
         // v0: two partitions (region=US, region=EU), one file each.
-        await DeltaWriter(path).write(
-          partitioned('region', DataType.string, ['US', 'EU']),
-          partitionBy: ['region'],
-        );
+        await DeltaWriter(path)
+            .write(
+              partitioned('region', DataType.string, ['US', 'EU']),
+              partitionBy: ['region'],
+            )
+            .ok;
         expect(parquets(), 2);
 
         // A schema-mismatched partitioned append is rejected at commit time. Its
@@ -1036,9 +1295,9 @@ void main() {
         );
         await expectLater(
           DeltaWriter(path).write(wide, partitionBy: ['region']),
-          throwsA(isA<StateError>()),
+          failsWith(Kind.schema),
         );
-        // Only v0's two files remain — the rejected append left no orphan.
+        // Only v0's two files remain: the rejected append left no orphan.
         expect(parquets(), 2);
       },
     );
@@ -1048,11 +1307,13 @@ void main() {
       () async {
         // Stats are computed eagerly per partition (so each partition Table is
         // released right after its file is written) rather than from a Table
-        // retained until commit — the add action must still carry real stats.
-        await DeltaWriter(path).write(
-          partitioned('region', DataType.string, ['US', 'EU']),
-          partitionBy: ['region'],
-        );
+        // retained until commit: the add action must still carry real stats.
+        await DeltaWriter(path)
+            .write(
+              partitioned('region', DataType.string, ['US', 'EU']),
+              partitionBy: ['region'],
+            )
+            .ok;
         expect(addAction()['stats'], contains('numRecords'));
       },
     );
@@ -1062,21 +1323,25 @@ void main() {
       // value." __HIVE_DEFAULT_PARTITION__ is the PATH convention, not this one:
       // Spark casts the map's string straight to the column type, so the
       // sentinel reads back as the literal text.
-      await DeltaWriter(path).write(
-        partitioned('region', DataType.string, [null]),
-        partitionBy: ['region'],
-      );
+      await DeltaWriter(path)
+          .write(
+            partitioned('region', DataType.string, [null]),
+            partitionBy: ['region'],
+          )
+          .ok;
       expect(addAction()['partitionValues'], {'region': ''});
       // The directory segment keeps the Hive marker.
       expect(addAction()['path'], contains('__HIVE_DEFAULT_PARTITION__'));
     });
 
     test('a null partition value round-trips back to null', () async {
-      await DeltaWriter(path).write(
-        partitioned('region', DataType.string, ['eu', null]),
-        partitionBy: ['region'],
-      );
-      final table = await (await DataFrameIO.readDelta(path)).execute();
+      await DeltaWriter(path)
+          .write(
+            partitioned('region', DataType.string, ['eu', null]),
+            partitionBy: ['region'],
+          )
+          .ok;
+      final table = await (await DataFrameIO.readDelta(path).ok).execute().ok;
       expect(
         {for (final r in table.toRows()) r['id'] as int: r['region']},
         {0: 'eu', 1: null},
@@ -1085,26 +1350,26 @@ void main() {
 
     group('special-character partition values round-trip (audit 7)', () {
       // The writer emitted the RAW value into the directory name and add.path,
-      // but the reader (and the Delta spec) URL-decode add.path — a `50%`
+      // but the reader (and the Delta spec) URL-decode add.path: a `50%`
       // partition wrote fine and then EVERY read threw FormatException, and
       // `a/b` silently became a nested directory. Values now get Hive path
       // escaping on disk and URL encoding in the log.
       for (final value in ['50%', 'a b', 'a/b', 'ünïcode', 'a=b', 'x%2Fy']) {
         test("'$value' writes, reads, deletes, and appends", () async {
           Table two() => partitioned('c', DataType.string, [value, 'plain']);
-          await DeltaWriter(path).write(two(), partitionBy: ['c']);
-          final first = await DeltaTable(path).read();
+          await DeltaWriter(path).write(two(), partitionBy: ['c']).ok;
+          final first = await DeltaTable(path).read().ok;
           expect(
             first.toRows().map((r) => r['c']).toSet(),
             {value, 'plain'},
             reason: 'read-back after write',
           );
           // Mutations resolve add.path too.
-          await DeltaWriter(path).delete((row) => row['c'] == 'plain');
+          await DeltaWriter(path).delete((row) => row['c'] == 'plain').ok;
           await DeltaWriter(
             path,
-          ).write(two(), partitionBy: ['c'], mode: DeltaWriteMode.append);
-          final after = await DeltaTable(path).read();
+          ).write(two(), partitionBy: ['c'], mode: DeltaWriteMode.append).ok;
+          final after = await DeltaTable(path).read().ok;
           expect(
             after.toRows().where((r) => r['c'] == value).length,
             2,
@@ -1144,29 +1409,33 @@ void main() {
         // int partition
         await DeltaWriter(
           path,
-        ).write(t(DataType.int64, [5, 5, 7]), partitionBy: ['p']);
-        final v = await DeltaWriter(path).delete((r) => r['p'] == 5);
+        ).write(t(DataType.int64, [5, 5, 7]), partitionBy: ['p']).ok;
+        final v = await DeltaWriter(path).delete((r) => r['p'] == 5).ok;
         expect(v, greaterThanOrEqualTo(0));
         expect(
-          (await DeltaTable(path).read()).toRows().map((r) => r['p']).toSet(),
+          (await DeltaTable(
+            path,
+          ).read().ok).toRows().map((r) => r['p']).toSet(),
           {7},
         );
 
         // date partition
         final datePath = '${dir.path}/tbl_date';
-        await DeltaWriter(datePath).write(
-          t(DataType.date, [
-            DateTime.utc(2024, 1, 15),
-            DateTime.utc(2024, 2, 20),
-          ]),
-          partitionBy: ['p'],
-        );
+        await DeltaWriter(datePath)
+            .write(
+              t(DataType.date, [
+                DateTime.utc(2024, 1, 15),
+                DateTime.utc(2024, 2, 20),
+              ]),
+              partitionBy: ['p'],
+            )
+            .ok;
         final dv = await DeltaWriter(
           datePath,
-        ).delete((r) => r['p'] == DateTime.utc(2024, 1, 15));
+        ).delete((r) => r['p'] == DateTime.utc(2024, 1, 15)).ok;
         expect(dv, greaterThanOrEqualTo(0));
         expect(
-          (await DeltaTable(datePath).read()).toRows().single['p'],
+          (await DeltaTable(datePath).read().ok).toRows().single['p'],
           DateTime.utc(2024, 2, 20),
         );
 
@@ -1174,11 +1443,11 @@ void main() {
         final nullPath = '${dir.path}/tbl_null';
         await DeltaWriter(
           nullPath,
-        ).write(t(DataType.string, [null, 'keep']), partitionBy: ['p']);
-        final nv = await DeltaWriter(nullPath).delete((r) => r['p'] == null);
+        ).write(t(DataType.string, [null, 'keep']), partitionBy: ['p']).ok;
+        final nv = await DeltaWriter(nullPath).delete((r) => r['p'] == null).ok;
         expect(nv, greaterThanOrEqualTo(0));
         expect(
-          (await DeltaTable(nullPath).read()).toRows().single['p'],
+          (await DeltaTable(nullPath).read().ok).toRows().single['p'],
           'keep',
         );
       });
@@ -1201,7 +1470,7 @@ void main() {
               ],
             ),
           );
-          await DeltaWriter(path).write(t(), partitionBy: ['n']);
+          await DeltaWriter(path).write(t(), partitionBy: ['n']).ok;
           // Corrupt the committed add action's partition value in place.
           final commit = File('$path/_delta_log/${'0'.padLeft(20, '0')}.json');
           final lines = commit.readAsLinesSync();
@@ -1214,21 +1483,18 @@ void main() {
           commit.writeAsStringSync('${patched.join('\n')}\n');
           await expectLater(
             DeltaTable(path).read(),
-            throwsA(
-              isA<FormatException>().having(
-                (e) => e.message,
-                'message',
-                allOf(contains('12x'), contains('n')),
-              ),
-            ),
+            failsWith(Kind.corrupt, allOf(contains('12x'), contains('n'))),
           );
         },
       );
 
       test('the logged add.path URL-decodes to the on-disk file', () async {
-        await DeltaWriter(
-          path,
-        ).write(partitioned('c', DataType.string, ['50%']), partitionBy: ['c']);
+        await DeltaWriter(path)
+            .write(
+              partitioned('c', DataType.string, ['50%']),
+              partitionBy: ['c'],
+            )
+            .ok;
         final logged = addAction()['path'] as String;
         expect(File('$path/${Uri.decodeFull(logged)}').existsSync(), isTrue);
         // On disk the Hive-escaped form: `c=50%25/...`.
@@ -1240,47 +1506,53 @@ void main() {
         '(audit 7)', () async {
       // Raw storage ints (epoch days/micros) and unscaled BigInts in the JSON
       // stats made external engines parse garbage bounds.
-      await DeltaWriter(path).write(
-        Table(
-          name: 't',
-          columns: [
-            ListColumn<DateTime>(
-              name: 'd',
-              dataType: DataType.date,
-              data: [DateTime.utc(2024, 1, 15), DateTime.utc(2024, 2, 20)],
-              nullable: false,
-            ),
-            ListColumn<DateTime>(
-              name: 'ts',
-              dataType: DataType.timestamp,
-              data: [
-                DateTime.utc(2024, 1, 15, 10, 30),
-                DateTime.utc(2024, 2, 20, 8, 5),
+      await DeltaWriter(path)
+          .write(
+            Table(
+              name: 't',
+              columns: [
+                ListColumn<DateTime>(
+                  name: 'd',
+                  dataType: DataType.date,
+                  data: [DateTime.utc(2024, 1, 15), DateTime.utc(2024, 2, 20)],
+                  nullable: false,
+                ),
+                ListColumn<DateTime>(
+                  name: 'ts',
+                  dataType: DataType.timestamp,
+                  data: [
+                    DateTime.utc(2024, 1, 15, 10, 30),
+                    DateTime.utc(2024, 2, 20, 8, 5),
+                  ],
+                  nullable: false,
+                ),
+                ListColumn<BigInt>(
+                  name: 'amt',
+                  dataType: DataType.decimal,
+                  data: [BigInt.from(12345), BigInt.from(99)], // 123.45, 0.99
+                  nullable: false,
+                ),
               ],
-              nullable: false,
-            ),
-            ListColumn<BigInt>(
-              name: 'amt',
-              dataType: DataType.decimal,
-              data: [BigInt.from(12345), BigInt.from(99)], // 123.45, 0.99
-              nullable: false,
-            ),
-          ],
-          schema: Schema(
-            fields: [
-              Field(name: 'd', dataType: DataType.date, nullable: false),
-              Field(name: 'ts', dataType: DataType.timestamp, nullable: false),
-              Field(
-                name: 'amt',
-                dataType: DataType.decimal,
-                nullable: false,
-                precision: 10,
-                scale: 2,
+              schema: Schema(
+                fields: [
+                  Field(name: 'd', dataType: DataType.date, nullable: false),
+                  Field(
+                    name: 'ts',
+                    dataType: DataType.timestamp,
+                    nullable: false,
+                  ),
+                  Field(
+                    name: 'amt',
+                    dataType: DataType.decimal,
+                    nullable: false,
+                    precision: 10,
+                    scale: 2,
+                  ),
+                ],
               ),
-            ],
-          ),
-        ),
-      );
+            ),
+          )
+          .ok;
       final stats =
           jsonDecode(addAction()['stats'] as String) as Map<String, dynamic>;
       final min = stats['minValues'] as Map<String, dynamic>;
@@ -1293,20 +1565,59 @@ void main() {
       expect(max['amt'], '123.45');
     });
 
+    test('add.stats use code-point order and omit infinity', () async {
+      await DeltaWriter(path)
+          .write(
+            Table(
+              name: 't',
+              columns: [
+                ListColumn<String>(
+                  name: 's',
+                  dataType: DataType.string,
+                  data: ['\uFF01', '\u{1F600}'],
+                  nullable: false,
+                ),
+                NumericColumn.float64(
+                  name: 'x',
+                  values: [1.0, double.infinity],
+                  nullable: false,
+                ),
+              ],
+              schema: Schema(
+                fields: [
+                  Field(name: 's', dataType: DataType.string, nullable: false),
+                  Field(name: 'x', dataType: DataType.float64, nullable: false),
+                ],
+              ),
+            ),
+          )
+          .ok;
+      final stats =
+          jsonDecode(addAction()['stats'] as String) as Map<String, dynamic>;
+      expect((stats['maxValues'] as Map)['s'], '\u{1F600}');
+      expect((stats['minValues'] as Map)['x'], 1.0);
+      // JSON has no infinity, so the bound is left out.
+      expect((stats['maxValues'] as Map).containsKey('x'), isFalse);
+    });
+
     test('a date partition serializes as yyyy-MM-dd', () async {
-      await DeltaWriter(path).write(
-        partitioned('d', DataType.date, [DateTime.utc(2024, 1, 15)]),
-        partitionBy: ['d'],
-      );
+      await DeltaWriter(path)
+          .write(
+            partitioned('d', DataType.date, [DateTime.utc(2024, 1, 15)]),
+            partitionBy: ['d'],
+          )
+          .ok;
       expect(addAction()['partitionValues'], {'d': '2024-01-15'});
     });
 
     test('a date partition reads back as a DateTime, not a String', () async {
-      await DeltaWriter(path).write(
-        partitioned('d', DataType.date, [DateTime.utc(2024, 1, 15)]),
-        partitionBy: ['d'],
-      );
-      final table = await (await DataFrameIO.readDelta(path)).execute();
+      await DeltaWriter(path)
+          .write(
+            partitioned('d', DataType.date, [DateTime.utc(2024, 1, 15)]),
+            partitionBy: ['d'],
+          )
+          .ok;
+      final table = await (await DataFrameIO.readDelta(path).ok).execute().ok;
       final value = table.toRows().single['d'];
       expect(
         value,
@@ -1317,17 +1628,19 @@ void main() {
     });
 
     test('a boolean partition serializes as true/false', () async {
-      await DeltaWriter(
-        path,
-      ).write(partitioned('b', DataType.boolean, [true]), partitionBy: ['b']);
+      await DeltaWriter(path)
+          .write(partitioned('b', DataType.boolean, [true]), partitionBy: ['b'])
+          .ok;
       expect(addAction()['partitionValues'], {'b': 'true'});
     });
 
     test('a string partition is unchanged', () async {
-      await DeltaWriter(path).write(
-        partitioned('region', DataType.string, ['eu-west']),
-        partitionBy: ['region'],
-      );
+      await DeltaWriter(path)
+          .write(
+            partitioned('region', DataType.string, ['eu-west']),
+            partitionBy: ['region'],
+          )
+          .ok;
       expect(addAction()['partitionValues'], {'region': 'eu-west'});
     });
 
@@ -1335,44 +1648,48 @@ void main() {
       // Reading the partition string through a double would round this past 2^53
       // (or brick the read when the rounded double can't restate at scale 0).
       final unscaled = BigInt.parse('12345678901234567890');
-      await DeltaWriter(path).write(
-        Table(
-          name: 't',
-          columns: [
-            NumericColumn.int64(name: 'id', values: [0], nullable: false),
-            ListColumn<BigInt>(
-              name: 'p',
-              dataType: DataType.decimal,
-              data: [unscaled],
-              nullable: false,
-            ),
-          ],
-          schema: Schema(
-            fields: [
-              Field(name: 'id', dataType: DataType.int64, nullable: false),
-              Field(
-                name: 'p',
-                dataType: DataType.decimal,
-                nullable: false,
-                precision: 38,
-                scale: 0,
+      await DeltaWriter(path)
+          .write(
+            Table(
+              name: 't',
+              columns: [
+                NumericColumn.int64(name: 'id', values: [0], nullable: false),
+                ListColumn<BigInt>(
+                  name: 'p',
+                  dataType: DataType.decimal,
+                  data: [unscaled],
+                  nullable: false,
+                ),
+              ],
+              schema: Schema(
+                fields: [
+                  Field(name: 'id', dataType: DataType.int64, nullable: false),
+                  Field(
+                    name: 'p',
+                    dataType: DataType.decimal,
+                    nullable: false,
+                    precision: 38,
+                    scale: 0,
+                  ),
+                ],
               ),
-            ],
-          ),
-        ),
-        partitionBy: ['p'],
-      );
-      final table = await (await DataFrameIO.readDelta(path)).execute();
+            ),
+            partitionBy: ['p'],
+          )
+          .ok;
+      final table = await (await DataFrameIO.readDelta(path).ok).execute().ok;
       expect(table.column('p')!.toList(), [unscaled]);
     });
 
     test('a table written with the legacy sentinel still reads', () async {
       // Tables this library already wrote carry __HIVE_DEFAULT_PARTITION__ in
       // the map; the reader must keep accepting it.
-      await DeltaWriter(path).write(
-        partitioned('region', DataType.string, ['eu', null]),
-        partitionBy: ['region'],
-      );
+      await DeltaWriter(path)
+          .write(
+            partitioned('region', DataType.string, ['eu', null]),
+            partitionBy: ['region'],
+          )
+          .ok;
       final commit = File('$path/_delta_log/${'0'.padLeft(20, '0')}.json');
       commit.writeAsStringSync(
         commit.readAsStringSync().replaceAll(
@@ -1380,7 +1697,7 @@ void main() {
           '"region":"__HIVE_DEFAULT_PARTITION__"',
         ),
       );
-      final table = await (await DataFrameIO.readDelta(path)).execute();
+      final table = await (await DataFrameIO.readDelta(path).ok).execute().ok;
       expect(
         {for (final r in table.toRows()) r['id'] as int: r['region']},
         {0: 'eu', 1: null},
@@ -1406,7 +1723,7 @@ void main() {
         .toList();
 
     Future<Set<int>> read(String path) async {
-      final t = await (await DataFrameIO.readDelta(path)).execute();
+      final t = await (await DataFrameIO.readDelta(path).ok).execute().ok;
       return {for (final r in t.toRows()) r['id'] as int};
     }
 
@@ -1421,7 +1738,7 @@ void main() {
     test(
       'vacuum removes a crash-orphaned part file, keeps the committed one',
       () async {
-        await DeltaWriter(path).write(t());
+        await DeltaWriter(path).write(t()).ok;
         final committed = parts(path).single.path;
         // A writer that wrote a data file then died before committing.
         final orphan = File('$path/part-99999-deadbeef.parquet')
@@ -1440,7 +1757,7 @@ void main() {
     );
 
     test('vacuum preserves a within-TTL (in-flight) orphan', () async {
-      await DeltaWriter(path).write(t());
+      await DeltaWriter(path).write(t()).ok;
       final fresh = File('$path/part-88888-inflight.parquet')
         ..writeAsBytesSync(List.filled(64, 0));
 
@@ -1449,10 +1766,69 @@ void main() {
       expect(fresh.existsSync(), isTrue, reason: 'a fresh orphan is in-flight');
     });
 
+    Table byCity(List<String> cities) => Table(
+      name: 't',
+      columns: [
+        NumericColumn.int64(
+          name: 'id',
+          values: [for (var i = 1; i <= cities.length; i++) i],
+          nullable: false,
+        ),
+        ListColumn<String>(
+          name: 'city',
+          dataType: DataType.string,
+          data: cities,
+          nullable: false,
+        ),
+      ],
+      schema: Schema(
+        fields: [
+          Field(name: 'id', dataType: DataType.int64, nullable: false),
+          Field(name: 'city', dataType: DataType.string, nullable: false),
+        ],
+      ),
+    );
+
+    test('vacuum keeps live files whose logged path is URL-encoded', () async {
+      // On disk the directory is Hive-escaped (`city=50%25`), and `add.path`
+      // URL-encodes that again (`city=50%2525/...`).
+      await DeltaWriter(
+        path,
+      ).write(byCity(['50%', 'a b', 'x']), partitionBy: ['city']).ok;
+      final orphan = File('$path/city=x/part-77777-orphan.parquet')
+        ..writeAsBytesSync(List.filled(64, 0));
+
+      await DeltaLog(path).vacuumOrphans(olderThan: Duration.zero);
+
+      expect(await read(path), {1, 2, 3});
+      expect(orphan.existsSync(), isFalse, reason: 'a real orphan still goes');
+    });
+
+    test('vacuum keeps a live file logged by absolute path', () async {
+      await DeltaWriter(path).write(t()).ok;
+      final commit = File('$path/_delta_log/00000000000000000000.json');
+      final absolute = Directory(path).absolute.path;
+      commit.writeAsStringSync(
+        commit
+            .readAsLinesSync()
+            .map((line) {
+              final action = jsonDecode(line) as Map<String, dynamic>;
+              final add = action['add'] as Map<String, dynamic>?;
+              if (add != null) add['path'] = '$absolute/${add['path']}';
+              return jsonEncode(action);
+            })
+            .join('\n'),
+      );
+
+      await DeltaLog(path).vacuumOrphans(olderThan: Duration.zero);
+
+      expect(await read(path), {1, 2, 3});
+    });
+
     test('vacuum keeps an orphaned DV that is still referenced', () async {
       // Write + delete so a deletion-vector .bin exists and is referenced.
-      await DeltaWriter(path).write(t());
-      await DeltaWriter(path).delete((row) => row['id'] == 2);
+      await DeltaWriter(path).write(t()).ok;
+      await DeltaWriter(path).delete((row) => row['id'] == 2).ok;
       final dvs = Directory(path)
           .listSync()
           .whereType<File>()
@@ -1471,14 +1847,14 @@ void main() {
 
   group('cross-engine fixtures', () {
     Future<List<int>> ids(String path) async {
-      final t = await (await DataFrameIO.readDelta(path)).execute();
+      final t = await (await DataFrameIO.readDelta(path).ok).execute().ok;
       return t.column('id')!.toList().cast<int>()..sort();
     }
 
     group('Delta fixtures', () {
       test('reads this library\'s own deletion-vector table', () async {
         const path = 'test/fixtures/delta/dart_written';
-        final t = await (await DataFrameIO.readDelta(path)).execute();
+        final t = await (await DataFrameIO.readDelta(path).ok).execute().ok;
         expect(t.column('id')!.toList().cast<int>()..sort(), [
           1,
           3,
@@ -1495,12 +1871,84 @@ void main() {
         expect(t.column('name')!.toList(), contains('n100'));
       });
 
+      // delta-rs: struct, array and map columns, with nulls at each level.
+      const nested = 'test/fixtures/delta/rs_nested';
+      final rows = [
+        {
+          'id': 1,
+          'info': {'a': 1, 'b': 'x'},
+          'tags': [1, 2],
+          'props': {'k1': 1.5},
+        },
+        {'id': 2, 'info': null, 'tags': <int>[], 'props': null},
+        {
+          'id': 3,
+          'info': {'a': 3, 'b': null},
+          'tags': null,
+          'props': <String, double>{},
+        },
+      ];
+
+      test(
+        'reads a delta-rs table with struct, array and map columns',
+        () async {
+          final t = await DeltaTable(nested).read().ok;
+          expect(t.schema.field('info')!.dataType, DataType.struct);
+          expect(t.schema.field('tags')!.dataType, DataType.list);
+          expect(t.schema.field('props')!.dataType, DataType.map);
+          final read = t.toRows()
+            ..sort((a, b) => (a['id'] as int).compareTo(b['id'] as int));
+          expect(read, rows);
+        },
+      );
+
+      test('nested types round-trip through the Delta schema', () async {
+        final schema = (await DeltaTable(nested).schema()).ok;
+        final text = DeltaSchema.toJson(schema);
+        expect(
+          DeltaSchema.sameStructure(
+            text,
+            File('$nested/_delta_log/00000000000000000000.json')
+                    .readAsLinesSync()
+                    .map(jsonDecode)
+                    .whereType<Map>()
+                    .firstWhere(
+                      (action) => action.containsKey('metaData'),
+                    )['metaData']['schemaString']
+                as String,
+          ),
+          isTrue,
+          reason: text,
+        );
+        expect(DeltaSchema.toJson(DeltaSchema.fromJson(text)), text);
+      });
+
+      test('a nested table written here reads back', () async {
+        final dir = Directory.systemTemp.createTempSync('delta_nested_');
+        addTearDown(() => dir.deleteSync(recursive: true));
+        final source = await DeltaTable(nested).read().ok;
+        await DeltaWriter('${dir.path}/t').write(source).ok;
+        final read = (await DeltaTable('${dir.path}/t').read().ok).toRows()
+          ..sort((a, b) => (a['id'] as int).compareTo(b['id'] as int));
+        expect(read, rows);
+        // Nested columns carry no statistics: Spark keeps a struct's per
+        // leaf and none for an array or map.
+        final log = File('${dir.path}/t/_delta_log/00000000000000000000.json');
+        final add = log
+            .readAsLinesSync()
+            .map(jsonDecode)
+            .whereType<Map>()
+            .firstWhere((action) => action.containsKey('add'));
+        final stats = jsonDecode(add['add']['stats'] as String) as Map;
+        expect(stats['nullCount'], {'id': 0});
+      });
+
       test('time travel on the fixture sees pre-delete rows', () async {
         const path = 'test/fixtures/delta/dart_written';
         final v0 = await (await DataFrameIO.readDelta(
           path,
           version: 0,
-        )).execute();
+        ).ok).execute().ok;
         expect(v0.column('id')!.toList().cast<int>()..sort(), [
           0,
           1,
@@ -1550,18 +1998,20 @@ void main() {
     });
     tearDown(() => dir.deleteSync(recursive: true));
 
-    test('a merge source over the cap throws StateError', () async {
-      await DeltaWriter(tbl).write(t([1, 2, 3]));
+    test('a merge source over the cap returns a limit error', () async {
+      await DeltaWriter(tbl).write(t([1, 2, 3])).ok;
       await expectLater(
         DeltaWriter(tbl).merge(t([2, 3, 4, 5]), on: ['id'], maxSourceRows: 2),
-        throwsA(isA<StateError>()),
+        failsWith(Kind.limit),
       );
     });
 
     test('under the cap the merge upserts normally', () async {
-      await DeltaWriter(tbl).write(t([1, 2, 3]));
-      await DeltaWriter(tbl).merge(t([3, 4]), on: ['id'], maxSourceRows: 100);
-      final t2 = await DeltaTable(tbl).read();
+      await DeltaWriter(tbl).write(t([1, 2, 3])).ok;
+      await DeltaWriter(
+        tbl,
+      ).merge(t([3, 4]), on: ['id'], maxSourceRows: 100).ok;
+      final t2 = await DeltaTable(tbl).read().ok;
       expect({for (final r in t2.toRows()) r['id'] as int}, {1, 2, 3, 4});
     });
   });
@@ -1593,7 +2043,7 @@ void main() {
       final t = await (await DataFrameIO.readDelta(
         path,
         concurrency: concurrency,
-      )).execute();
+      ).ok).execute().ok;
       return [
         for (final r in t.toRows()) {'id': r['id'], 'region': r['region']},
       ];
@@ -1606,10 +2056,12 @@ void main() {
     test('partitioned multi-file table: concurrency:4 == sequential', () async {
       final tbl = '${dir.path}/t';
       // partitionBy writes one data file per distinct region → several files.
-      await DeltaWriter(tbl).write(
-        t([1, 2, 3, 4, 5, 6], ['us', 'eu', 'us', 'ap', 'eu', 'ap']),
-        partitionBy: ['region'],
-      );
+      await DeltaWriter(tbl)
+          .write(
+            t([1, 2, 3, 4, 5, 6], ['us', 'eu', 'us', 'ap', 'eu', 'ap']),
+            partitionBy: ['region'],
+          )
+          .ok;
       final seq = await rows(tbl);
       final par = await rows(tbl, concurrency: 4);
       expect(par, seq);
@@ -1618,8 +2070,12 @@ void main() {
 
     test('deletion-vector table reads identically under concurrency', () async {
       final tbl = '${dir.path}/dv';
-      await DeltaWriter(tbl).write(t([1, 2, 3, 4], ['us', 'eu', 'us', 'eu']));
-      await DeltaWriter(tbl).delete((row) => row['id'] == 2 || row['id'] == 3);
+      await DeltaWriter(
+        tbl,
+      ).write(t([1, 2, 3, 4], ['us', 'eu', 'us', 'eu'])).ok;
+      await DeltaWriter(
+        tbl,
+      ).delete((row) => row['id'] == 2 || row['id'] == 3).ok;
       final seq = await rows(tbl);
       final par = await rows(tbl, concurrency: 4);
       expect(par, seq);
@@ -1641,12 +2097,14 @@ void main() {
       addTearDown(() => dir.deleteSync(recursive: true));
       final tbl = '${dir.path}/t';
 
-      await DeltaWriter(tbl).write(t([10, 20, 30, 40, 50]));
+      await DeltaWriter(tbl).write(t([10, 20, 30, 40, 50])).ok;
       // Deletion vector removes positions 1 (20) and 3 (40).
-      await DeltaWriter(tbl).delete((r) => r['id'] == 20 || r['id'] == 40);
+      await DeltaWriter(tbl).delete((r) => r['id'] == 20 || r['id'] == 40).ok;
 
       // Small batch size forces multiple batches, exercising the offset tracking.
-      final batches = await DeltaTable(tbl).readBatches(size: 2).toList();
+      final batches = await DeltaTable(
+        tbl,
+      ).readBatches(batchSize: 2).ok.toList();
       final rows = [
         for (final b in batches)
           for (final r in b.toRows()) r['id'] as int,
@@ -1655,7 +2113,7 @@ void main() {
       expect(batches.length, greaterThan(1)); // actually streamed, not one blob
 
       // Matches the eager read.
-      final eager = await DeltaTable(tbl).read();
+      final eager = await DeltaTable(tbl).read().ok;
       expect({for (final r in eager.toRows()) r['id'] as int}, {10, 30, 50});
     });
   });
@@ -1681,7 +2139,7 @@ void main() {
     );
 
     Future<Map<int, String?>> read(String path) async {
-      final t = await DeltaTable(path).read();
+      final t = await DeltaTable(path).read().ok;
       return {for (final r in t.toRows()) r['id'] as int: r['name'] as String?};
     }
 
@@ -1694,182 +2152,306 @@ void main() {
     tearDown(() => dir.deleteSync(recursive: true));
 
     test('SQL UPDATE … SET … WHERE on a Delta table', () async {
-      await DeltaWriter(tbl).write(t([0, 1, 2, 3, 4]));
-      final engine = SqlEngine(allowExternalPaths: true);
-      final res = await engine.execute(
-        "UPDATE '$tbl' SET name = 'X' WHERE id >= 3",
-      );
+      await DeltaWriter(tbl).write(t([0, 1, 2, 3, 4])).ok;
+      final engine = SqlEngine.open(allowExternalPaths: true).ok;
+      final res = await engine
+          .execute("UPDATE '$tbl' SET name = 'X' WHERE id >= 3")
+          .ok;
       expect(res.column('version')!.toList(), [1]);
       expect(await read(tbl), {0: 'n0', 1: 'n1', 2: 'n2', 3: 'X', 4: 'X'});
     });
 
-    test('SQL UPDATE SET with a CASE expression', () async {
-      await DeltaWriter(tbl).write(t([1, 2, 3]));
-      final engine = SqlEngine(allowExternalPaths: true);
-      await engine.execute(
-        "UPDATE '$tbl' SET name = CASE WHEN id >= 3 THEN 'hi' ELSE name END",
+    test('DeltaMutations.delete removes the matched rows', () async {
+      await DeltaWriter(tbl).write(t([0, 1, 2, 3])).ok;
+      final mutations = Mutations.of(tbl);
+      expect(mutations, isA<DeltaMutations>());
+      expect(await mutations.exists(), isTrue);
+      expect(await mutations.delete((row) => (row['id'] as int).isOdd).ok, 1);
+      expect(await read(tbl), {0: 'n0', 2: 'n2'});
+      // Nothing matched: no commit.
+      expect(await Mutations.of(tbl).delete((row) => false).ok, -1);
+    });
+
+    test('DeltaMutations.delete reports a missing table as an Err', () async {
+      await expectLater(
+        Mutations.of(tbl).delete((row) => true),
+        failsWith(Kind.missing, contains('Not a Delta table')),
       );
+    });
+
+    test('SQL UPDATE SET with a CASE expression', () async {
+      await DeltaWriter(tbl).write(t([1, 2, 3])).ok;
+      final engine = SqlEngine.open(allowExternalPaths: true).ok;
+      await engine
+          .execute(
+            "UPDATE '$tbl' SET name = CASE WHEN id >= 3 THEN 'hi' ELSE name END",
+          )
+          .ok;
       expect(await read(tbl), {1: 'n1', 2: 'n2', 3: 'hi'});
     });
 
     test('SQL UPDATE SET with a scalar function', () async {
-      await DeltaWriter(tbl).write(t([1, 2]));
-      final engine = SqlEngine(allowExternalPaths: true);
-      await engine.execute("UPDATE '$tbl' SET name = UPPER(name) WHERE id = 1");
+      await DeltaWriter(tbl).write(t([1, 2])).ok;
+      final engine = SqlEngine.open(allowExternalPaths: true).ok;
+      await engine
+          .execute("UPDATE '$tbl' SET name = UPPER(name) WHERE id = 1")
+          .ok;
       expect(await read(tbl), {1: 'N1', 2: 'n2'});
     });
 
     test('SQL UPDATE SET COALESCE fills a NULL', () async {
-      await DeltaWriter(tbl).write(
-        Table(
-          name: 't',
-          columns: [
-            NumericColumn.int64(name: 'id', values: [1, 2], nullable: false),
-            ListColumn<String>(
-              name: 'name',
-              dataType: DataType.string,
-              data: ['a', null],
-              nullable: true,
-            ),
-          ],
-          schema: Schema(
-            fields: [
-              Field(name: 'id', dataType: DataType.int64, nullable: false),
-              Field(name: 'name', dataType: DataType.string, nullable: true),
-            ],
-          ),
-        ),
-      );
-      final engine = SqlEngine(allowExternalPaths: true);
-      await engine.execute("UPDATE '$tbl' SET name = COALESCE(name, 'X')");
-      expect(await read(tbl), {1: 'a', 2: 'X'});
-    });
-
-    test('SQL INSERT VALUES with expressions evaluates them', () async {
-      await DeltaWriter(tbl).write(t([1]));
-      final engine = SqlEngine(allowExternalPaths: true);
-      await engine.execute("INSERT INTO '$tbl' VALUES (1 + 1, UPPER('a'))");
-      expect(await read(tbl), {1: 'n1', 2: 'A'});
-    });
-
-    test('SQL UPDATE with an arithmetic SET expression', () async {
-      await DeltaWriter(tbl).write(
-        Table(
-          name: 't',
-          columns: [
-            NumericColumn.int64(name: 'id', values: [1, 2, 3], nullable: false),
-            NumericColumn.int64(
-              name: 'v',
-              values: [10, 20, 30],
-              nullable: false,
-            ),
-          ],
-          schema: Schema(
-            fields: [
-              Field(name: 'id', dataType: DataType.int64, nullable: false),
-              Field(name: 'v', dataType: DataType.int64, nullable: false),
-            ],
-          ),
-        ),
-      );
-      final engine = SqlEngine(allowExternalPaths: true);
-      await engine.execute("UPDATE '$tbl' SET v = v + 100 WHERE id = 2");
-      final t2 = await DeltaTable(tbl).read();
-      final m = {for (final r in t2.toRows()) r['id'] as int: r['v']};
-      expect(m, {1: 10, 2: 120, 3: 30});
-    });
-
-    group('SQL UPDATE SET shares SELECT evaluator semantics (review 1+2)', () {
-      // The DML SET value now evaluates through the SAME physical evaluator as
-      // SELECT, so it inherits Kleene 3VL, checked int overflow and /0->NULL —
-      // the hand-rolled row evaluator collapsed NULL AND TRUE to false, wrapped
-      // int64 overflow, and produced Infinity on divide-by-zero.
-      late SqlEngine engine;
-      setUp(() => engine = SqlEngine(allowExternalPaths: true));
-      tearDown(() => engine.dispose());
-
-      test('AND with a NULL operand keeps NULL, not false (3VL)', () async {
-        await DeltaWriter(tbl).write(
-          Table(
-            name: 't',
-            columns: [
-              NumericColumn.int64(name: 'id', values: [1], nullable: false),
-              ListColumn<bool>(
-                name: 'flag',
-                dataType: DataType.boolean,
-                data: [null],
-                nullable: true,
-              ),
-              ListColumn<bool>(
-                name: 'out',
-                dataType: DataType.boolean,
-                data: [null],
-                nullable: true,
-              ),
-            ],
-            schema: Schema(
-              fields: [
-                Field(name: 'id', dataType: DataType.int64, nullable: false),
-                Field(name: 'flag', dataType: DataType.boolean, nullable: true),
-                Field(name: 'out', dataType: DataType.boolean, nullable: true),
-              ],
-            ),
-          ),
-        );
-        await engine.execute("UPDATE '$tbl' SET out = flag AND TRUE");
-        final row = (await DeltaTable(tbl).read()).toRows().single;
-        expect(row['out'], isNull); // NULL AND TRUE = NULL, not false
-      });
-
-      test(
-        'int64 overflow in a SET expression fails loud, not wrapped',
-        () async {
-          await DeltaWriter(tbl).write(
+      await DeltaWriter(tbl)
+          .write(
             Table(
               name: 't',
               columns: [
-                NumericColumn.int64(name: 'v', values: [1], nullable: false),
-              ],
-              schema: Schema(
-                fields: [
-                  Field(name: 'v', dataType: DataType.int64, nullable: false),
-                ],
-              ),
-            ),
-          );
-          await expectLater(
-            engine.execute("UPDATE '$tbl' SET v = 9223372036854775807 + 1"),
-            throwsA(anyOf(isA<FormatException>(), isA<StateError>())),
-          );
-          expect((await DeltaTable(tbl).read()).toRows().single['v'], 1);
-        },
-      );
-
-      test(
-        'divide by zero in a SET expression yields NULL, not Infinity',
-        () async {
-          await DeltaWriter(tbl).write(
-            Table(
-              name: 't',
-              columns: [
-                NumericColumn.int64(name: 'id', values: [1], nullable: false),
-                ListColumn<double>(
-                  name: 'x',
-                  dataType: DataType.float64,
-                  data: [1.0],
+                NumericColumn.int64(
+                  name: 'id',
+                  values: [1, 2],
+                  nullable: false,
+                ),
+                ListColumn<String>(
+                  name: 'name',
+                  dataType: DataType.string,
+                  data: ['a', null],
                   nullable: true,
                 ),
               ],
               schema: Schema(
                 fields: [
                   Field(name: 'id', dataType: DataType.int64, nullable: false),
-                  Field(name: 'x', dataType: DataType.float64, nullable: true),
+                  Field(
+                    name: 'name',
+                    dataType: DataType.string,
+                    nullable: true,
+                  ),
                 ],
               ),
             ),
+          )
+          .ok;
+      final engine = SqlEngine.open(allowExternalPaths: true).ok;
+      await engine.execute("UPDATE '$tbl' SET name = COALESCE(name, 'X')").ok;
+      expect(await read(tbl), {1: 'a', 2: 'X'});
+    });
+
+    test('SQL INSERT VALUES with expressions evaluates them', () async {
+      await DeltaWriter(tbl).write(t([1])).ok;
+      final engine = SqlEngine.open(allowExternalPaths: true).ok;
+      await engine.execute("INSERT INTO '$tbl' VALUES (1 + 1, UPPER('a'))").ok;
+      expect(await read(tbl), {1: 'n1', 2: 'A'});
+    });
+
+    test('a read-only engine rejects writes', () async {
+      await DeltaWriter(tbl).write(t([1, 2])).ok;
+      final engine = SqlEngine.open(
+        allowExternalPaths: true,
+        readOnly: true,
+      ).ok;
+      for (final statement in [
+        "UPDATE '$tbl' SET name = 'X'",
+        "INSERT INTO '$tbl' VALUES (3, 'c')",
+        "MERGE INTO '$tbl' USING '$tbl' ON id = id WHEN MATCHED THEN DELETE",
+        "CREATE VIEW v AS (SELECT * FROM '$tbl')",
+      ]) {
+        await expectLater(
+          engine.execute(statement),
+          failsWith(Kind.denied),
+          reason: statement,
+        );
+        await expectLater(
+          engine.executeStream(statement).first,
+          failsWith(Kind.denied),
+          reason: statement,
+        );
+      }
+      expect(await read(tbl), {1: 'n1', 2: 'n2'});
+      await engine.dispose();
+    });
+
+    test('a sandboxed engine is read-only unless told otherwise', () async {
+      await DeltaWriter(tbl).write(t([1, 2])).ok;
+      final sandboxed = SqlEngine.open(sandboxRoot: dir.path).ok;
+      await expectLater(
+        sandboxed.execute("UPDATE 'tbl' SET name = 'X'"),
+        failsWith(Kind.denied),
+      );
+      expect(await read(tbl), {1: 'n1', 2: 'n2'});
+      final writable = SqlEngine.open(
+        sandboxRoot: dir.path,
+        readOnly: false,
+      ).ok;
+      await writable.execute("UPDATE 'tbl' SET name = 'X'").ok;
+      expect(await read(tbl), {1: 'X', 2: 'X'});
+      await sandboxed.dispose();
+      await writable.dispose();
+    });
+
+    test('SQL UPDATE with an arithmetic SET expression', () async {
+      await DeltaWriter(tbl)
+          .write(
+            Table(
+              name: 't',
+              columns: [
+                NumericColumn.int64(
+                  name: 'id',
+                  values: [1, 2, 3],
+                  nullable: false,
+                ),
+                NumericColumn.int64(
+                  name: 'v',
+                  values: [10, 20, 30],
+                  nullable: false,
+                ),
+              ],
+              schema: Schema(
+                fields: [
+                  Field(name: 'id', dataType: DataType.int64, nullable: false),
+                  Field(name: 'v', dataType: DataType.int64, nullable: false),
+                ],
+              ),
+            ),
+          )
+          .ok;
+      final engine = SqlEngine.open(allowExternalPaths: true).ok;
+      await engine.execute("UPDATE '$tbl' SET v = v + 100 WHERE id = 2").ok;
+      final t2 = await DeltaTable(tbl).read().ok;
+      final m = {for (final r in t2.toRows()) r['id'] as int: r['v']};
+      expect(m, {1: 10, 2: 120, 3: 30});
+    });
+
+    group('SQL UPDATE SET shares SELECT evaluator semantics (review 1+2)', () {
+      // The DML SET value now evaluates through the SAME physical evaluator as
+      // SELECT, so it inherits Kleene 3VL, checked int overflow and /0->NULL:
+      // the hand-rolled row evaluator collapsed NULL AND TRUE to false, wrapped
+      // int64 overflow, and produced Infinity on divide-by-zero.
+      late SqlEngine engine;
+      setUp(() => engine = SqlEngine.open(allowExternalPaths: true).ok);
+      tearDown(() => engine.dispose());
+
+      test('AND with a NULL operand keeps NULL, not false (3VL)', () async {
+        await DeltaWriter(tbl)
+            .write(
+              Table(
+                name: 't',
+                columns: [
+                  NumericColumn.int64(name: 'id', values: [1], nullable: false),
+                  ListColumn<bool>(
+                    name: 'flag',
+                    dataType: DataType.boolean,
+                    data: [null],
+                    nullable: true,
+                  ),
+                  ListColumn<bool>(
+                    name: 'out',
+                    dataType: DataType.boolean,
+                    data: [null],
+                    nullable: true,
+                  ),
+                ],
+                schema: Schema(
+                  fields: [
+                    Field(
+                      name: 'id',
+                      dataType: DataType.int64,
+                      nullable: false,
+                    ),
+                    Field(
+                      name: 'flag',
+                      dataType: DataType.boolean,
+                      nullable: true,
+                    ),
+                    Field(
+                      name: 'out',
+                      dataType: DataType.boolean,
+                      nullable: true,
+                    ),
+                  ],
+                ),
+              ),
+            )
+            .ok;
+        await engine.execute("UPDATE '$tbl' SET out = flag AND TRUE").ok;
+        final row = (await DeltaTable(tbl).read().ok).toRows().single;
+        expect(row['out'], isNull); // NULL AND TRUE = NULL, not false
+      });
+
+      test(
+        'int64 overflow in a SET expression fails loud, not wrapped',
+        () async {
+          await DeltaWriter(tbl)
+              .write(
+                Table(
+                  name: 't',
+                  columns: [
+                    NumericColumn.int64(
+                      name: 'v',
+                      values: [1],
+                      nullable: false,
+                    ),
+                  ],
+                  schema: Schema(
+                    fields: [
+                      Field(
+                        name: 'v',
+                        dataType: DataType.int64,
+                        nullable: false,
+                      ),
+                    ],
+                  ),
+                ),
+              )
+              .ok;
+          await expectLater(
+            engine.execute("UPDATE '$tbl' SET v = 9223372036854775807 + 1"),
+            failsWith(Kind.invalid),
           );
-          await engine.execute("UPDATE '$tbl' SET x = 10.0 / 0");
-          expect((await DeltaTable(tbl).read()).toRows().single['x'], isNull);
+          expect((await DeltaTable(tbl).read().ok).toRows().single['v'], 1);
+        },
+      );
+
+      test(
+        'divide by zero in a SET expression yields NULL, not Infinity',
+        () async {
+          await DeltaWriter(tbl)
+              .write(
+                Table(
+                  name: 't',
+                  columns: [
+                    NumericColumn.int64(
+                      name: 'id',
+                      values: [1],
+                      nullable: false,
+                    ),
+                    ListColumn<double>(
+                      name: 'x',
+                      dataType: DataType.float64,
+                      data: [1.0],
+                      nullable: true,
+                    ),
+                  ],
+                  schema: Schema(
+                    fields: [
+                      Field(
+                        name: 'id',
+                        dataType: DataType.int64,
+                        nullable: false,
+                      ),
+                      Field(
+                        name: 'x',
+                        dataType: DataType.float64,
+                        nullable: true,
+                      ),
+                    ],
+                  ),
+                ),
+              )
+              .ok;
+          await engine.execute("UPDATE '$tbl' SET x = 10.0 / 0").ok;
+          expect(
+            (await DeltaTable(tbl).read().ok).toRows().single['x'],
+            isNull,
+          );
         },
       );
     });
@@ -1906,34 +2488,34 @@ void main() {
 
       late SqlEngine engine;
       setUp(() async {
-        await DeltaWriter(tbl).write(prices());
-        engine = SqlEngine(allowExternalPaths: true);
+        await DeltaWriter(tbl).write(prices()).ok;
+        engine = SqlEngine.open(allowExternalPaths: true).ok;
       });
       tearDown(() => engine.dispose());
 
       Future<Map<int, Object?>> byId() async {
-        final t = await DeltaTable(tbl).read();
+        final t = await DeltaTable(tbl).read().ok;
         return {for (final r in t.toRows()) r['id'] as int: r['price']};
       }
 
       test('WHERE price = <literal> matches by value', () async {
-        await engine.execute("UPDATE '$tbl' SET id = 99 WHERE price = 1.50");
-        final t = await DeltaTable(tbl).read();
+        await engine.execute("UPDATE '$tbl' SET id = 99 WHERE price = 1.50").ok;
+        final t = await DeltaTable(tbl).read().ok;
         final ids = t.column('id')!.toList()..sort();
         expect(ids, [2, 3, 99]);
       });
 
       test('WHERE price < <literal> compares by value', () async {
-        await engine.execute("UPDATE '$tbl' SET id = 99 WHERE price < 2.00");
-        final t = await DeltaTable(tbl).read();
+        await engine.execute("UPDATE '$tbl' SET id = 99 WHERE price < 2.00").ok;
+        final t = await DeltaTable(tbl).read().ok;
         final ids = t.column('id')!.toList()..sort();
         expect(ids, [2, 3, 99]);
       });
 
       test('SET price = price + 1 keeps exact scale', () async {
-        await engine.execute(
-          "UPDATE '$tbl' SET price = price + 1 WHERE id = 1",
-        );
+        await engine
+            .execute("UPDATE '$tbl' SET price = price + 1 WHERE id = 1")
+            .ok;
         expect(await byId(), {
           1: Decimal(BigInt.from(250), 2),
           2: Decimal(BigInt.from(250), 2),
@@ -1944,23 +2526,25 @@ void main() {
       test('SET decimal division fails loud, not rounded storage', () async {
         await expectLater(
           engine.execute("UPDATE '$tbl' SET price = price / 3 WHERE id = 1"),
-          throwsA(isA<FormatException>()),
+          failsWith(Kind.invalid),
         );
         // Nothing was committed.
         expect((await byId())[1], Decimal(BigInt.from(150), 2));
       });
 
       test('SET decimal = int literal stores the exact value', () async {
-        // An integer is exact in a decimal column — it must store, not fail
+        // An integer is exact in a decimal column; it must store, not fail
         // loud like a lossy float division.
-        await engine.execute("UPDATE '$tbl' SET price = 20 WHERE id = 1");
+        await engine.execute("UPDATE '$tbl' SET price = 20 WHERE id = 1").ok;
         expect((await byId())[1], Decimal(BigInt.from(2000), 2)); // 20.00
       });
 
       test(
         'SET decimal = int arithmetic stores exactly at column scale',
         () async {
-          await engine.execute("UPDATE '$tbl' SET price = 2 + 3 WHERE id = 1");
+          await engine
+              .execute("UPDATE '$tbl' SET price = 2 + 3 WHERE id = 1")
+              .ok;
           expect((await byId())[1], Decimal(BigInt.from(500), 2)); // 5.00
         },
       );
@@ -1968,8 +2552,87 @@ void main() {
       test(
         'INSERT an int into a decimal column stores the exact value',
         () async {
-          await engine.execute("INSERT INTO '$tbl' VALUES (4, 20)");
+          await engine.execute("INSERT INTO '$tbl' VALUES (4, 20)").ok;
           expect((await byId())[4], Decimal(BigInt.from(2000), 2)); // 20.00
+        },
+      );
+    });
+
+    group('SQL UPDATE over an integer or float column', () {
+      // A SET value takes the column's type as CAST gives it: a decimal or
+      // double result is rounded half away from zero into an integer column.
+      Table pay() => Table(
+        name: 't',
+        columns: [
+          NumericColumn.int64(name: 'id', values: [1, 2], nullable: false),
+          NumericColumn.int16(
+            name: 'salary',
+            values: [10000, 20000],
+            nullable: false,
+          ),
+          NumericColumn.float64(
+            name: 'score',
+            values: [1.5, 2.5],
+            nullable: false,
+          ),
+        ],
+        schema: Schema(
+          fields: [
+            Field(name: 'id', dataType: DataType.int64, nullable: false),
+            Field(name: 'salary', dataType: DataType.int16, nullable: false),
+            Field(name: 'score', dataType: DataType.float64, nullable: false),
+          ],
+        ),
+      );
+
+      late SqlEngine engine;
+      setUp(() async {
+        await DeltaWriter(tbl).write(pay()).ok;
+        engine = SqlEngine.open(allowExternalPaths: true).ok;
+      });
+      tearDown(() => engine.dispose());
+
+      Future<Map<int, Map<String, Object?>>> byId() async {
+        final t = await DeltaTable(tbl).read().ok;
+        return {for (final r in t.toRows()) r['id'] as int: r};
+      }
+
+      test('a decimal result is stored as an integer', () async {
+        await engine
+            .execute("UPDATE '$tbl' SET salary = salary * 1.05 WHERE id = 1")
+            .ok;
+        expect((await byId())[1]!['salary'], 10500);
+      });
+
+      test('a fractional result is rounded half away from zero', () async {
+        await engine
+            .execute("UPDATE '$tbl' SET salary = salary + 0.5 WHERE id = 2")
+            .ok;
+        expect((await byId())[2]!['salary'], 20001);
+      });
+
+      test('a double result is stored as an integer', () async {
+        await engine
+            .execute("UPDATE '$tbl' SET salary = salary * 1.5e0 WHERE id = 1")
+            .ok;
+        expect((await byId())[1]!['salary'], 15000);
+      });
+
+      test('an integer result is stored in a float column', () async {
+        await engine.execute("UPDATE '$tbl' SET score = 2 WHERE id = 1").ok;
+        expect((await byId())[1]!['score'], 2.0);
+      });
+
+      test(
+        'a result outside the column type fails and commits nothing',
+        () async {
+          await expectLater(
+            engine.execute(
+              "UPDATE '$tbl' SET salary = salary * 2 WHERE id = 2",
+            ),
+            failsWith(Kind.invalid),
+          );
+          expect((await byId())[2]!['salary'], 20000);
         },
       );
     });
@@ -1978,25 +2641,27 @@ void main() {
       'arithmetic on a non-numeric column fails loud (FormatException)',
       () async {
         // a mistyped operand yields a domain error, not a raw TypeError.
-        await DeltaWriter(tbl).write(t([1, 2]));
-        final engine = SqlEngine(allowExternalPaths: true);
+        await DeltaWriter(tbl).write(t([1, 2])).ok;
+        final engine = SqlEngine.open(allowExternalPaths: true).ok;
         await expectLater(
           engine.execute("UPDATE '$tbl' SET name = name + 1 WHERE id = 1"),
-          throwsA(isA<FormatException>()),
+          failsWith(Kind.invalid),
         );
       },
     );
 
     test('SQL MERGE INTO … UPDATE SET * / INSERT * (upsert)', () async {
-      await DeltaWriter(tbl).write(t([0, 1, 2, 3, 4]));
+      await DeltaWriter(tbl).write(t([0, 1, 2, 3, 4])).ok;
       final src = '${dir.path}/src.parquet';
-      await ParquetWriter(src).write(t([3, 5], ['s3', 's5']));
-      final engine = SqlEngine(allowExternalPaths: true);
-      await engine.execute(
-        "MERGE INTO '$tbl' t USING '$src' s ON t.id = s.id "
-        "WHEN MATCHED THEN UPDATE SET * "
-        "WHEN NOT MATCHED THEN INSERT *",
-      );
+      await ParquetWriter(src).write(t([3, 5], ['s3', 's5'])).ok;
+      final engine = SqlEngine.open(allowExternalPaths: true).ok;
+      await engine
+          .execute(
+            "MERGE INTO '$tbl' t USING '$src' s ON t.id = s.id "
+            "WHEN MATCHED THEN UPDATE SET * "
+            "WHEN NOT MATCHED THEN INSERT *",
+          )
+          .ok;
       expect(await read(tbl), {
         0: 'n0',
         1: 'n1',
@@ -2008,39 +2673,45 @@ void main() {
     });
 
     test('SQL MERGE … WHEN MATCHED THEN DELETE', () async {
-      await DeltaWriter(tbl).write(t([0, 1, 2, 3, 4]));
+      await DeltaWriter(tbl).write(t([0, 1, 2, 3, 4])).ok;
       final src = '${dir.path}/d.parquet';
-      await ParquetWriter(src).write(t([1, 3]));
-      final engine = SqlEngine(allowExternalPaths: true);
-      await engine.execute(
-        "MERGE INTO '$tbl' USING '$src' ON id = id WHEN MATCHED THEN DELETE",
-      );
+      await ParquetWriter(src).write(t([1, 3])).ok;
+      final engine = SqlEngine.open(allowExternalPaths: true).ok;
+      await engine
+          .execute(
+            "MERGE INTO '$tbl' USING '$src' ON id = id WHEN MATCHED THEN DELETE",
+          )
+          .ok;
       expect((await read(tbl)).keys.toList()..sort(), [0, 2, 4]);
     });
 
     group('SQL INSERT INTO … VALUES', () {
       test('appends a single row and returns the version', () async {
-        await DeltaWriter(tbl).write(t([0]));
-        final engine = SqlEngine(allowExternalPaths: true);
-        final res = await engine.execute("INSERT INTO '$tbl' VALUES (1, 'a')");
+        await DeltaWriter(tbl).write(t([0])).ok;
+        final engine = SqlEngine.open(allowExternalPaths: true).ok;
+        final res = await engine
+            .execute("INSERT INTO '$tbl' VALUES (1, 'a')")
+            .ok;
         expect(res.column('version')!.toList(), [1]);
         expect(await read(tbl), {0: 'n0', 1: 'a'});
       });
 
       test('appends several rows in one commit', () async {
-        await DeltaWriter(tbl).write(t([0]));
-        final engine = SqlEngine(allowExternalPaths: true);
-        final res = await engine.execute(
-          "INSERT INTO '$tbl' VALUES (1, 'a'), (2, 'b'), (3, 'c')",
-        );
+        await DeltaWriter(tbl).write(t([0])).ok;
+        final engine = SqlEngine.open(allowExternalPaths: true).ok;
+        final res = await engine
+            .execute("INSERT INTO '$tbl' VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+            .ok;
         expect(res.column('version')!.toList(), [1], reason: 'one commit');
         expect(await read(tbl), {0: 'n0', 1: 'a', 2: 'b', 3: 'c'});
       });
 
       test('a column list may reorder the columns', () async {
-        await DeltaWriter(tbl).write(t([0]));
-        final engine = SqlEngine(allowExternalPaths: true);
-        await engine.execute("INSERT INTO '$tbl' (name, id) VALUES ('a', 1)");
+        await DeltaWriter(tbl).write(t([0])).ok;
+        final engine = SqlEngine.open(allowExternalPaths: true).ok;
+        await engine
+            .execute("INSERT INTO '$tbl' (name, id) VALUES ('a', 1)")
+            .ok;
         expect(await read(tbl), {0: 'n0', 1: 'a'});
       });
 
@@ -2063,46 +2734,57 @@ void main() {
             ],
           ),
         );
-        await DeltaWriter(tbl).write(nullable);
-        final engine = SqlEngine(allowExternalPaths: true);
-        await engine.execute("INSERT INTO '$tbl' (id) VALUES (1)");
-        await engine.execute("INSERT INTO '$tbl' VALUES (2, NULL)");
+        await DeltaWriter(tbl).write(nullable).ok;
+        final engine = SqlEngine.open(allowExternalPaths: true).ok;
+        await engine.execute("INSERT INTO '$tbl' (id) VALUES (1)").ok;
+        await engine.execute("INSERT INTO '$tbl' VALUES (2, NULL)").ok;
         expect(await read(tbl), {0: 'n0', 1: null, 2: null});
       });
 
       test('an int literal widens into a float column', () async {
-        await DeltaWriter(tbl).write(
-          Table(
-            name: 't',
-            columns: [
-              NumericColumn.int64(name: 'id', values: [0], nullable: false),
-              NumericColumn.float64(
-                name: 'amt',
-                values: [1.5],
-                nullable: false,
+        await DeltaWriter(tbl)
+            .write(
+              Table(
+                name: 't',
+                columns: [
+                  NumericColumn.int64(name: 'id', values: [0], nullable: false),
+                  NumericColumn.float64(
+                    name: 'amt',
+                    values: [1.5],
+                    nullable: false,
+                  ),
+                ],
+                schema: Schema(
+                  fields: [
+                    Field(
+                      name: 'id',
+                      dataType: DataType.int64,
+                      nullable: false,
+                    ),
+                    Field(
+                      name: 'amt',
+                      dataType: DataType.float64,
+                      nullable: false,
+                    ),
+                  ],
+                ),
               ),
-            ],
-            schema: Schema(
-              fields: [
-                Field(name: 'id', dataType: DataType.int64, nullable: false),
-                Field(name: 'amt', dataType: DataType.float64, nullable: false),
-              ],
-            ),
-          ),
-        );
-        final engine = SqlEngine(allowExternalPaths: true);
-        await engine.execute("INSERT INTO '$tbl' VALUES (1, 3)");
-        final rows = (await DeltaTable(tbl).read()).toRows();
+            )
+            .ok;
+        final engine = SqlEngine.open(allowExternalPaths: true).ok;
+        await engine.execute("INSERT INTO '$tbl' VALUES (1, 3)").ok;
+        final rows = (await DeltaTable(tbl).read().ok).toRows();
         expect(rows.map((r) => r['amt']), [1.5, 3.0]);
       });
 
       test('works through executeStream', () async {
         // executeStream has its own statement dispatch; without INSERT there it
         // falls through to the SELECT path and dies on a cast.
-        await DeltaWriter(tbl).write(t([0]));
-        final engine = SqlEngine(allowExternalPaths: true);
+        await DeltaWriter(tbl).write(t([0])).ok;
+        final engine = SqlEngine.open(allowExternalPaths: true).ok;
         await engine
             .executeStream("INSERT INTO '$tbl' VALUES (1, 'a')")
+            .ok
             .drain();
         expect(await read(tbl), {0: 'n0', 1: 'a'});
       });
@@ -2110,73 +2792,58 @@ void main() {
       test('appends to a partitioned table', () async {
         // The append has to repeat the table's partition layout, which is
         // recoverable only from the committed metadata.
-        await DeltaWriter(tbl).write(t([0, 1]), partitionBy: ['name']);
-        final engine = SqlEngine(allowExternalPaths: true);
-        await engine.execute("INSERT INTO '$tbl' VALUES (2, 'n2')");
+        await DeltaWriter(tbl).write(t([0, 1]), partitionBy: ['name']).ok;
+        final engine = SqlEngine.open(allowExternalPaths: true).ok;
+        await engine.execute("INSERT INTO '$tbl' VALUES (2, 'n2')").ok;
         expect(await read(tbl), {0: 'n0', 1: 'n1', 2: 'n2'});
       });
 
       group('INSERT fails closed (table untouched)', () {
-        Future<void> rejects(String sql, Matcher matcher) async {
-          await DeltaWriter(tbl).write(t([0, 1]));
-          final engine = SqlEngine(allowExternalPaths: true);
-          await expectLater(engine.execute(sql), throwsA(matcher));
+        Future<void> rejects(String sql, Kind kind) async {
+          await DeltaWriter(tbl).write(t([0, 1])).ok;
+          final engine = SqlEngine.open(allowExternalPaths: true).ok;
+          await expectLater(engine.execute(sql), failsWith(kind));
           expect(await read(tbl), {0: 'n0', 1: 'n1'}); // untouched
         }
 
         test('too few values', () async {
-          await rejects("INSERT INTO '$tbl' VALUES (2)", isA<ArgumentError>());
+          await rejects("INSERT INTO '$tbl' VALUES (2)", Kind.schema);
         });
 
         test('too many values', () async {
           await rejects(
             "INSERT INTO '$tbl' VALUES (2, 'a', 'extra')",
-            isA<ArgumentError>(),
+            Kind.schema,
           );
         });
 
         test('a column list naming an unknown column', () async {
-          await rejects(
-            "INSERT INTO '$tbl' (nope) VALUES (2)",
-            isA<ArgumentError>(),
-          );
+          await rejects("INSERT INTO '$tbl' (nope) VALUES (2)", Kind.schema);
         });
 
         test('a column named twice', () async {
           await rejects(
             "INSERT INTO '$tbl' (id, id) VALUES (2, 3)",
-            isA<ArgumentError>(),
+            Kind.schema,
           );
         });
 
         test('a string into an int column', () async {
-          await rejects(
-            "INSERT INTO '$tbl' VALUES ('x', 'a')",
-            isA<ArgumentError>(),
-          );
+          await rejects("INSERT INTO '$tbl' VALUES ('x', 'a')", Kind.schema);
         });
 
         test('an int into a string column', () async {
           // commonType would widen int->string; storing it would put an int
           // inside a string column, which column validation does not catch.
-          await rejects(
-            "INSERT INTO '$tbl' VALUES (2, 9)",
-            isA<ArgumentError>(),
-          );
+          await rejects("INSERT INTO '$tbl' VALUES (2, 9)", Kind.schema);
         });
 
         test('NULL into a non-nullable column', () async {
-          await rejects(
-            "INSERT INTO '$tbl' VALUES (2, NULL)",
-            isA<ArgumentError>(),
-          );
+          await rejects("INSERT INTO '$tbl' VALUES (2, NULL)", Kind.schema);
         });
 
         test('a non-constant value', () async {
-          await rejects(
-            "INSERT INTO '$tbl' VALUES (2, name)",
-            isA<FormatException>(),
-          );
+          await rejects("INSERT INTO '$tbl' VALUES (2, name)", Kind.invalid);
         });
       });
 
@@ -2184,10 +2851,10 @@ void main() {
         // DeltaWriter.write creates a table on an empty location, so a typo'd
         // path must be rejected before it gets there.
         final missing = '${dir.path}/nosuch';
-        final engine = SqlEngine(allowExternalPaths: true);
+        final engine = SqlEngine.open(allowExternalPaths: true).ok;
         await expectLater(
           engine.execute("INSERT INTO '$missing' VALUES (1, 'a')"),
-          throwsA(anyOf(isA<ArgumentError>(), isA<StateError>())),
+          failsWith(Kind.missing),
         );
         expect(Directory(missing).existsSync(), isFalse);
       });
@@ -2195,31 +2862,31 @@ void main() {
 
     group('DML fails closed (no silent degrade)', () {
       test('UPDATE WHERE on an unknown column throws', () async {
-        await DeltaWriter(tbl).write(t([0, 1, 2]));
-        final engine = SqlEngine(allowExternalPaths: true);
+        await DeltaWriter(tbl).write(t([0, 1, 2])).ok;
+        final engine = SqlEngine.open(allowExternalPaths: true).ok;
         await expectLater(
           engine.execute("UPDATE '$tbl' SET name = 'X' WHERE missing = 1"),
-          throwsA(isA<FormatException>()),
+          failsWith(Kind.invalid),
         );
         expect(await read(tbl), {0: 'n0', 1: 'n1', 2: 'n2'}); // untouched
       });
 
       test('UPDATE SET to an unknown column throws (not null-write)', () async {
-        await DeltaWriter(tbl).write(t([0, 1, 2]));
-        final engine = SqlEngine(allowExternalPaths: true);
+        await DeltaWriter(tbl).write(t([0, 1, 2])).ok;
+        final engine = SqlEngine.open(allowExternalPaths: true).ok;
         await expectLater(
           engine.execute("UPDATE '$tbl' SET name = missing WHERE id = 1"),
-          throwsA(isA<FormatException>()),
+          failsWith(Kind.invalid),
         );
         expect(await read(tbl), {0: 'n0', 1: 'n1', 2: 'n2'});
       });
 
       test('UPDATE WHERE that is a non-boolean expression throws', () async {
-        await DeltaWriter(tbl).write(t([0, 1, 2]));
-        final engine = SqlEngine(allowExternalPaths: true);
+        await DeltaWriter(tbl).write(t([0, 1, 2])).ok;
+        final engine = SqlEngine.open(allowExternalPaths: true).ok;
         await expectLater(
           engine.execute("UPDATE '$tbl' SET name = 'X' WHERE id"),
-          throwsA(isA<FormatException>()),
+          failsWith(Kind.invalid),
         );
       });
     });
@@ -2295,7 +2962,7 @@ void main() {
 
     test('a malformed Z85 descriptor throws FormatException', () async {
       // A 20-char UUID descriptor (the 'u' path slices the last 20 chars) whose
-      // last char is a space — not in the Z85 alphabet.
+      // last char is a space, not in the Z85 alphabet.
       final dv = DeletionVectorDescriptor(
         storageType: 'u',
         pathOrInlineDv: '${'0' * 19} ',
@@ -2312,7 +2979,7 @@ void main() {
 
   // A bitmap container stores its bits in a Uint64List, so bit 63 of a word
   // reads back as a NEGATIVE Dart int. Iterating it must still yield 63.
-  // `add`/`contains` only mask bits and were always right — the bug lived
+  // `add`/`contains` only mask bits and were always right: the bug lived
   // solely where a bit position is converted back into a number, which is why a
   // test that builds a bitmap container but never iterates it passed.
   group('roaring bitmap word-boundary iteration', () {
@@ -2367,7 +3034,9 @@ void main() {
     test('a bit-63 deletion vector survives serialize -> deserialize', () {
       final values = {63, for (var i = 1000; i < 5200; i++) i};
       expect(
-        Roaring.deserializeTreemap(Roaring.serializeTreemap(values)),
+        Roaring.deserializeToBitmap(
+          Roaring.serializeTreemap(values),
+        ).values.toSet(),
         values,
       );
     });
@@ -2454,41 +3123,37 @@ void main() {
       dir = Directory.systemTemp.createTempSync('merge_cap_');
       tbl = '${dir.path}/tbl';
       src = '${dir.path}/src.parquet';
-      await DeltaWriter(tbl).write(t([0, 1, 2]));
-      await ParquetWriter(src).write(t([2, 3, 4, 5, 6])); // 5-row source
+      await DeltaWriter(tbl).write(t([0, 1, 2])).ok;
+      await ParquetWriter(src).write(t([2, 3, 4, 5, 6])).ok; // 5-row source
     });
     tearDown(() => dir.deleteSync(recursive: true));
 
     test('oversized MERGE subquery source fails loud (no OOM)', () async {
-      final engine = SqlEngine(
+      final engine = SqlEngine.open(
         allowExternalPaths: true,
         maxMaterializedRows: 2,
-      );
+      ).ok;
       expect(
         engine.execute(
           "MERGE INTO '$tbl' t USING (SELECT * FROM '$src') s ON t.id = s.id "
           "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *",
         ),
-        throwsA(
-          isA<StateError>().having(
-            (e) => e.toString(),
-            'message',
-            contains('maxRows'),
-          ),
-        ),
+        failsWith(Kind.limit, contains('maxRows')),
       );
     });
 
     test('a within-cap MERGE subquery source still works', () async {
-      final engine = SqlEngine(
+      final engine = SqlEngine.open(
         allowExternalPaths: true,
         maxMaterializedRows: 100,
-      );
-      await engine.execute(
-        "MERGE INTO '$tbl' t USING (SELECT * FROM '$src') s ON t.id = s.id "
-        "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *",
-      );
-      final t2 = await (await DataFrameIO.readDelta(tbl)).execute();
+      ).ok;
+      await engine
+          .execute(
+            "MERGE INTO '$tbl' t USING (SELECT * FROM '$src') s ON t.id = s.id "
+            "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *",
+          )
+          .ok;
+      final t2 = await (await DataFrameIO.readDelta(tbl).ok).execute().ok;
       expect(
         {for (final r in t2.toRows()) r['id'] as int},
         {0, 1, 2, 3, 4, 5, 6},
@@ -2505,17 +3170,41 @@ void main() {
       ),
     );
 
+    test('a file: URI add.path inside the table reads', () async {
+      final dir = Directory.systemTemp.createTempSync('confine_');
+      addTearDown(() => dir.deleteSync(recursive: true));
+      final path = '${dir.path}/t';
+      await DeltaWriter(path).write(t([1, 2])).ok;
+      final log = File('$path/_delta_log/${'0'.padLeft(20, '0')}.json');
+      final root = Directory(path).absolute.path;
+      log.writeAsStringSync(
+        log
+            .readAsLinesSync()
+            .map((line) {
+              final action = jsonDecode(line) as Map<String, dynamic>;
+              final add = action['add'] as Map<String, dynamic>?;
+              if (add == null) return line;
+              return jsonEncode({
+                'add': {...add, 'path': 'file:$root/${add['path']}'},
+              });
+            })
+            .join('\n'),
+      );
+      final read = await DeltaTable(path).read().ok;
+      expect(read.rowCount, 2);
+    });
+
     test('add.path outside the table root is confined by default', () async {
       final dir = Directory.systemTemp.createTempSync('confine_');
       addTearDown(() => dir.deleteSync(recursive: true));
       final tbl = '${dir.path}/t';
 
       // A normal table (commit 0, ids 1..3).
-      await DeltaWriter(tbl).write(t([1, 2, 3]));
+      await DeltaWriter(tbl).write(t([1, 2, 3])).ok;
 
       // A data file OUTSIDE the table dir, referenced by an absolute path.
       final outside = '${dir.path}/outside.parquet';
-      await ParquetWriter(outside).write(t([99]));
+      await ParquetWriter(outside).write(t([99])).ok;
 
       // Hand-author commit 1 adding the external file.
       final commit1 = '$tbl/_delta_log/${'0' * 19}1.json';
@@ -2532,10 +3221,10 @@ void main() {
       );
 
       // Default: the escape is rejected.
-      await expectLater(DeltaTable(tbl).read(), throwsA(isA<ArgumentError>()));
+      await expectLater(DeltaTable(tbl).read(), failsWith(Kind.denied));
 
       // Opt-in: the external file is read (ids 1,2,3,99).
-      final t2 = await DeltaTable(tbl, allowExternalPaths: true).read();
+      final t2 = await DeltaTable(tbl, allowExternalPaths: true).read().ok;
       expect({for (final r in t2.toRows()) r['id'] as int}, {1, 2, 3, 99});
     });
   });
@@ -2555,8 +3244,8 @@ void main() {
 
     test('write does not throw and the column round-trips', () async {
       final path = '${dir.path}/tbl';
-      await DeltaWriter(path).write(floats([1.0, double.nan, 3.0]));
-      final t = await (await DataFrameIO.readDelta(path)).execute();
+      await DeltaWriter(path).write(floats([1.0, double.nan, 3.0])).ok;
+      final t = await (await DataFrameIO.readDelta(path).ok).execute().ok;
       final back = t.column('f')!.toList();
       expect(back[0], 1.0);
       expect((back[1] as double).isNaN, isTrue);
@@ -2564,7 +3253,7 @@ void main() {
     });
   });
 
-  group('#1 Delta commit coordinator seam', () {
+  group('#1 Delta commit coordinator boundary', () {
     late Directory dir;
     late String path;
     setUp(() {
@@ -2583,18 +3272,18 @@ void main() {
 
     test('an injected coordinator is used for the commit', () async {
       final probe = _CountingCoordinator();
-      await DeltaWriter(path, coordinator: probe).write(ids([1, 2, 3]));
+      await DeltaWriter(path, coordinator: probe).write(ids([1, 2, 3])).ok;
       expect(probe.commits, greaterThan(0));
       // And the write is a real, readable commit.
-      final t = await (await DataFrameIO.readDelta(path)).execute();
+      final t = await (await DataFrameIO.readDelta(path).ok).execute().ok;
       expect(t.column('id')!.toList(), [1, 2, 3]);
     });
 
     test('sequential writes advance versions contiguously', () async {
       final w = DeltaWriter(path);
-      await w.write(ids([1]));
-      await w.write(ids([2]));
-      await w.write(ids([3]));
+      await w.write(ids([1])).ok;
+      await w.write(ids([2])).ok;
+      await w.write(ids([3])).ok;
       expect(await DeltaLog(path).versions(), [0, 1, 2]);
     });
   });
@@ -2605,40 +3294,56 @@ void main() {
       final path = '${dir.path}/tbl';
       try {
         // v0: schema {id int64}
-        await DeltaWriter(path).write(
-          Table(
-            name: 't',
-            columns: [
-              NumericColumn.int64(name: 'id', values: [1, 2], nullable: false),
-            ],
-            schema: Schema(
-              fields: [
-                Field(name: 'id', dataType: DataType.int64, nullable: false),
-              ],
-            ),
-          ),
-        );
-        // overwrite with a DIFFERENT schema {name string}
-        await DeltaWriter(path).write(
-          Table(
-            name: 't',
-            columns: [
-              ListColumn<String>(
-                name: 'name',
-                dataType: DataType.string,
-                data: ['x', 'y'],
-                nullable: false,
+        await DeltaWriter(path)
+            .write(
+              Table(
+                name: 't',
+                columns: [
+                  NumericColumn.int64(
+                    name: 'id',
+                    values: [1, 2],
+                    nullable: false,
+                  ),
+                ],
+                schema: Schema(
+                  fields: [
+                    Field(
+                      name: 'id',
+                      dataType: DataType.int64,
+                      nullable: false,
+                    ),
+                  ],
+                ),
               ),
-            ],
-            schema: Schema(
-              fields: [
-                Field(name: 'name', dataType: DataType.string, nullable: false),
-              ],
-            ),
-          ),
-          mode: DeltaWriteMode.overwrite,
-        );
-        final t = await (await DataFrameIO.readDelta(path)).execute();
+            )
+            .ok;
+        // overwrite with a DIFFERENT schema {name string}
+        await DeltaWriter(path)
+            .write(
+              Table(
+                name: 't',
+                columns: [
+                  ListColumn<String>(
+                    name: 'name',
+                    dataType: DataType.string,
+                    data: ['x', 'y'],
+                    nullable: false,
+                  ),
+                ],
+                schema: Schema(
+                  fields: [
+                    Field(
+                      name: 'name',
+                      dataType: DataType.string,
+                      nullable: false,
+                    ),
+                  ],
+                ),
+              ),
+              mode: DeltaWriteMode.overwrite,
+            )
+            .ok;
+        final t = await (await DataFrameIO.readDelta(path).ok).execute().ok;
         expect(t.schema.fields.map((f) => f.name), ['name']);
         expect(t.column('name')!.toList(), ['x', 'y']);
       } finally {
@@ -2660,21 +3365,27 @@ void main() {
     );
 
     Future<void> seed(String path) async {
-      await DeltaWriter(path).write(
-        Table(
-          name: 't',
-          columns: [
-            NumericColumn.int64(name: 'id', values: [1, 2], nullable: false),
-            ListColumn<String>(
-              name: 'name',
-              dataType: DataType.string,
-              data: ['a', 'b'],
-              nullable: true,
+      await DeltaWriter(path)
+          .write(
+            Table(
+              name: 't',
+              columns: [
+                NumericColumn.int64(
+                  name: 'id',
+                  values: [1, 2],
+                  nullable: false,
+                ),
+                ListColumn<String>(
+                  name: 'name',
+                  dataType: DataType.string,
+                  data: ['a', 'b'],
+                  nullable: true,
+                ),
+              ],
+              schema: idName(),
             ),
-          ],
-          schema: idName(),
-        ),
-      );
+          )
+          .ok;
     }
 
     test(
@@ -2687,7 +3398,7 @@ void main() {
             (row) => row['id'] == 1,
             {'nmae': (row) => 'X'}, // typo: column is 'name'
           ),
-          throwsArgumentError,
+          failsWith(Kind.invalid),
         );
       },
     );
@@ -2714,7 +3425,7 @@ void main() {
       );
       await expectLater(
         DeltaWriter(path).merge(source, on: ['id']),
-        throwsArgumentError,
+        failsWith(Kind.invalid),
       );
     });
   });
@@ -2726,19 +3437,21 @@ void main() {
 
     test('Delta merge rejects a source over the byte budget', () async {
       final path = '${dir.path}/tbl';
-      await DeltaWriter(path).write(
-        Table(
-          name: 't',
-          columns: [
-            NumericColumn.int64(name: 'id', values: [1], nullable: false),
-          ],
-          schema: Schema(
-            fields: [
-              Field(name: 'id', dataType: DataType.int64, nullable: false),
-            ],
-          ),
-        ),
-      );
+      await DeltaWriter(path)
+          .write(
+            Table(
+              name: 't',
+              columns: [
+                NumericColumn.int64(name: 'id', values: [1], nullable: false),
+              ],
+              schema: Schema(
+                fields: [
+                  Field(name: 'id', dataType: DataType.int64, nullable: false),
+                ],
+              ),
+            ),
+          )
+          .ok;
       final big = 'x' * 4096;
       final source = Table(
         name: 's',
@@ -2764,7 +3477,7 @@ void main() {
       );
       await expectLater(
         DeltaWriter(path).merge(source, on: ['id'], maxSourceBytes: 4096),
-        throwsStateError,
+        failsWith(Kind.limit),
       );
     });
   });
@@ -2791,12 +3504,12 @@ void main() {
         ),
       );
       final writer = DeltaWriter(path);
-      await writer.write(one(1));
+      await writer.write(one(1)).ok;
       for (var i = 2; i <= 6; i++) {
-        await writer.write(one(i));
+        await writer.write(one(i)).ok;
       }
-      final back = await DataFrameIO.readDelta(path);
-      final table = await back.execute(maxRows: null);
+      final back = await DataFrameIO.readDelta(path).ok;
+      final table = await back.execute(maxRows: null).ok;
       expect(table.rowCount, 6);
       final ids = (table.column('id')!.toList()..sort());
       expect(ids, [1, 2, 3, 4, 5, 6]);
@@ -2821,41 +3534,37 @@ void main() {
     test('sequential commits under the lock work (functional)', () async {
       final path = '${dir.path}/lk1';
       const coord = FileLockDeltaCommitCoordinator();
-      await DeltaWriter(path, coordinator: coord).write(one(1));
-      await DeltaWriter(path, coordinator: coord).write(one(2));
-      final back = await DeltaTable(path).read();
+      await DeltaWriter(path, coordinator: coord).write(one(1)).ok;
+      await DeltaWriter(path, coordinator: coord).write(one(2)).ok;
+      final back = await DeltaTable(path).read().ok;
       expect({for (final r in back.toRows()) r['id'] as int}, {1, 2});
       expect(File('$path/_delta_log/_commit.lock').existsSync(), isTrue);
     });
 
-    test(
-      'concurrent writer PROCESSES lose no commits',
-      () async {
-        final path = '${dir.path}/lk2';
-        // Seed v0 with a single writer, then race N separate processes appending.
-        await DeltaWriter(
-          path,
-          coordinator: const FileLockDeltaCommitCoordinator(),
-        ).write(one(0));
-        const n = 4;
-        final results = await Future.wait([
-          for (var i = 1; i <= n; i++)
-            Process.run('dart', [
-              'run',
-              'test/support/delta_lock_append.dart',
-              path,
-              '$i',
-            ]),
-        ]);
-        for (final r in results) {
-          expect(r.exitCode, 0, reason: '${r.stdout}\n${r.stderr}');
-        }
-        final back = await DeltaTable(path).read();
-        final ids = {for (final r in back.toRows()) r['id'] as int};
-        expect(ids, {0, 1, 2, 3, 4}); // seed + every append, none lost
-      },
-      timeout: const Timeout(Duration(minutes: 2)),
-    );
+    test('concurrent writer PROCESSES lose no commits', () async {
+      final path = '${dir.path}/lk2';
+      // Seed v0 with a single writer, then race N separate processes appending.
+      await DeltaWriter(
+        path,
+        coordinator: const FileLockDeltaCommitCoordinator(),
+      ).write(one(0)).ok;
+      const n = 4;
+      final results = await Future.wait([
+        for (var i = 1; i <= n; i++)
+          Process.run('dart', [
+            'run',
+            'test/support/delta_lock_append.dart',
+            path,
+            '$i',
+          ]),
+      ]);
+      for (final r in results) {
+        expect(r.exitCode, 0, reason: '${r.stdout}\n${r.stderr}');
+      }
+      final back = await DeltaTable(path).read().ok;
+      final ids = {for (final r in back.toRows()) r['id'] as int};
+      expect(ids, {0, 1, 2, 3, 4}); // seed + every append, none lost
+    }, timeout: const Timeout(Duration(minutes: 2)));
   });
 
   group('#F2 registry failure after publish is indeterminate', () {
@@ -2868,7 +3577,7 @@ void main() {
       // Point the registry at an existing DIRECTORY. The lock (a sibling) still
       // works and _read sees no registry FILE (a fresh registry, so the body
       // runs), but the final temp→registry rename fails AFTER the Delta commit
-      // has published — the exact "committed but pointer unrecorded" window.
+      // has published: the exact "committed but pointer unrecorded" window.
       final registry = '${dir.path}/registry.json';
       Directory(registry).createSync();
       final catalog = LocalCatalog(registry);
@@ -2878,7 +3587,7 @@ void main() {
       // staged files. The coordinator must remap it to an indeterminate outcome.
       await expectLater(
         DeltaWriter(path, coordinator: coord).write(_ids([1, 2, 3])),
-        throwsA(isA<DeltaCommitIndeterminate>()),
+        failsWith(Kind.indeterminate),
       );
 
       // The commit published (v0 in the log) and its data files SURVIVE.
@@ -2893,7 +3602,7 @@ void main() {
         isNotEmpty,
         reason: 'staged data must not be deleted after the commit published',
       );
-      final back = await DeltaTable(path).read();
+      final back = await DeltaTable(path).read().ok;
       expect({for (final r in back.toRows()) r['id'] as int}, {1, 2, 3});
     });
   });
@@ -2923,10 +3632,10 @@ void main() {
           ],
         ),
       );
-      await DeltaWriter(path).write(t, partitionBy: ['p']);
+      await DeltaWriter(path).write(t, partitionBy: ['p']).ok;
       await expectLater(
-        DeltaWriter(path).write(t), // no partitionBy — mismatch
-        throwsA(isA<StateError>()),
+        DeltaWriter(path).write(t), // no partitionBy: mismatch
+        failsWith(Kind.schema),
       );
     });
   });
@@ -2946,14 +3655,14 @@ void main() {
 
     test('a truncated mid-history commit throws on read', () async {
       final path = '${dir.path}/dtz';
-      await DeltaWriter(path).write(intTable('id', [0]));
-      await DeltaWriter(path).write(intTable('id', [1]));
-      await DeltaWriter(path).write(intTable('id', [2]));
+      await DeltaWriter(path).write(intTable('id', [0])).ok;
+      await DeltaWriter(path).write(intTable('id', [1])).ok;
+      await DeltaWriter(path).write(intTable('id', [2])).ok;
       // Truncate version 1 (an intermediate commit) to 0 bytes.
       File(
         '$path/_delta_log/${'1'.padLeft(20, '0')}.json',
       ).writeAsBytesSync([]);
-      await expectLater(DeltaTable(path).read(), throwsA(isA<StateError>()));
+      await expectLater(DeltaTable(path).read(), failsWith(Kind.corrupt));
     });
   });
 
@@ -2984,7 +3693,7 @@ void main() {
     );
 
     Future<Map<int, String>> names(String path) async {
-      final t = await DeltaTable(path).read();
+      final t = await DeltaTable(path).read().ok;
       return {for (final r in t.toRows()) r['id'] as int: r['name'] as String};
     }
 
@@ -2994,13 +3703,10 @@ void main() {
         final tbl = '${dir.path}/tbl';
         await DeltaWriter(
           tbl,
-        ).write(rows([0, 1, 2], [1, 2, 3], ['a', 'b', 'c']));
+        ).write(rows([0, 1, 2], [1, 2, 3], ['a', 'b', 'c'])).ok;
         // A cap below the row count throws; opting out (null) reads it fully.
-        expect(
-          () => DeltaTable(tbl).read(maxRows: 1),
-          throwsA(isA<StateError>()),
-        );
-        final t = await DeltaTable(tbl).read(maxRows: null);
+        expect(DeltaTable(tbl).read(maxRows: 1), failsWith(Kind.limit));
+        final t = await DeltaTable(tbl).read(maxRows: null).ok;
         expect(t.rowCount, 3);
       },
     );
@@ -3012,9 +3718,9 @@ void main() {
           final tbl = '${dir.path}/tbl';
           await DeltaWriter(
             tbl,
-          ).write(rows([0, 1, 2], [10, null, 5], ['a', 'b', 'c']));
-          final engine = SqlEngine(allowExternalPaths: true);
-          await engine.execute("UPDATE '$tbl' SET name = 'X' WHERE v <> 5");
+          ).write(rows([0, 1, 2], [10, null, 5], ['a', 'b', 'c'])).ok;
+          final engine = SqlEngine.open(allowExternalPaths: true).ok;
+          await engine.execute("UPDATE '$tbl' SET name = 'X' WHERE v <> 5").ok;
           // v=10 matches; v=NULL is UNKNOWN (not matched); v=5 is false.
           expect(await names(tbl), {0: 'X', 1: 'b', 2: 'c'});
         },
@@ -3026,9 +3732,9 @@ void main() {
           final tbl = '${dir.path}/tbl';
           await DeltaWriter(
             tbl,
-          ).write(rows([0, 1, 2], [10, null, 5], ['a', 'b', 'c']));
-          final engine = SqlEngine(allowExternalPaths: true);
-          await engine.execute("UPDATE '$tbl' SET name = 'X' WHERE v = 5");
+          ).write(rows([0, 1, 2], [10, null, 5], ['a', 'b', 'c'])).ok;
+          final engine = SqlEngine.open(allowExternalPaths: true).ok;
+          await engine.execute("UPDATE '$tbl' SET name = 'X' WHERE v = 5").ok;
           expect(await names(tbl), {0: 'a', 1: 'b', 2: 'X'});
         },
       );
@@ -3077,35 +3783,34 @@ void main() {
         'duplicate source keys throw when a MATCHED action is present',
         () async {
           final tbl = '${dir.path}/tbl';
-          await DeltaWriter(tbl).write(base([1, 2]));
+          await DeltaWriter(tbl).write(base([1, 2])).ok;
           expect(
-            () => DeltaWriter(tbl).merge(
+            DeltaWriter(tbl).merge(
               src([1, 1], ['x', 'y']),
               on: ['id'],
               whenMatchedUpdate: {'name': (t, s) => s['name']},
             ),
-            throwsA(isA<StateError>()),
+            failsWith(Kind.invalid),
           );
         },
       );
 
-      test(
-        'a NULL join key never matches — it is inserted, not merged',
-        () async {
-          final tbl = '${dir.path}/tbl';
-          await DeltaWriter(tbl).write(base([1, 2], nullableId: true));
-          // The null-keyed source row must fall to NOT-MATCHED (insert), not error
-          // and not collide with the target.
-          await DeltaWriter(tbl).merge(
-            src([null], ['fresh']),
-            on: ['id'],
-            whenMatchedUpdate: {'name': (t, s) => s['name']},
-          );
-          final t = await DeltaTable(tbl).read();
-          final ns = [for (final r in t.toRows()) r['name'] as String]..sort();
-          expect(ns, ['fresh', 'n1', 'n2']);
-        },
-      );
+      test('a NULL join key never matches; it is inserted, not merged', () async {
+        final tbl = '${dir.path}/tbl';
+        await DeltaWriter(tbl).write(base([1, 2], nullableId: true)).ok;
+        // The null-keyed source row must fall to NOT-MATCHED (insert), not error
+        // and not collide with the target.
+        await DeltaWriter(tbl)
+            .merge(
+              src([null], ['fresh']),
+              on: ['id'],
+              whenMatchedUpdate: {'name': (t, s) => s['name']},
+            )
+            .ok;
+        final t = await DeltaTable(tbl).read().ok;
+        final ns = [for (final r in t.toRows()) r['name'] as String]..sort();
+        expect(ns, ['fresh', 'n1', 'n2']);
+      });
     });
   });
 
@@ -3124,17 +3829,18 @@ void main() {
 
     test('a mutation does not commit over a concurrent 0-byte claim', () async {
       final tbl = '${dir.path}/t';
-      await DeltaWriter(tbl).write(ids([1, 2, 3])); // v0
+      await DeltaWriter(tbl).write(ids([1, 2, 3])).ok; // v0
       // Plant a FRESH 0-byte claim for v1 (a concurrent writer mid-commit).
       await File('$tbl/_delta_log/${'1'.padLeft(20, '0')}.json').create();
-      // The UPDATE must contend (back off) and abort rather than jump to v2 over
-      // the live claim — bounded by maxRetries so the test terminates.
+      // Without the file lock, the UPDATE must contend (back off) and abort
+      // rather than jump to v2 over the live claim: bounded by maxRetries so
+      // the test terminates.
       await expectLater(
         DeltaWriter(
           tbl,
-          maxRetries: 2,
+          coordinator: const FilesystemDeltaCommitCoordinator(maxRetries: 2),
         ).update((r) => (r['id'] as int) == 1, {'id': (r) => 9}),
-        throwsA(isA<StateError>()),
+        failsWith(Kind.conflict),
       );
       // v2 must NOT exist (the mutation never jumped the claim).
       expect(
@@ -3149,7 +3855,7 @@ void main() {
     setUp(() => dir = Directory.systemTemp.createTempSync('round45_'));
     tearDown(() => dir.deleteSync(recursive: true));
 
-    group('#2 Delta protocol gate', () {
+    group('#2 Delta protocol check', () {
       test('an unknown reader feature is rejected fail-closed', () {
         // Unit: the capability matrix.
         expect(Protocol(1, 2).readerUnsupported(), isNull);
@@ -3170,19 +3876,25 @@ void main() {
 
       test('reading a table with an unsupported protocol throws', () async {
         final tbl = '${dir.path}/t';
-        await DeltaWriter(tbl).write(
-          Table(
-            name: 't',
-            columns: [
-              NumericColumn.int64(name: 'id', values: [1], nullable: false),
-            ],
-            schema: Schema(
-              fields: [
-                Field(name: 'id', dataType: DataType.int64, nullable: false),
-              ],
-            ),
-          ),
-        );
+        await DeltaWriter(tbl)
+            .write(
+              Table(
+                name: 't',
+                columns: [
+                  NumericColumn.int64(name: 'id', values: [1], nullable: false),
+                ],
+                schema: Schema(
+                  fields: [
+                    Field(
+                      name: 'id',
+                      dataType: DataType.int64,
+                      nullable: false,
+                    ),
+                  ],
+                ),
+              ),
+            )
+            .ok;
         // Add commit v1 upgrading the protocol to an unsupported reader feature.
         await File(
           '$tbl/_delta_log/${'1'.padLeft(20, '0')}.json',
@@ -3196,10 +3908,7 @@ void main() {
             },
           })}\n',
         );
-        await expectLater(
-          DeltaTable(tbl).read(),
-          throwsA(isA<UnsupportedError>()),
-        );
+        await expectLater(DeltaTable(tbl).read(), failsWith(Kind.unsupported));
       });
     });
 
@@ -3218,12 +3927,12 @@ void main() {
           ),
         );
         final w = DeltaWriter(tbl);
-        await w.write(one(0)); // v0
-        await w.write(one(1)); // v1
-        await w.write(one(2)); // v2
+        await w.write(one(0)).ok; // v0
+        await w.write(one(1)).ok; // v1
+        await w.write(one(2)).ok; // v2
         // Delete the intermediate commit.
         File('$tbl/_delta_log/${'1'.padLeft(20, '0')}.json').deleteSync();
-        await expectLater(DeltaTable(tbl).read(), throwsA(isA<StateError>()));
+        await expectLater(DeltaTable(tbl).read(), failsWith(Kind.corrupt));
       });
     });
   });
@@ -3240,8 +3949,8 @@ void main() {
     test('a crash-orphaned 0-byte tail version is reused, no gap', () async {
       final tbl = '${dir.path}/delta6';
       final writer = DeltaWriter(tbl);
-      await writer.write(_ids([1])); // v0
-      await writer.write(_ids([2])); // v1
+      await writer.write(_ids([1])).ok; // v0
+      await writer.write(_ids([2])).ok; // v1
       final log = DeltaLog(tbl);
       // Simulate a writer that crashed after the O_EXCL claim of v2 but before
       // publishing content, aged past the 15-minute orphan TTL.
@@ -3250,9 +3959,9 @@ void main() {
       await v2.setLastModified(
         DateTime.now().subtract(const Duration(minutes: 20)),
       );
-      await writer.write(_ids([3])); // must reclaim v2, not skip to v3
+      await writer.write(_ids([3])).ok; // must reclaim v2, not skip to v3
       expect(await log.versions(), [0, 1, 2]);
-      expect((await DeltaTable(tbl).read()).rowCount, 3);
+      expect((await DeltaTable(tbl).read().ok).rowCount, 3);
     });
   });
 
@@ -3276,7 +3985,7 @@ void main() {
     test(
       'commits are atomic (no .tmp leftovers) and carry a commitInfo',
       () async {
-        await DeltaWriter(tbl).write(ids([1, 2, 3]));
+        await DeltaWriter(tbl).write(ids([1, 2, 3])).ok;
         final logDir = Directory('$tbl/_delta_log');
         final names = logDir
             .listSync()
@@ -3291,14 +4000,11 @@ void main() {
 
     test('timestamp travel uses commit metadata, not file mtime', () async {
       final w = DeltaWriter(tbl);
-      await w.write(ids([1, 2, 3]));
-      await w.write(ids([4, 5]));
+      await w.write(ids([1, 2, 3])).ok;
+      await w.write(ids([4, 5])).ok;
       // A timestamp before any commit -> error; far-future -> latest snapshot.
-      expect(
-        () => DeltaTable(tbl).read(timestamp: 0),
-        throwsA(isA<ArgumentError>()),
-      );
-      final latest = await DeltaTable(tbl).read(timestamp: 1 << 62);
+      expect(DeltaTable(tbl).read(asOf: 0), failsWith(Kind.missing));
+      final latest = await DeltaTable(tbl).read(asOf: 1 << 62).ok;
       expect(latest.rowCount, 5);
     });
   });
@@ -3371,62 +4077,62 @@ void main() {
     group('delta.appendOnly', () {
       test('append still commits', () async {
         final w = DeltaWriter(path);
-        await w.write(t([0, 1, 2]));
+        await w.write(t([0, 1, 2])).ok;
         appendOnly();
-        await w.write(t([3, 4]));
-        final after = await (await DataFrameIO.readDelta(path)).execute();
+        await w.write(t([3, 4])).ok;
+        final after = await (await DataFrameIO.readDelta(path).ok).execute().ok;
         expect(after.rowCount, 5);
       });
 
       test('delete is refused', () async {
         final w = DeltaWriter(path);
-        await w.write(t([0, 1, 2]));
+        await w.write(t([0, 1, 2])).ok;
         appendOnly();
         await expectLater(
           w.delete((row) => (row['id'] as int) == 0),
-          throwsA(isA<UnsupportedError>()),
+          failsWith(Kind.denied),
         );
       });
 
       test('update is refused', () async {
         final w = DeltaWriter(path);
-        await w.write(t([0, 1, 2]));
+        await w.write(t([0, 1, 2])).ok;
         appendOnly();
         await expectLater(
           w.update((row) => true, {'id': (row) => 9}),
-          throwsA(isA<UnsupportedError>()),
+          failsWith(Kind.denied),
         );
       });
 
       test('merge is refused', () async {
         final w = DeltaWriter(path);
-        await w.write(t([0, 1, 2]));
+        await w.write(t([0, 1, 2])).ok;
         appendOnly();
         await expectLater(
           w.merge(t([2, 3]), on: ['id'], whenNotMatchedInsert: true),
-          throwsA(isA<UnsupportedError>()),
+          failsWith(Kind.denied),
         );
       });
 
       test('overwrite is refused', () async {
         final w = DeltaWriter(path);
-        await w.write(t([0, 1, 2]));
+        await w.write(t([0, 1, 2])).ok;
         appendOnly();
         await expectLater(
           w.write(t([9]), mode: DeltaWriteMode.overwrite),
-          throwsA(isA<UnsupportedError>()),
+          failsWith(Kind.denied),
         );
       });
 
       test('the table is left untouched by a refused mutation', () async {
         final w = DeltaWriter(path);
-        await w.write(t([0, 1, 2]));
+        await w.write(t([0, 1, 2])).ok;
         appendOnly();
         await expectLater(
           w.delete((row) => (row['id'] as int) == 0),
-          throwsA(isA<UnsupportedError>()),
+          failsWith(Kind.denied),
         );
-        final after = await (await DataFrameIO.readDelta(path)).execute();
+        final after = await (await DataFrameIO.readDelta(path).ok).execute().ok;
         expect(after.column('id')!.toList().cast<int>()..sort(), [0, 1, 2]);
         expect(await DeltaLog(path).versions(), [0]);
       });
@@ -3437,26 +4143,71 @@ void main() {
       // one must be refused rather than silently accepted.
       test('append is refused', () async {
         final w = DeltaWriter(path);
-        await w.write(t([1, 2]));
+        await w.write(t([1, 2])).ok;
         invariant();
-        await expectLater(w.write(t([3])), throwsA(isA<UnsupportedError>()));
+        await expectLater(w.write(t([3])), failsWith(Kind.unsupported));
       });
 
       test('update is refused', () async {
         final w = DeltaWriter(path);
-        await w.write(t([1, 2]));
+        await w.write(t([1, 2])).ok;
         invariant();
         await expectLater(
           w.update((row) => true, {'id': (row) => -1}),
-          throwsA(isA<UnsupportedError>()),
+          failsWith(Kind.unsupported),
         );
       });
 
-      test('reading is still allowed', () async {
-        await DeltaWriter(path).write(t([1, 2]));
+      test('an overwrite keeps the invariant', () async {
+        await DeltaWriter(path).write(t([1, 2])).ok;
         invariant();
-        final after = await (await DataFrameIO.readDelta(path)).execute();
+        final w = DeltaWriter(path, invariants: const SqlInvariantEvaluator());
+        // The incoming schema has the same structure and no metadata.
+        await w.write(t([3]), mode: DeltaWriteMode.overwrite).ok;
+        await expectLater(w.write(t([-1])), failsWith(Kind.invalid));
+      });
+
+      test('reading is still allowed', () async {
+        await DeltaWriter(path).write(t([1, 2])).ok;
+        invariant();
+        final after = await (await DataFrameIO.readDelta(path).ok).execute().ok;
         expect(after.rowCount, 2);
+      });
+
+      group('the evaluator accepts only a column predicate', () {
+        const evaluator = SqlInvariantEvaluator();
+        final table = Table.fromRows('t', [
+          {'id': 1},
+          {'id': -1},
+        ]);
+
+        test('a predicate counts its violations', () async {
+          expect(await evaluator.violations(table, 'id > 0').ok, 1);
+        });
+
+        test('text that closes the parentheses is rejected', () async {
+          // Spliced into `WHERE NOT (...)`, this would add its own clause.
+          await expectLater(
+            evaluator.violations(
+              table,
+              'id > 0) AND (id IN (SELECT -1 AS one)',
+            ),
+            failsWith(Kind.invalid),
+          );
+        });
+
+        test('subqueries and EXISTS are rejected', () async {
+          for (final predicate in [
+            'id IN (SELECT 1 AS one)',
+            'id NOT IN (SELECT -1 AS one)',
+          ]) {
+            await expectLater(
+              evaluator.violations(table, predicate),
+              failsWith(Kind.invalid),
+              reason: predicate,
+            );
+          }
+        });
       });
 
       // With an evaluator wired, invariants move from "rejected" to "enforced".
@@ -3465,10 +4216,12 @@ void main() {
             DeltaWriter(path, invariants: const SqlInvariantEvaluator());
 
         test('a satisfying append commits', () async {
-          await DeltaWriter(path).write(t([1, 2]));
+          await DeltaWriter(path).write(t([1, 2])).ok;
           invariant(); // id > 0
-          await writer().write(t([3, 4]));
-          final after = await (await DataFrameIO.readDelta(path)).execute();
+          await writer().write(t([3, 4])).ok;
+          final after = await (await DataFrameIO.readDelta(
+            path,
+          ).ok).execute().ok;
           expect(after.column('id')!.toList().cast<int>()..sort(), [
             1,
             2,
@@ -3478,36 +4231,37 @@ void main() {
         });
 
         test('a violating append throws and commits nothing', () async {
-          await DeltaWriter(path).write(t([1, 2]));
+          await DeltaWriter(path).write(t([1, 2])).ok;
           invariant();
           await expectLater(
             writer().write(t([3, -1])),
-            throwsA(
-              isA<StateError>().having(
-                (e) => e.message,
-                'message',
-                allOf(contains('id > 0'), contains('invariant')),
-              ),
+            failsWith(
+              Kind.invalid,
+              allOf(contains('id > 0'), contains('invariant')),
             ),
           );
-          final after = await (await DataFrameIO.readDelta(path)).execute();
+          final after = await (await DataFrameIO.readDelta(
+            path,
+          ).ok).execute().ok;
           expect(after.column('id')!.toList().cast<int>()..sort(), [1, 2]);
           expect(await DeltaLog(path).versions(), [0]);
         });
 
         test('a violating overwrite throws and commits nothing', () async {
-          await DeltaWriter(path).write(t([1, 2]));
+          await DeltaWriter(path).write(t([1, 2])).ok;
           invariant();
           await expectLater(
             writer().write(t([-5]), mode: DeltaWriteMode.overwrite),
-            throwsA(isA<StateError>()),
+            failsWith(Kind.invalid),
           );
-          final after = await (await DataFrameIO.readDelta(path)).execute();
+          final after = await (await DataFrameIO.readDelta(
+            path,
+          ).ok).execute().ok;
           expect(after.column('id')!.toList().cast<int>()..sort(), [1, 2]);
         });
 
         test('a NULL does not violate (SQL CHECK semantics)', () async {
-          await DeltaWriter(path).write(nullable([1]));
+          await DeltaWriter(path).write(nullable([1])).ok;
           // id > 0 is NULL for a null id: unknown is not false, so it passes.
           patch(
             (metadata) => {
@@ -3528,30 +4282,34 @@ void main() {
               }),
             },
           );
-          await writer().write(nullable([2, null]));
-          final after = await (await DataFrameIO.readDelta(path)).execute();
+          await writer().write(nullable([2, null])).ok;
+          final after = await (await DataFrameIO.readDelta(
+            path,
+          ).ok).execute().ok;
           expect(after.rowCount, 3);
         });
 
         test('a table with no invariants is unaffected', () async {
           final w = writer();
-          await w.write(t([1]));
-          await w.write(t([2]));
-          final after = await (await DataFrameIO.readDelta(path)).execute();
+          await w.write(t([1])).ok;
+          await w.write(t([2])).ok;
+          final after = await (await DataFrameIO.readDelta(
+            path,
+          ).ok).execute().ok;
           expect(after.column('id')!.toList().cast<int>()..sort(), [1, 2]);
         });
 
         test('update still refuses: it cannot enforce them yet', () async {
-          await DeltaWriter(path).write(t([1, 2]));
+          await DeltaWriter(path).write(t([1, 2])).ok;
           invariant();
           await expectLater(
             writer().update((row) => true, {'id': (row) => -1}),
-            throwsA(isA<UnsupportedError>()),
+            failsWith(Kind.unsupported),
           );
         });
 
         test('an unreadable invariant is refused, not guessed at', () async {
-          await DeltaWriter(path).write(t([1]));
+          await DeltaWriter(path).write(t([1])).ok;
           patch(
             (metadata) => {
               ...metadata,
@@ -3568,10 +4326,7 @@ void main() {
               }),
             },
           );
-          await expectLater(
-            writer().write(t([2])),
-            throwsA(isA<FormatException>()),
-          );
+          await expectLater(writer().write(t([2])), failsWith(Kind.corrupt));
         });
       });
     });
@@ -3594,7 +4349,7 @@ void main() {
 
       test('survives an overwrite that changes the schema', () async {
         final w = DeltaWriter(path);
-        await w.write(t([0, 1]));
+        await w.write(t([0, 1])).ok;
         // Another engine annotates the column, then we overwrite with a wider
         // schema: the surviving column's metadata must not be dropped.
         patch(
@@ -3618,33 +4373,277 @@ void main() {
         );
         expect(annotated.fields.single.metadata, {'comment': 'the key'});
 
-        await w.write(
-          Table(
-            name: 't',
-            columns: [
-              NumericColumn.int64(name: 'id', values: [9], nullable: false),
-            ],
-            schema: annotated,
-          ),
-          mode: DeltaWriteMode.overwrite,
-        );
+        await w
+            .write(
+              Table(
+                name: 't',
+                columns: [
+                  NumericColumn.int64(name: 'id', values: [9], nullable: false),
+                ],
+                schema: annotated,
+              ),
+              mode: DeltaWriteMode.overwrite,
+            )
+            .ok;
         final after = DeltaSchema.fromJson(
           (await DeltaLog(path).snapshot()).metadata.schemaString,
         );
         expect(after.fields.single.metadata, {'comment': 'the key'});
       });
+
+      test(
+        'an overwrite adding a column keeps the others\' metadata',
+        () async {
+          final w = DeltaWriter(path);
+          await w.write(t([0, 1])).ok;
+          patch(
+            (metadata) => {
+              ...metadata,
+              'schemaString': jsonEncode({
+                'type': 'struct',
+                'fields': [
+                  {
+                    'name': 'id',
+                    'type': 'long',
+                    'nullable': false,
+                    'metadata': {'comment': 'the key'},
+                  },
+                ],
+              }),
+            },
+          );
+          // A schema built here, without the metadata, and one column wider.
+          await w
+              .write(
+                Table(
+                  name: 't',
+                  columns: [
+                    NumericColumn.int64(
+                      name: 'id',
+                      values: [9],
+                      nullable: false,
+                    ),
+                    NumericColumn.int64(
+                      name: 'n',
+                      values: [1],
+                      nullable: false,
+                    ),
+                  ],
+                  schema: Schema(
+                    fields: [
+                      Field(
+                        name: 'id',
+                        dataType: DataType.int64,
+                        nullable: false,
+                      ),
+                      Field(
+                        name: 'n',
+                        dataType: DataType.int64,
+                        nullable: false,
+                      ),
+                    ],
+                  ),
+                ),
+                mode: DeltaWriteMode.overwrite,
+              )
+              .ok;
+          final after = DeltaSchema.fromJson(
+            (await DeltaLog(path).snapshot()).metadata.schemaString,
+          );
+          expect(after.field('id')!.metadata, {'comment': 'the key'});
+          expect(after.field('n')!.metadata, isEmpty);
+        },
+      );
+    });
+  });
+
+  group('scan with partition and stats prune', () {
+    late Directory dir;
+    late String path;
+    late SqlEngine engine;
+
+    setUp(() {
+      dir = Directory.systemTemp.createTempSync('delta_prune_');
+      path = '${dir.path}/t';
+      engine = SqlEngine.open(allowExternalPaths: true).ok;
+    });
+    tearDown(() async {
+      await engine.dispose();
+      dir.deleteSync(recursive: true);
+    });
+
+    Table rows(String part, List<int> ids) => Table.fromRows('t', [
+      for (final id in ids) {'id': id, 'part': part, 'v': 'v$id'},
+    ]);
+
+    /// One file per partition: a holds ids 0..9, b 10..19, c 20..29.
+    Future<void> partitioned() async {
+      for (final (i, part) in ['a', 'b', 'c'].indexed) {
+        await DeltaWriter(path)
+            .write(
+              rows(part, [for (var id = i * 10; id < i * 10 + 10; id++) id]),
+              partitionBy: ['part'],
+            )
+            .ok;
+      }
+    }
+
+    Future<({List<Map<String, dynamic>> rows, int files})> query(
+      String where,
+    ) async {
+      ParquetReader.footersParsed = 0;
+      final table = await engine
+          .execute("SELECT id, part, v FROM '$path' WHERE $where ORDER BY id")
+          .ok;
+      return (rows: table.toRows(), files: ParquetReader.footersParsed);
+    }
+
+    Future<List<Map<String, dynamic>>> eager(
+      bool Function(Map row) where,
+    ) async {
+      final table = await DeltaTable(path).read().ok;
+      final all = [
+        for (final row in table.toRows())
+          if (where(row)) {'id': row['id'], 'part': row['part'], 'v': row['v']},
+      ];
+      all.sort((x, y) => (x['id'] as int).compareTo(y['id'] as int));
+      return all;
+    }
+
+    test('a partition filter opens only the matching files', () async {
+      await partitioned();
+      final result = await query("part = 'a'");
+      expect(result.files, 1);
+      expect(result.rows, await eager((row) => row['part'] == 'a'));
+      expect(result.rows, hasLength(10));
+    });
+
+    test('readBatches reads only the requested columns', () async {
+      await partitioned();
+      final batches = await DeltaTable(
+        path,
+      ).readBatches(columns: ['v', 'part']).ok.toList();
+      for (final batch in batches) {
+        expect(batch.schema.fields.map((f) => f.name).toSet(), {'v', 'part'});
+      }
+      expect(
+        [
+          for (final b in batches)
+            for (final row in b.toRows()) '${row['part']}${row['v']}',
+        ]..sort(),
+        [
+          for (final (i, part) in ['a', 'b', 'c'].indexed)
+            for (var id = i * 10; id < i * 10 + 10; id++) '${part}v$id',
+        ]..sort(),
+      );
+      // Only a partition column: its value on every row of every file.
+      final parts = await DeltaTable(
+        path,
+      ).readBatches(columns: ['part']).ok.toList();
+      expect([for (final b in parts) ...b.column('part')!.toList()]..sort(), [
+        for (final part in ['a', 'b', 'c']) ...List.filled(10, part),
+      ]);
+    });
+
+    test('a filter on an unselected column still filters', () async {
+      await partitioned();
+      final table = await engine
+          .execute("SELECT v FROM '$path' WHERE id >= 25 ORDER BY v")
+          .ok;
+      expect(table.schema.fields.map((f) => f.name), ['v']);
+      expect(table.column('v')!.toList(), [
+        for (var id = 25; id < 30; id++) 'v$id',
+      ]);
+    });
+
+    test('column stats prune files whose range cannot match', () async {
+      await partitioned();
+      final result = await query('id >= 25');
+      expect(result.files, 1);
+      expect(result.rows, await eager((row) => (row['id'] as int) >= 25));
+      final between = await query('id > 8 AND id < 11');
+      expect(between.files, 2);
+      expect(between.rows.map((row) => row['id']), [9, 10]);
+    });
+
+    test('a filter no file can match opens none', () async {
+      await partitioned();
+      final result = await query("part = 'z'");
+      expect(result.files, 0);
+      expect(result.rows, isEmpty);
+    });
+
+    test('an unprunable filter reads every file and matches', () async {
+      await partitioned();
+      final result = await query("v <> 'v3'");
+      expect(result.files, 3);
+      expect(result.rows, await eager((row) => row['v'] != 'v3'));
+    });
+
+    test('a NaN row survives pruning for <>', () async {
+      await DeltaWriter(path)
+          .write(
+            Table.fromRows('t', [
+              {'x': 5.0},
+              {'x': double.nan},
+            ]),
+          )
+          .ok;
+      final table = await engine
+          .execute("SELECT x FROM '$path' WHERE x <> 5")
+          .ok;
+      expect(table.rowCount, 1);
+      expect((table.column('x')!.toList().single as double).isNaN, isTrue);
+    });
+
+    test('a file with a deletion vector is not pruned by row group', () async {
+      // spark4_row_groups: spark4_written with its one data file rewritten as
+      // five row groups of two rows (ids 0..9); the deletion vector removes
+      // positions 5..9. Pruning the first two groups for `id >= 4` would read
+      // the deleted positions against the wrong rows.
+      const fixture = 'test/fixtures/delta/spark4_row_groups';
+      final ids = [
+        for (final row
+            in (await engine
+                    .execute("SELECT id FROM '$fixture' WHERE id >= 4")
+                    .ok)
+                .toRows())
+          row['id'],
+      ];
+      expect(ids, [4]);
+    });
+
+    test('a registered Delta table scans with pruning', () async {
+      await partitioned();
+      await engine.registerFile('d', path).ok;
+      ParquetReader.footersParsed = 0;
+      final table = await engine
+          .execute("SELECT id FROM d WHERE part = 'c' ORDER BY id")
+          .ok;
+      expect(ParquetReader.footersParsed, 1);
+      expect(table.toRows().map((row) => row['id']), [
+        for (var id = 20; id < 30; id++) id,
+      ]);
+    });
+
+    test('deleted rows stay deleted through the scan', () async {
+      await partitioned();
+      await DeltaWriter(path).delete((row) => row['id'] == 3).ok;
+      final result = await query("part = 'a'");
+      expect(result.rows.map((row) => row['id']), [0, 1, 2, 4, 5, 6, 7, 8, 9]);
+      expect(result.rows, await eager((row) => row['part'] == 'a'));
     });
   });
 }
 
 /// Delegates to the default filesystem coordinator, counting invocations to
-/// prove the injection seam is honored.
+/// prove the injection boundary is honored.
 class _CountingCoordinator implements DeltaCommitCoordinator {
   int commits = 0;
   final _inner = const FilesystemDeltaCommitCoordinator();
 
   @override
-  Future<int> commit({
+  Future<Result<int, ErrorDetails>> commit({
     required DeltaLog log,
     required Future<List<Map<String, dynamic>>> Function(int version) build,
     String label = 'commit',
@@ -3687,3 +4686,42 @@ Table _ids(List<int> ids) => Table(
   ),
   columns: [ListColumn<int>(name: 'id', dataType: DataType.int64, data: ids)],
 );
+
+/// Copy the directory tree [source] to [target].
+void copyDirectory(Directory source, String target) {
+  for (final entity in source.listSync(recursive: true)) {
+    final relative = entity.path.substring(source.path.length + 1);
+    if (entity is Directory) {
+      Directory('$target/$relative').createSync(recursive: true);
+    } else if (entity is File) {
+      File('$target/$relative').parent.createSync(recursive: true);
+      entity.copySync('$target/$relative');
+    }
+  }
+}
+
+/// A coordinator that runs [before] once, ahead of the first commit, to stand
+/// in for a writer that commits between a transaction's read and its commit.
+class _BeforeCommit implements DeltaCommitCoordinator {
+  _BeforeCommit(this.before);
+
+  final Future<void> Function() before;
+  var _done = false;
+
+  @override
+  Future<Result<int, ErrorDetails>> commit({
+    required DeltaLog log,
+    required Future<List<Map<String, dynamic>>> Function(int version) build,
+    String label = 'commit',
+  }) async {
+    if (!_done) {
+      _done = true;
+      await before();
+    }
+    return const FilesystemDeltaCommitCoordinator().commit(
+      log: log,
+      build: build,
+      label: label,
+    );
+  }
+}

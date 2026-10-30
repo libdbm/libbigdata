@@ -1,27 +1,32 @@
 import 'dart:io';
+import 'dart:typed_data';
 
 import '../../core/data_type.dart';
+import '../../core/keys.dart' show partitionOf;
 import '../../core/schema.dart';
 import '../../core/table.dart';
 import '../../formats/arrow/arrow_reader.dart';
 import '../../formats/arrow/arrow_writer.dart';
 import '../../formats/parquet/parquet_reader.dart';
 import '../../formats/parquet/parquet_writer.dart';
+import '../exec/kernels.dart';
 import '../execution/exec_core.dart';
 import '../../core/ids.dart' as ids;
+import '../../core/failure.dart';
+import '../../core/result.dart';
 
 /// On-disk spill files for blocking operators. A spill run/partition is a single
 /// file, unique-named and deleted when the owning iterator closes.
 ///
 /// Two formats:
 /// - [SpillFormat.parquet] (default): lossless for all column types, read back
-///   lazily (one row group at a time) — required where files are co-read or
+///   lazily (one row group at a time): required where files are co-read or
 ///   streamed (sort k-way merge, join probe side).
 /// - [SpillFormat.arrow]: cheaper to write (no compression/stats) with zero-copy
 ///   numeric decode, written incrementally (bounded memory) via [ArrowStreamWriter]
-///   but read whole-file — only for budget-sized files that are read fully
-///   (aggregate partitions, join build side). Falls back to Parquet when the
-///   schema has a type Arrow can't encode.
+///   and read back one record batch at a time. Used for files that are read
+///   fully (aggregate partitions). Falls back to Parquet when the schema has a
+///   type Arrow can't encode.
 enum SpillFormat { parquet, arrow }
 
 final Set<DataType> _arrowTypes = {
@@ -43,15 +48,21 @@ final Set<DataType> _arrowTypes = {
 bool _arrowSupported(Schema schema) =>
     schema.fields.every((f) => _arrowTypes.contains(f.dataType));
 
-// Secure entropy so concurrent isolates/pods can't collide on spill filenames
-// (a clock-seeded Random() seeds identically across same-millisecond boots).
-
 /// Prefix of a per-[SqlEngine]-session spill subdirectory. Each engine spills
-/// under its own `<base>/<sessionDirPrefix><token>/` so no engine's sweep can
+/// under its own `<base>/<sessionPrefix><token>/` so no engine's sweep can
 /// ever touch another live session's runs. (Deliberately does NOT contain the
 /// `spill-` file prefix, so a directory listing that greps for leaked `spill-*`
 /// files doesn't match the session dir itself.)
-const sessionDirPrefix = 'libbigdata-session-';
+const sessionPrefix = 'libbigdata-session-';
+
+/// Where a [SqlEngine] or DataFrame execution with no spill directory of its
+/// own keeps its sessions: a dedicated subdirectory of the system temp, so
+/// [sweepOrphanedSpills] lists only this library's sessions.
+String get defaultSpillBase => '${Directory.systemTemp.path}/libbigdata-spill';
+
+/// A new session directory under [base]. Nothing is created: an operator makes
+/// the directory on its first spill, and the marker with it.
+String newSpillSession(String base) => '$base/$sessionPrefix${ids.token()}';
 
 /// The per-session live-marker (a sibling of the spill files) whose mtime is
 /// kept fresh while a query is active, so a concurrent engine's sweep treats the
@@ -59,8 +70,8 @@ const sessionDirPrefix = 'libbigdata-session-';
 String _sessionMarker(String spillFilePath) =>
     '${File(spillFilePath).parent.path}/.live';
 
-/// Best-effort refresh of the session marker so a sibling engine's age-gated
-/// sweep sees this session as live. RECREATES the marker if it is missing — a
+/// Best-effort refresh of the session marker so a sibling engine's age-checked
+/// sweep sees this session as live. RECREATES the marker if it is missing: a
 /// prior sweep may have reclaimed the (then-idle) session dir, and an operator
 /// re-creates the spill dir on demand WITHOUT the marker; without this a live
 /// session that spills again would have no `.live` and be deletable mid-query.
@@ -76,27 +87,28 @@ void _touchSessionMarker(String spillFilePath) {
   } catch (_) {}
 }
 
-/// Best-effort reclaim of crash-orphaned spill SESSIONS in [dir]. Graceful
-/// cleanup runs via operator `close()`/[SpillWriter.abort], but a SIGKILL exits
-/// before any `finally`, leaving a whole `<sessionDirPrefix>*` subdir behind.
+/// Best-effort reclaim of crash-orphaned spill SESSIONS in [directory].
+/// Graceful cleanup runs via operator `close()`/[SpillWriter.abort], but a
+/// SIGKILL exits before any `finally`, leaving a whole `<sessionPrefix>*`
+/// subdir behind.
 ///
 /// SESSION-SCOPED, not per-file: it only reclaims a session subdir whose `.live`
-/// marker is missing or older than [ttl] — a marker an active engine keeps fresh
+/// marker is missing or older than [ttl]: a marker an active engine keeps fresh
 /// on every spill write/read. So a live sibling engine's runs are never deleted
 /// (the P0 that let a >[ttl] query lose a partition to another engine's sweep).
 /// Every step is best-effort: a racing writer or a vanished dir never errors.
 Future<void> sweepOrphanedSpills(
-  String dir, {
+  String directory, {
   Duration ttl = const Duration(hours: 1),
 }) async {
   try {
-    final d = Directory(dir);
+    final d = Directory(directory);
     if (!await d.exists()) return;
     final now = DateTime.now();
     await for (final e in d.list()) {
       if (e is! Directory) continue;
       final name = e.uri.pathSegments.where((s) => s.isNotEmpty).last;
-      if (!name.startsWith(sessionDirPrefix)) continue;
+      if (!name.startsWith(sessionPrefix)) continue;
       try {
         final marker = File('${e.path}/.live');
         final stale =
@@ -104,11 +116,11 @@ Future<void> sweepOrphanedSpills(
             now.difference((await marker.stat()).modified) > ttl;
         if (stale) await e.delete(recursive: true);
       } catch (_) {
-        // Racing writer / permission / vanished — skip, never break startup.
+        // Racing writer / permission / vanished: skip, never break startup.
       }
     }
   } catch (_) {
-    // Dir vanished / not listable — nothing to reclaim.
+    // Dir vanished / not listable; nothing to reclaim.
   }
 }
 
@@ -122,10 +134,10 @@ Future<void> sweepOrphanedSpills(
 ///
 /// CONTRACT (as with [MemoryManager]): isolate-private and synchronous.
 /// [charge]/[release] read-modify-write [_used] with no `await` between, so on
-/// Dart's single event loop they can't interleave — no lock needed. Do NOT share
+/// Dart's single event loop they can't interleave: no lock needed. Do NOT share
 /// one instance across isolates, and do NOT introduce an `await` into the
 /// charge/release critical section.
-class SpillBudget {
+final class SpillBudget {
   /// Max combined live spill bytes.
   final int cap;
   int _used = 0;
@@ -134,12 +146,13 @@ class SpillBudget {
   /// Bytes currently held by live spill files.
   int get used => _used;
 
-  /// Account [bytes] about to be spilled; throws [StateError] (charging nothing)
-  /// if it would exceed [cap].
+  /// Account [bytes] about to be spilled; throws a [Kind.limit] [Failure]
+  /// (charging nothing) if it would exceed [cap].
   void charge(int bytes) {
     if (bytes <= 0) return;
     if (_used + bytes > cap) {
-      throw StateError(
+      throw Failure.of(
+        Kind.limit,
         'spill exceeded maxSpillBytes=$cap (used $_used, +$bytes); raise '
         'maxSpillBytes or reduce the query',
       );
@@ -157,7 +170,7 @@ class SpillBudget {
   /// Reconcile a prior charge to the true on-disk size once a file is finalized.
   /// A negative delta refunds the compression saving; a POSITIVE delta (the
   /// finalized file is larger than estimated) is reserved with the cap check and
-  /// THROWS if it would cross [cap] — the caller must then delete the run rather
+  /// THROWS if it would cross [cap]: the caller must then delete the run rather
   /// than let the on-disk total silently exceed maxSpillBytes.
   void adjust(int delta) {
     if (delta < 0) {
@@ -168,16 +181,16 @@ class SpillBudget {
   }
 }
 
-/// A finalized spill file; read it back one [RecordBatch] at a time. Parquet is
-/// lazy (bounded); Arrow loads the whole file (safe only for budget-sized files
-/// read fully).
+/// A finalized spill file; read it back one [RecordBatch] at a time. Both
+/// formats read lazily: Parquet a row group at a time, Arrow a record batch at
+/// a time.
 class SpillRun {
   final String path;
   final Schema schema;
 
   /// Whether this run finalized an actual file. `false` = a legitimately empty
   /// run (the writer finished with nothing added). When `true` but the file is
-  /// gone, the run was deleted after finalization — a corruption we must fail
+  /// gone, the run was deleted after finalization: a corruption we must fail
   /// loud on rather than silently read as zero rows (a dropped partition).
   final bool hasFile;
   final SpillBudget? _budget;
@@ -193,13 +206,14 @@ class SpillRun {
        _bytes = bytes;
 
   Stream<RecordBatch> read({int size = 8192}) async* {
-    if (!hasFile) return; // legitimately empty run — no file was ever written
+    if (!hasFile) return; // legitimately empty run: no file was ever written
     if (!await File(path).exists()) {
       // A finalized run vanished (e.g. another session swept a shared spill
       // dir). Reading it as empty would silently drop a join/agg/sort/set-op
       // partition; fail loud instead.
-      throw StateError(
-        'Spill run "$path" was finalized but its file is missing — it was '
+      throw Failure.of(
+        Kind.io,
+        'Spill run "$path" was finalized but its file is missing; it was '
         'deleted after finalization (results would be silently wrong). Use a '
         'per-session spill directory.',
       );
@@ -207,11 +221,17 @@ class SpillRun {
     _touchSessionMarker(path);
     final batches = path.endsWith('.arrow')
         ? ArrowReader(path).readBatches()
-        : ParquetReader(path).readBatches(size: size);
+        : ParquetReader(path).readBatches(batchSize: size).unwrap();
+    // The file stores columns under positional names (see SpillWriter.add);
+    // give them back the operator's names and qualifiers.
     await for (final table in batches) {
+      await pause();
       yield RecordBatch(
-        columns: table.columns,
-        schema: table.schema,
+        columns: [
+          for (final (index, column) in table.columns.indexed)
+            column.withName(schema.fields[index].name),
+        ],
+        schema: schema,
         rowCount: table.rowCount,
       );
     }
@@ -224,6 +244,35 @@ class SpillRun {
       _released = true;
       _budget?.release(_bytes);
     }
+  }
+}
+
+/// Route [batch]'s rows to [writers] by the hash of each row's [key]: rows
+/// with equal keys go to the same writer (so each partition can be finished
+/// on its own), and [salt] redistributes them on a recursive re-partition.
+/// Each gathered batch carries [schema], by default the batch's own. The one
+/// router for the aggregate, join and set-operation spills.
+Future<void> route(
+  RecordBatch batch,
+  List<SpillWriter> writers,
+  Object? Function(int row) key, {
+  int salt = 0,
+  Schema? schema,
+}) async {
+  final buckets = [for (var i = 0; i < writers.length; i++) <int>[]];
+  for (var row = 0; row < batch.rowCount; row++) {
+    buckets[partitionOf(key(row), writers.length, salt: salt)].add(row);
+  }
+  for (var part = 0; part < writers.length; part++) {
+    if (buckets[part].isEmpty) continue;
+    final index = Int32List.fromList(buckets[part]);
+    await writers[part].add(
+      RecordBatch(
+        columns: [for (final c in batch.columns) Kernels.gather(c, index)],
+        schema: schema ?? batch.schema,
+        rowCount: index.length,
+      ),
+    );
   }
 }
 
@@ -246,30 +295,49 @@ class SpillWriter {
     this._budget,
   );
 
-  /// Construct a writer for a spill file in [dir]. [dir] MUST already exist —
-  /// callers create it once (asynchronously) before their writer loop so this
-  /// stays off the event loop on the hot spill path. [budget], when set, caps
-  /// the combined on-disk spill size and fails fast when exceeded.
+  /// Construct a writer for a spill file in [directory]. [directory] MUST
+  /// already exist: callers create it once (asynchronously) before their
+  /// writer loop so this stays off the event loop on the hot spill path.
+  /// [budget], when set, caps the combined on-disk spill size and fails fast
+  /// when exceeded.
   factory SpillWriter(
-    String dir,
+    String directory,
     Schema schema, {
     SpillFormat format = SpillFormat.parquet,
     SpillBudget? budget,
   }) {
     // Spilled intermediates may carry nulls in any column across the stream, so
-    // the file schema must be all-nullable — a footer frozen from a no-null first
+    // the file schema must be all-nullable: a footer frozen from a no-null first
     // batch would mark leaves required and then read back inconsistently.
-    final ns = _nullableSchema(schema);
-    final useArrow = format == SpillFormat.arrow && _arrowSupported(ns);
-    final path = '$dir/spill-${ids.token()}.${useArrow ? 'arrow' : 'parquet'}';
+    final nullable = _nullableSchema(schema);
+    final useArrow = format == SpillFormat.arrow && _arrowSupported(nullable);
+    final path =
+        '$directory/spill-${ids.token()}.${useArrow ? 'arrow' : 'parquet'}';
     return SpillWriter._(
       path,
-      ns,
+      nullable,
       useArrow ? null : ParquetWriter(path),
-      useArrow ? ArrowStreamWriter(path, ns) : null,
+      useArrow ? ArrowStreamWriter(path, _positional(nullable)) : null,
       budget,
     );
   }
+
+  /// [schema] with each field named by its position. A batch can hold two
+  /// columns of the same name under different qualifiers (a join's `t.id` and
+  /// `u.id`), which a file schema cannot; [SpillRun.read] restores the names.
+  static Schema _positional(Schema schema) => Schema(
+    fields: [
+      for (final (index, field) in schema.fields.indexed)
+        Field(
+          name: 'c$index',
+          dataType: field.dataType,
+          nullable: field.nullable,
+          precision: field.precision,
+          scale: field.scale,
+          children: field.children,
+        ),
+    ],
+  );
 
   /// Widen every field to nullable (spilled data is always potentially-null).
   static Schema _nullableSchema(Schema schema) => Schema(
@@ -280,24 +348,28 @@ class SpillWriter {
   );
 
   Future<void> add(RecordBatch batch) async {
+    await pause();
     if (batch.rowCount == 0) return;
     _touchSessionMarker(path); // keep this session live for the sweep
     _any = true;
     final table = Table(
       name: 'spill',
-      schema: _nullableSchema(batch.schema),
-      columns: batch.columns,
+      schema: _positional(_nullableSchema(batch.schema)),
+      columns: [
+        for (final (index, column) in batch.columns.indexed)
+          column.withName('c$index'),
+      ],
     );
     // Charge the budget BEFORE writing, so an over-cap spill fails fast and
     // never grows the file past the limit. charge() throws without counting if
     // it would exceed the cap.
-    final est = table.memoryUsage;
-    _budget?.charge(est);
-    _bytes += est;
+    final estimate = table.memoryUsage;
+    _budget?.charge(estimate);
+    _bytes += estimate;
     if (_arrow != null) {
       await _arrow.add(table);
     } else {
-      await _parquet!.writeBatch(table);
+      await _parquet!.writeBatch(table).unwrap();
     }
   }
 
@@ -306,7 +378,7 @@ class SpillWriter {
   Future<SpillRun> finish() async {
     // Transfer ownership of the charged bytes to the SpillRun ONLY AFTER
     // finalization succeeds. If close() throws, `_owned` stays true so a
-    // subsequent abort() releases the budget — otherwise a disk-full / footer
+    // subsequent abort() releases the budget; otherwise a disk-full / footer
     // failure would permanently consume the engine-wide SpillBudget.
     if (_arrow != null) {
       await _arrow.close(); // no file if nothing was added
@@ -331,7 +403,7 @@ class SpillWriter {
         bytes: _bytes,
       );
     }
-    await _parquet!.close();
+    await _parquet!.close().unwrap();
     await _reconcileToDisk();
     _owned = false;
     return SpillRun(
@@ -347,7 +419,7 @@ class SpillWriter {
   /// file's true on-disk size so the budget reflects real disk usage (spilled
   /// files are compressed, so this typically refunds a large over-charge). If
   /// the file is instead LARGER than estimated and reserving the extra would
-  /// cross maxSpillBytes, the run is deleted and the query fails — the cap is a
+  /// cross maxSpillBytes, the run is deleted and the query fails: the cap is a
   /// HARD ceiling, not silently crossed.
   Future<void> _reconcileToDisk() async {
     final file = File(path);
@@ -358,7 +430,7 @@ class SpillWriter {
     try {
       _budget?.adjust(delta); // throws if a positive delta would exceed the cap
       _bytes = actual;
-    } on StateError {
+    } on Failure {
       // The finalized file would push on-disk spill past maxSpillBytes. Release
       // our estimate, delete the run, and let the query fail rather than exceed
       // the limit the caller was promised.

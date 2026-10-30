@@ -2,10 +2,17 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:libbigdata/libbigdata.dart';
+import 'package:libbigdata/src/core/failure.dart';
 import 'package:libbigdata/src/core/limits.dart';
+import 'package:libbigdata/src/formats/arrow/arrow_buffers.dart'
+    show decodeColumn;
+import 'package:libbigdata/src/formats/arrow/arrow_message.dart'
+    show decimalBitsMeta, timeUnitMeta;
 import 'package:libbigdata/src/formats/arrow/arrow_reader.dart';
 import 'package:libbigdata/src/formats/arrow/arrow_writer.dart';
 import 'package:test/test.dart';
+
+import 'support/results.dart';
 
 Table _ids(List<int> ids) => Table(
   name: 't',
@@ -16,6 +23,92 @@ Table _ids(List<int> ids) => Table(
 );
 
 void main() {
+  test('a date file from an earlier version still reads as days', () async {
+    // Earlier writers omitted the date unit, which the spec reads as
+    // milliseconds; the values are 4-byte days.
+    final table = await ArrowReader(
+      'test/fixtures/arrow_date_without_unit.arrow',
+    ).read();
+    expect(table.column('d')!.toList(), [
+      DateTime.utc(2020, 1, 1),
+      DateTime.utc(1969, 12, 31),
+    ]);
+  });
+
+  group('IPC stream format', () {
+    late Directory dir;
+    setUp(() => dir = Directory.systemTemp.createTempSync('arrow_stream_'));
+    tearDown(() => dir.deleteSync(recursive: true));
+
+    final frame = DataFrame.fromTable(
+      Table.fromRows('t', [
+        for (var i = 0; i < 5; i++) {'id': i, 'name': 'n$i'},
+      ]),
+    );
+
+    test('writeArrowStream writes the stream format and reads back', () async {
+      final path = '${dir.path}/t.arrows';
+      await frame
+          .writeArrowStream(
+            path,
+            batchSize: 2,
+            compression: ArrowCompression.zstd,
+          )
+          .ok;
+      final bytes = File(path).readAsBytesSync();
+      // No ARROW1 magic; ends with the end-of-stream marker.
+      expect(String.fromCharCodes(bytes.take(6)), isNot('ARROW1'));
+      expect(bytes.sublist(bytes.length - 8), [255, 255, 255, 255, 0, 0, 0, 0]);
+      final read = await DataFrameIO.readArrowStream(path).ok;
+      expect((await read.execute().ok).column('name')!.toList(), [
+        'n0',
+        'n1',
+        'n2',
+        'n3',
+        'n4',
+      ]);
+    });
+
+    test('an empty stream keeps its schema', () async {
+      final path = '${dir.path}/e.arrows';
+      await frame.filter('id > 99').writeArrowStream(path).ok;
+      final read = await (await DataFrameIO.readArrowStream(
+        path,
+      ).ok).execute().ok;
+      expect(read.rowCount, 0);
+      expect(read.schema.fieldNames, ['id', 'name']);
+    });
+
+    test('readArrowStream also reads the file format', () async {
+      final path = '${dir.path}/t.arrow';
+      await frame.writeArrow(path).ok;
+      final read = await DataFrameIO.readArrowStream(path).ok;
+      expect((await read.execute().ok).rowCount, 5);
+    });
+
+    test('a stream over the row cap is a limit', () async {
+      final path = '${dir.path}/t.arrows';
+      await frame.writeArrowStream(path, batchSize: 2).ok;
+      await expectLater(
+        DataFrameIO.readArrowStream(path, maxRows: 3),
+        failsWith(Kind.limit),
+      );
+    });
+
+    test('readArrowBatches honours batchSize', () async {
+      final path = '${dir.path}/t.arrow';
+      await frame.writeArrow(path, batchSize: 5).ok;
+      final sizes = [
+        for (final batch in await DataFrameIO.readArrowBatches(
+          path,
+          batchSize: 2,
+        ).ok.toList())
+          (await batch.execute().ok).rowCount,
+      ];
+      expect(sizes, [2, 2, 1]);
+    });
+  });
+
   group('IPC', () {
     Table sample(int rows) {
       final id = <int?>[];
@@ -679,7 +772,7 @@ void main() {
       // a huge value so a block's offset+len exceeds the file.
       final corrupt = Uint8List.fromList(bytes);
       // Set the 8 bytes right before the trailing footer-length int32 to a huge
-      // value — this lands inside the footer flatbuffer (a Block bodyLength/offset
+      // value; this lands inside the footer flatbuffer (a Block bodyLength/offset
       // field), driving a block out of range.
       final at = corrupt.length - 10 - 8; // before <i32 len><"ARROW1"> tail
       final bd = ByteData.sublistView(corrupt);
@@ -705,7 +798,160 @@ void main() {
         );
       },
     );
+
+    test(
+      'any single corrupted byte reads or fails with a domain error',
+      () async {
+        final dir = Directory.systemTemp.createTempSync('afuzz_');
+        addTearDown(() => dir.deleteSync(recursive: true));
+        final bytes = await makeValid(dir);
+        for (var i = 0; i < bytes.length; i++) {
+          for (final value in [0x00, 0x7F, 0xFF]) {
+            final corrupt = Uint8List.fromList(bytes)..[i] = value;
+            try {
+              ArrowReader.decode(corrupt);
+            } on FormatException {
+              // expected for metadata bytes
+            } on Failure catch (failure) {
+              // a flipped type code can name a real but unsupported type
+              expect(failure.details.kind, Kind.unsupported);
+            } catch (error) {
+              fail('byte $i set to $value threw ${error.runtimeType}: $error');
+            }
+          }
+        }
+      },
+    );
+
+    test('a decimal buffer shorter than declared throws FormatException', () {
+      final field = Field(
+        name: 'd',
+        dataType: DataType.decimal,
+        metadata: {decimalBitsMeta: 128},
+      );
+      final body = Uint8List(64);
+      // Four 128-bit values need 64 bytes; the buffer declares 32.
+      expect(
+        () => decodeColumn(
+          field,
+          (length: 4, nullCount: 0),
+          [(offset: 0, length: 0), (offset: 0, length: 32)],
+          body,
+        ),
+        throwsA(isA<FormatException>()),
+      );
+    });
   });
+
+  group('crafted buffers fail as corrupt', () {
+    final body = Uint8List(256);
+
+    void corrupt(Field field, int rows, int nulls, List<(int, int)> buffers) {
+      expect(
+        () => decodeColumn(
+          field,
+          (length: rows, nullCount: nulls),
+          [
+            for (final (offset, length) in buffers)
+              (offset: offset, length: length),
+          ],
+          body,
+        ),
+        throwsA(isA<FormatException>()),
+      );
+    }
+
+    test('a validity buffer shorter than the rows', () {
+      // 64 rows with nulls need 8 bytes of validity; 1 is declared.
+      corrupt(Field(name: 'a', dataType: DataType.int64), 64, 3, [
+        (0, 1),
+        (8, 64 * 8),
+      ]);
+    });
+
+    test('nulls without a validity buffer', () {
+      corrupt(Field(name: 'a', dataType: DataType.int32), 4, 1, [
+        (0, 0),
+        (0, 16),
+      ]);
+    });
+
+    test('int16, boolean, date and timestamp buffers too short', () {
+      corrupt(Field(name: 'a', dataType: DataType.int16), 16, 0, [
+        (0, 0),
+        (0, 2),
+      ]);
+      corrupt(Field(name: 'a', dataType: DataType.boolean), 64, 0, [
+        (0, 0),
+        (0, 1),
+      ]);
+      corrupt(Field(name: 'a', dataType: DataType.date), 8, 0, [
+        (0, 0),
+        (0, 4),
+      ]);
+      corrupt(Field(name: 'a', dataType: DataType.timestamp), 8, 0, [
+        (0, 0),
+        (0, 8),
+      ]);
+    });
+
+    test('a string offset past its data buffer', () {
+      // Offsets [0, 100) but a 4-byte data buffer: the bytes would come from
+      // whatever follows it in the body.
+      final offsets = ByteData(8)
+        ..setInt32(0, 0, Endian.little)
+        ..setInt32(4, 100, Endian.little);
+      body.setRange(0, 8, offsets.buffer.asUint8List());
+      corrupt(Field(name: 's', dataType: DataType.string), 1, 0, [
+        (0, 0),
+        (0, 8),
+        (8, 4),
+      ]);
+    });
+
+    test('a seconds timestamp that overflows microseconds', () {
+      final raw = ByteData(8)..setInt64(0, 1 << 62, Endian.little);
+      body.setRange(0, 8, raw.buffer.asUint8List());
+      corrupt(
+        Field(
+          name: 't',
+          dataType: DataType.timestamp,
+          metadata: {timeUnitMeta: 0},
+        ),
+        1,
+        0,
+        [(0, 0), (0, 8)],
+      );
+    });
+  });
+
+  test('a wide batch reads with maxRows: null', () async {
+    final dir = Directory.systemTemp.createTempSync('awide_');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    const rows = 1000000;
+    final names = [for (var c = 0; c < 11; c++) 'c$c'];
+    final values = [for (var i = 0; i < rows; i++) i];
+    final path = '${dir.path}/wide.arrow';
+    // One batch, so its nodes together declare 11M rows.
+    await ArrowWriter(path, batchSize: rows).write(
+      Table(
+        name: 't',
+        schema: Schema(
+          fields: [
+            for (final name in names)
+              Field(name: name, dataType: DataType.int64, nullable: false),
+          ],
+        ),
+        columns: [
+          for (final name in names)
+            NumericColumn.int64(name: name, values: values, nullable: false),
+        ],
+      ),
+    );
+    final table = await ArrowReader(path).read(maxRows: null);
+    expect(table.rowCount, rows);
+    expect(table.column('c10')![rows - 1], rows - 1);
+  }, timeout: const Timeout(Duration(minutes: 2)));
 
   group('#8 Arrow zero-body read', () {
     late Directory dir;
@@ -769,7 +1015,7 @@ void main() {
             ),
           );
           // Second batch has the two columns reordered (b, a): same types, wrong
-          // order — must be rejected rather than stored under the wrong field.
+          // order: must be rejected rather than stored under the wrong field.
           final reordered = Table(
             name: 't',
             schema: Schema(
@@ -847,7 +1093,7 @@ void main() {
           // the block is read/decoded.
           await expectLater(
             ArrowReader(path).read(maxBytes: 1),
-            throwsA(isA<StateError>()),
+            throwsFailure(Kind.limit),
           );
           // Opting out (null) still reads the whole file.
           final full = await ArrowReader(

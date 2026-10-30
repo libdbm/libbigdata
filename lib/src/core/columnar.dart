@@ -5,19 +5,15 @@ import 'data_type.dart';
 import 'schema.dart';
 
 /// Shared building blocks for the columnar containers ([Table] and [DataChunk]),
-/// so the two can't drift — historically a fix applied to one (float coercion,
-/// width promotion, the null_ validation rule) silently missed the other.
+/// so the two can't drift: a fix (float coercion, width promotion, the null_
+/// validation rule) applies to both.
 
-/// Build a typed [Column] for [field] from boxed [data]. Numeric fields get the
-/// matching typed buffer (int8/16/32/64, float32/64); integer-literal source
-/// values are COERCED to double for a float field (a plain `cast<double?>()`
-/// throws on an int); every other type is a boxed [ListColumn].
 /// [value] as an unscaled BigInt at [scale]. Padding with zeros is exact;
 /// DROPPING digits is not, so a value needing more scale than the field declares
 /// is rejected rather than silently rounded.
 BigInt _rescale(Decimal value, int scale, String column) {
-  final diff = scale - value.scale;
-  if (diff >= 0) return value.unscaled * BigInt.from(10).pow(diff);
+  final shift = scale - value.scale;
+  if (shift >= 0) return value.unscaled * BigInt.from(10).pow(shift);
   final normalized = value.normalized;
   final shrink = scale - normalized.scale;
   if (shrink >= 0) return normalized.unscaled * BigInt.from(10).pow(shrink);
@@ -27,6 +23,11 @@ BigInt _rescale(Decimal value, int scale, String column) {
   );
 }
 
+/// Build a typed [Column] for [field] from boxed [data]. Numeric fields get the
+/// matching typed buffer (int8/16/32/64, float32/64); integer-literal source
+/// values are COERCED to double for a float field (a plain `cast<double?>()`
+/// throws on an int); string fields are a [StringColumn] and boolean fields a
+/// [BoolColumn]; every other type is a boxed [ListColumn].
 Column columnFor(Field field, List<dynamic> data) {
   final type = field.dataType;
   if (type.isNumeric) {
@@ -107,13 +108,13 @@ Column columnFor(Field field, List<dynamic> data) {
         );
       }
     }
-    // decimal-as-BigInt / any other numeric is boxed — falls through to ListColumn.
+    // decimal-as-BigInt / any other numeric is boxed: falls through to ListColumn.
   }
   // A string field inferred from mixed-type rows (JSON `1` then `"a"` →
   // commonType string) still holds the raw non-string values; coerce them to
   // their string form so the column's data matches its declared dtype. Only the
-  // non-strict (inferred-schema) path reaches here with a non-string — the strict
-  // path rejects it in _checkValue first, so an explicit-schema caller still
+  // non-strict (inferred-schema) path reaches here with a non-string: the strict
+  // path rejects it in _check first, so an explicit-schema caller still
   // fails loud rather than getting a silent stringification.
   final coerced =
       type == DataType.string && data.any((v) => v != null && v is! String)
@@ -122,6 +123,21 @@ Column columnFor(Field field, List<dynamic> data) {
             if (v == null) null else v.toString(),
         ]
       : data;
+  if (type == DataType.string) {
+    return StringColumn(
+      name: field.name,
+      values: coerced.cast<String?>(),
+      nullable: field.nullable,
+    );
+  }
+  if (type == DataType.boolean &&
+      coerced.every((v) => v == null || v is bool)) {
+    return BoolColumn(
+      name: field.name,
+      values: coerced.cast<bool?>(),
+      nullable: field.nullable,
+    );
+  }
   return ListColumn(
     name: field.name,
     dataType: type,
@@ -130,11 +146,11 @@ Column columnFor(Field field, List<dynamic> data) {
   );
 }
 
-/// Build a [Column] named [name] of [type] from boxed [values]: a numeric column
-/// gets its typed buffer when every value matches the family, otherwise a boxed
-/// [ListColumn]. Schema-free columnar construction — lives in core so format
-/// readers (CSV/Delta/Iceberg/Dataset) build columns without depending on the SQL
-/// kernel layer.
+/// Build a [Column] named [name] of [type] from boxed [values]: a numeric,
+/// string or boolean column gets its typed buffers when every value matches,
+/// otherwise a boxed [ListColumn]. Schema-free columnar construction: lives
+/// in core so format readers (CSV/Delta/Iceberg/Dataset) build columns without
+/// depending on the SQL kernel layer.
 Column columnFromValues(String name, DataType type, List<Object?> values) {
   final nullable = values.contains(null);
   switch (type) {
@@ -192,6 +208,24 @@ Column columnFromValues(String name, DataType type, List<Object?> values) {
         );
       }
       break;
+    case DataType.boolean:
+      if (values.every((v) => v == null || v is bool)) {
+        return BoolColumn(
+          name: name,
+          values: values.cast<bool?>(),
+          nullable: nullable,
+        );
+      }
+      break;
+    case DataType.string:
+      if (values.every((v) => v == null || v is String)) {
+        return StringColumn(
+          name: name,
+          values: values.cast<String?>(),
+          nullable: nullable,
+        );
+      }
+      break;
     default:
       break;
   }
@@ -205,37 +239,36 @@ Column columnFromValues(String name, DataType type, List<Object?> values) {
 
 /// Build one typed column per field of [schema] from row maps. When [strict]
 /// (explicit-schema construction), a row key that is NOT a schema field is
-/// rejected rather than silently dropped — so a typo'd column can't vanish (and,
+/// rejected rather than silently dropped, so a typo'd column can't vanish (and,
 /// e.g., a Delta update to a mistyped column can't commit a silent no-op).
 List<Column> columnsFromRows(
   List<Map<String, dynamic>> rows,
   Schema schema, {
   bool strict = false,
 }) {
-  final columnData = <String, List<dynamic>>{
+  final data = <String, List<dynamic>>{
     for (final field in schema.fields) field.name: [],
   };
-  final fieldNames = strict ? {for (final f in schema.fields) f.name} : null;
+  final names = strict ? {for (final f in schema.fields) f.name} : null;
   for (final row in rows) {
-    if (fieldNames != null) {
+    if (names != null) {
       for (final key in row.keys) {
-        if (!fieldNames.contains(key)) {
+        if (!names.contains(key)) {
           throw ArgumentError(
             'Row has field "$key" not in the schema '
-            '(${fieldNames.join(', ')}); explicit-schema construction is strict',
+            '(${names.join(', ')}); explicit-schema construction is strict',
           );
         }
       }
     }
     for (final field in schema.fields) {
       final value = row[field.name];
-      if (strict) _checkValue(field, value);
-      columnData[field.name]!.add(value);
+      if (strict) _check(field, value);
+      data[field.name]!.add(value);
     }
   }
   return [
-    for (final field in schema.fields)
-      columnFor(field, columnData[field.name]!),
+    for (final field in schema.fields) columnFor(field, data[field.name]!),
   ];
 }
 
@@ -244,11 +277,11 @@ List<Column> columnsFromRows(
 /// Only for the strict (explicit-schema) path: an inferred schema is derived
 /// FROM the values, so they always fit. This is not redundant with
 /// [validateColumns], which checks a column's DECLARED dtype and never inspects
-/// values — a boxed [ListColumn] would otherwise happily hold an int under a
+/// values: a boxed [ListColumn] would otherwise happily hold an int under a
 /// `string` field, leaving the table asserting a type its data contradicts.
 /// Numeric fields would eventually throw inside [columnFor]'s cast, but with a
 /// bare `String is not a subtype of int?` naming neither column nor value.
-void _checkValue(Field field, Object? value) {
+void _check(Field field, Object? value) {
   if (value == null) return; // nullability is enforced by validateColumns
   final type = field.dataType;
   final bool ok;
@@ -282,8 +315,29 @@ void _checkValue(Field field, Object? value) {
   }
 }
 
+/// An empty column per field of [schema].
+List<Column> emptyColumns(Schema schema) => [
+  for (final field in schema.fields)
+    ListColumn(
+      name: field.name,
+      dataType: field.dataType,
+      data: [],
+      nullable: field.nullable,
+    ),
+];
+
+/// The [names] columns, in that order, found with [lookup]; a name it does not
+/// find is an [ArgumentError].
+List<Column> selectColumns(
+  List<String> names,
+  Column? Function(String name) lookup,
+) => [
+  for (final name in names)
+    lookup(name) ?? (throw ArgumentError('Column not found: $name')),
+];
+
 /// Validate that [columns] match [schema] in count, per-column name, equal
-/// length, and exact dtype — the ONE exception being an all-null (`null_`)
+/// length, and exact dtype: the ONE exception being an all-null (`null_`)
 /// COLUMN, which fits any concrete field (but NOT the reverse: a concrete column
 /// under a `null_` field is a schema lie and is rejected). A non-nullable field
 /// must not carry nulls. Throws [ArgumentError] on any violation.
@@ -295,12 +349,12 @@ void validateColumns(List<Column> columns, Schema schema) {
     );
   }
   if (columns.isEmpty) return;
-  final expectedLength = columns.first.length;
+  final expected = columns.first.length;
   for (int i = 0; i < columns.length; i++) {
-    if (columns[i].length != expectedLength) {
+    if (columns[i].length != expected) {
       throw ArgumentError(
         'Column ${columns[i].name} has length ${columns[i].length}, '
-        'expected $expectedLength',
+        'expected $expected',
       );
     }
     if (columns[i].name != schema.fields[i].name) {
@@ -309,12 +363,12 @@ void validateColumns(List<Column> columns, Schema schema) {
         '${schema.fields[i].name}',
       );
     }
-    final columnType = columns[i].dataType;
-    final fieldType = schema.fields[i].dataType;
-    if (columnType != fieldType && columnType != DataType.null_) {
+    final actual = columns[i].dataType;
+    final declared = schema.fields[i].dataType;
+    if (actual != declared && actual != DataType.null_) {
       throw ArgumentError(
-        'Column ${columns[i].name} has type $columnType but schema field '
-        'declares $fieldType',
+        'Column ${columns[i].name} has type $actual but schema field '
+        'declares $declared',
       );
     }
     if (!schema.fields[i].nullable && columns[i].hasNulls) {

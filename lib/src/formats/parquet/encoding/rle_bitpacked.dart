@@ -1,7 +1,10 @@
 import 'dart:typed_data';
 import 'dart:math' as math;
 
-/// Bit width holding rep/def levels 0..[maxLevel] — the ONE formula for the
+import '../../../util/varint.dart';
+import 'byte_reader.dart';
+
+/// Bit width holding rep/def levels 0..[maxLevel]: the ONE formula for the
 /// level codec, shared by the shredder, the page decoder, and the schema
 /// analyzer. Integer [int.bitLength] on purpose: `ceil(log2(maxLevel+1))`
 /// agrees for every small level but a float rounding at a power-of-two
@@ -25,12 +28,17 @@ class RleBitpackedHybrid {
   /// it (plus a one-group slack, since bit-packed runs round up to multiples of
   /// 8) is rejected as a [FormatException] rather than allocated. Callers should
   /// pass the page's declared value count; when omitted [maxPageValues] applies.
+  ///
+  /// [limit] stops decoding once that many values are produced, cutting the
+  /// run in progress. Use it where a stream may legally overrun its count
+  /// (dictionary indices, booleans), so a huge final run is never expanded.
   static List<int> decode(
     Uint8List data,
     int bitWidth, {
     int? length,
     bool hasLength = false,
     int? maxValues,
+    int? limit,
   }) {
     if (bitWidth < 0 || bitWidth > 32) {
       throw ArgumentError('Invalid bit width: $bitWidth');
@@ -41,7 +49,7 @@ class RleBitpackedHybrid {
         : (maxValues > maxPageValues ? maxPageValues : maxValues) + 8;
     // Two run kinds have different DoS risk, so they get different bounds:
     //  - an RLE run (and a bit-width-0 run) claims its length from a tiny header
-    //    and materializes that many copies WITHOUT reading more input — a genuine
+    //    and materializes that many copies WITHOUT reading more input: a genuine
     //    allocation bomb, held to the tight per-page [cap].
     //  - a bit-width>=1 BIT-PACKED run must physically read runLength*bitWidth/8
     //    bytes from the already-length-bounded buffer (readBitPacked throws when
@@ -57,11 +65,15 @@ class RleBitpackedHybrid {
       }
     }
 
+    // How many of a run's values to keep under [limit].
+    int keep(int runLength, int have) =>
+        limit == null ? runLength : math.min(runLength, limit - have);
+
     // Handle bit width 0 - all values are 0
     if (bitWidth == 0) {
       // With bit width 0, we can't encode any values other than 0
       // The data should only contain run length encodings
-      final reader = ByteReader(data);
+      final reader = ByteReader(data, label: 'RLE/bit-packed stream');
 
       // Some encodings have a 4-byte length prefix
       if (hasLength) {
@@ -69,18 +81,21 @@ class RleBitpackedHybrid {
       }
 
       final values = <int>[];
-      final endPos = length != null ? reader.position + length : data.length;
+      final end = length != null ? reader.position + length : data.length;
 
-      while (reader.position < endPos && reader.hasMore()) {
+      while ((limit == null || values.length < limit) &&
+          reader.position < end &&
+          reader.hasMore()) {
         // Read header using ULEB128
-        final header = reader.readULEB128();
+        final header = reader.readVarint(maxBytes: 5);
 
         // With bit width 0, only RLE runs make sense
         if ((header & 1) == 0) {
           // RLE run - all values are 0
           final runLength = header >> 1;
           guard(runLength, values.length, cap);
-          for (int i = 0; i < runLength; i++) {
+          final count = keep(runLength, values.length);
+          for (int i = 0; i < count; i++) {
             values.add(0);
           }
         } else {
@@ -88,7 +103,8 @@ class RleBitpackedHybrid {
           // runLength zeros WITHOUT reading input, so it stays on the tight cap.
           final runLength = (header >> 1) * 8;
           guard(runLength, values.length, cap);
-          for (int i = 0; i < runLength; i++) {
+          final count = keep(runLength, values.length);
+          for (int i = 0; i < count; i++) {
             values.add(0);
           }
         }
@@ -97,7 +113,7 @@ class RleBitpackedHybrid {
       return values;
     }
 
-    final reader = ByteReader(data);
+    final reader = ByteReader(data, label: 'RLE/bit-packed stream');
 
     // Some encodings have a 4-byte length prefix
     if (hasLength) {
@@ -105,36 +121,161 @@ class RleBitpackedHybrid {
     }
 
     final values = <int>[];
-    final endPos = length != null ? reader.position + length : data.length;
+    final end = length != null ? reader.position + length : data.length;
 
-    while (reader.position < endPos && reader.hasMore()) {
+    while ((limit == null || values.length < limit) &&
+        reader.position < end &&
+        reader.hasMore()) {
       // Read header using ULEB128
-      final header = reader.readULEB128();
+      final header = reader.readVarint(maxBytes: 5);
 
       if ((header & 1) == 0) {
-        // RLE run — one value copied runLength times with no further reads, so
+        // RLE run; one value copied runLength times with no further reads, so
         // it keeps the tight per-page cap (the real size-bomb vector).
         final runLength = header >> 1;
         guard(runLength, values.length, cap);
         final byteWidth = (bitWidth + 7) ~/ 8;
         final value = reader.readBits(byteWidth * 8);
 
-        for (int i = 0; i < runLength; i++) {
+        final count = keep(runLength, values.length);
+        for (int i = 0; i < count; i++) {
           values.add(value);
         }
       } else {
-        // Bit-packed run — readBitPacked reads runLength*bitWidth/8 bytes from
+        // Bit-packed run: readBitPacked reads runLength*bitWidth/8 bytes from
         // the length-bounded buffer (throws when short), so it is self-bounded;
         // only the absolute backstop applies, allowing a padded final block that
         // the caller's clamp() trims.
         final runLength = (header >> 1) * 8; // Stored as count/8
         guard(runLength, values.length, maxPageValues);
-        final packedValues = readBitPacked(reader, runLength, bitWidth);
-        values.addAll(packedValues);
+        final packed = readBitPacked(reader, runLength, bitWidth);
+        values.addAll(packed.take(keep(packed.length, values.length)));
       }
     }
 
     return values;
+  }
+
+  /// Decode up to [count] repetition or definition levels of [bitWidth] (1 to
+  /// 8 bits) from [data] into [into], starting at index 0, counting the levels
+  /// equal to [maxLevel] as it goes. Returns how many levels the data held
+  /// (fewer than [count] only when it runs out) and how many were [maxLevel].
+  ///
+  /// The page-reading counterpart of [decode]: no intermediate lists, RLE runs
+  /// filled in one call, and decoding stops at [count] instead of expanding a
+  /// writer's padded final block. The bounds are [decode]'s: an RLE run past
+  /// [count] plus one group, or a bit-packed run past [maxPageValues], is a
+  /// [FormatException], as is a run whose bytes are missing.
+  static ({int decoded, int present}) decodeLevels(
+    Uint8List data,
+    int bitWidth,
+    int count,
+    Uint8List into,
+    int maxLevel,
+  ) {
+    if (bitWidth < 1 || bitWidth > 8) {
+      throw ArgumentError('Level bit width must be 1 to 8: $bitWidth');
+    }
+    final cap = math.min(count, maxPageValues) + 8;
+    final mask = (1 << bitWidth) - 1;
+    final reader = ByteReader(data, label: 'RLE/bit-packed stream');
+    var have = 0;
+    var present = 0;
+    while (have < count && reader.hasMore()) {
+      final header = reader.readVarint(maxBytes: 5);
+      if ((header & 1) == 0) {
+        final runLength = header >> 1;
+        if (have + runLength > cap) {
+          throw FormatException(
+            'RLE run length $runLength exceeds page value bound $cap',
+          );
+        }
+        final value = reader.readByte();
+        final take = math.min(runLength, count - have);
+        into.fillRange(have, have + take, value);
+        if (value == maxLevel) present += take;
+        have += take;
+      } else {
+        final runLength = (header >> 1) * 8;
+        if (have + runLength > maxPageValues) {
+          throw FormatException(
+            'RLE run length $runLength exceeds page value bound $maxPageValues',
+          );
+        }
+        // A whole number of groups of 8, so a whole number of bytes.
+        final bytes = reader.readBytes(runLength * bitWidth ~/ 8);
+        final take = math.min(runLength, count - have);
+        var buffer = 0;
+        var bits = 0;
+        var next = 0;
+        for (var i = have, end = have + take; i < end; i++) {
+          if (bits < bitWidth) {
+            buffer |= bytes[next++] << bits;
+            bits += 8;
+          }
+          final level = buffer & mask;
+          buffer >>= bitWidth;
+          bits -= bitWidth;
+          into[i] = level;
+          if (level == maxLevel) present++;
+        }
+        have += take;
+      }
+    }
+    return (decoded: have, present: present);
+  }
+
+  /// Decode up to [count] values of [bitWidth] (0 to 32 bits) from [data] into
+  /// [into], starting at index 0, and return how many the data held. For
+  /// dictionary indices: the final run may overrun [count] and is cut there,
+  /// as [decode] does with `limit`. A run past [maxPageValues], or one whose
+  /// bytes are missing, is a [FormatException].
+  static int decodeInto(
+    Uint8List data,
+    int bitWidth,
+    int count,
+    Int32List into,
+  ) {
+    if (bitWidth < 0 || bitWidth > 32) {
+      throw FormatException('Invalid bit width: $bitWidth');
+    }
+    final mask = bitWidth == 32 ? 0xFFFFFFFF : (1 << bitWidth) - 1;
+    final byteWidth = (bitWidth + 7) ~/ 8;
+    final reader = ByteReader(data, label: 'RLE/bit-packed stream');
+    var have = 0;
+    while (have < count && reader.hasMore()) {
+      final header = reader.readVarint(maxBytes: 5);
+      final runLength = (header & 1) == 0 ? header >> 1 : (header >> 1) * 8;
+      if (have + runLength > maxPageValues + 8) {
+        throw FormatException(
+          'RLE run length $runLength exceeds page value bound $maxPageValues',
+        );
+      }
+      final take = math.min(runLength, count - have);
+      if ((header & 1) == 0) {
+        final value = byteWidth == 0 ? 0 : reader.readBits(byteWidth * 8);
+        into.fillRange(have, have + take, value.toSigned(32));
+      } else if (bitWidth == 0) {
+        into.fillRange(have, have + take, 0);
+      } else {
+        // The whole run is read even when cut, so a truncated run still fails.
+        final bytes = reader.readBytes(runLength * bitWidth ~/ 8);
+        var buffer = 0;
+        var bits = 0;
+        var next = 0;
+        for (var i = have, end = have + take; i < end; i++) {
+          while (bits < bitWidth) {
+            buffer |= bytes[next++] << bits;
+            bits += 8;
+          }
+          into[i] = (buffer & mask).toSigned(32);
+          buffer >>= bitWidth;
+          bits -= bitWidth;
+        }
+      }
+      have += take;
+    }
+    return have;
   }
 
   /// Read bit-packed values
@@ -260,7 +401,7 @@ class RleBitpackedHybrid {
     int bitWidth,
   ) {
     // Write header (run length << 1)
-    writeULEB128(buffer, runLength << 1);
+    writeVarint(buffer, runLength << 1);
 
     // Write value
     final byteWidth = (bitWidth + 7) ~/ 8;
@@ -280,7 +421,7 @@ class RleBitpackedHybrid {
     final count = (values.length ~/ 8) * 8;
 
     // Write header ((count / 8) << 1 | 1)
-    writeULEB128(buffer, (count ~/ 8) << 1 | 1);
+    writeVarint(buffer, (count ~/ 8) << 1 | 1);
 
     // Pack values
     final packed = packBits(values.sublist(0, count), bitWidth);
@@ -338,84 +479,5 @@ class RleBitpackedHybrid {
       bitsWritten += bitsToWrite;
       bitOffset += bitsToWrite;
     }
-  }
-
-  /// Write ULEB128 encoded integer
-  static void writeULEB128(BytesBuilder buffer, int value) {
-    while (value >= 0x80) {
-      buffer.addByte((value & 0x7F) | 0x80);
-      value >>= 7;
-    }
-    buffer.addByte(value & 0x7F);
-  }
-}
-
-/// Helper class for reading bytes
-class ByteReader {
-  final Uint8List data;
-  int position = 0;
-
-  ByteReader(this.data);
-
-  bool hasMore() => position < data.length;
-
-  int readByte() {
-    // Truncated input is a format violation (a catchable domain error), not a
-    // raw RangeError (which reads as an internal VM/programmer bug).
-    if (position >= data.length) {
-      throw const FormatException(
-        'Truncated RLE/bit-packed stream: no more bytes to read',
-      );
-    }
-    return data[position++];
-  }
-
-  Uint8List readBytes(int count) {
-    if (position + count > data.length) {
-      throw FormatException(
-        'Truncated RLE/bit-packed stream: need $count bytes at $position, '
-        'only ${data.length - position} left',
-      );
-    }
-    final bytes = data.sublist(position, position + count);
-    position += count;
-    return bytes;
-  }
-
-  int readInt32() {
-    final bytes = readBytes(4);
-    return ByteData.view(
-      bytes.buffer,
-      bytes.offsetInBytes,
-    ).getInt32(0, Endian.little);
-  }
-
-  int readBits(int bitCount) {
-    final byteCount = (bitCount + 7) ~/ 8;
-    final bytes = readBytes(byteCount);
-    int value = 0;
-    for (int i = 0; i < byteCount; i++) {
-      value |= bytes[i] << (i * 8);
-    }
-    return value;
-  }
-
-  int readULEB128() {
-    int value = 0;
-    int shift = 0;
-
-    while (true) {
-      final byte = readByte();
-      value |= (byte & 0x7F) << shift;
-      if ((byte & 0x80) == 0) {
-        break;
-      }
-      shift += 7;
-      if (shift > 35) {
-        throw FormatException('ULEB128 value too large');
-      }
-    }
-
-    return value;
   }
 }

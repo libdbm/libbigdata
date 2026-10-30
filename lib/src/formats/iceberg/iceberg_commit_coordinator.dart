@@ -3,37 +3,45 @@ import 'dart:io';
 import 'dart:math';
 
 import '../../core/backoff.dart';
+import '../../core/failure.dart';
+import '../../core/ids.dart' as ids;
 import '../../core/paths.dart';
+import '../../core/result.dart';
 
-/// Thrown when the current-metadata pointer could not be advanced because a
-/// concurrent writer won the version. Extends [StateError] so it stays
-/// `is StateError` with the historical message (default behavior unchanged).
-class IcebergCommitConflict extends StateError {
+/// The current-metadata pointer could not be advanced because a concurrent
+/// writer won the version. A commit returns it as an [Err] of [Kind.conflict].
+class IcebergCommitConflict extends Failure {
   IcebergCommitConflict(this.tablePath, this.version)
     : super(
-        'Iceberg commit conflict on $tablePath: version $version is contended '
-        'by another writer (retry the write)',
+        ErrorDetails(
+          Kind.conflict,
+          'Iceberg commit conflict on $tablePath: version $version is '
+          'contended by another writer (retry the write)',
+        ),
       );
 
   final String tablePath;
   final int version;
 }
 
-/// Thrown by a coordinator that CANNOT determine whether its commit landed — e.g.
-/// a catalog compare-and-swap whose response was lost to a timeout or connection
-/// reset after the swap may have already succeeded. Distinct from
+/// A coordinator CANNOT determine whether its commit landed, e.g. a catalog
+/// compare-and-swap whose response was lost to a timeout or connection reset
+/// after the swap may have already succeeded. Distinct from
 /// [IcebergCommitConflict] (which means the commit definitively did NOT land): on
 /// this, the writer must RETAIN its staged data files, because the published
-/// metadata may already reference them. Extends [StateError] for `is StateError`
-/// compatibility. The default [FilesystemCommitCoordinator] never throws it (all
-/// of its failure modes are pre-publish).
-class IcebergCommitIndeterminate extends StateError {
-  IcebergCommitIndeterminate(this.tablePath, [String? detail])
+/// metadata may already reference them. A commit returns it as an [Err] of
+/// [Kind.indeterminate], with the failure that caused it as the [cause].
+class IcebergCommitIndeterminate extends Failure {
+  IcebergCommitIndeterminate(this.tablePath, [String? detail, Object? cause])
     : super(
-        'Iceberg commit outcome indeterminate on $tablePath'
-        '${detail == null ? '' : ': $detail'} — staged files retained (the '
-        'commit may have landed; resolve the current-metadata pointer before '
-        'any cleanup)',
+        ErrorDetails(
+          Kind.indeterminate,
+          'Iceberg commit outcome indeterminate on $tablePath'
+          '${detail == null ? '' : ': $detail'}: staged files retained (the '
+          'commit may have landed; resolve the current-metadata pointer before '
+          'any cleanup)',
+          cause,
+        ),
       );
 
   final String tablePath;
@@ -42,14 +50,14 @@ class IcebergCommitIndeterminate extends StateError {
 /// What a coordinator publishes for a claimed version: the metadata file name
 /// (`NNNNN-uuid.metadata.json`) and its already-encoded JSON body. The
 /// coordinator installs this as the new current-metadata pointer.
-class IcebergMetadataPublish {
+final class IcebergMetadataPublish {
   IcebergMetadataPublish(this.metadataFileName, this.metadataJson);
 
   final String metadataFileName;
   final String metadataJson;
 }
 
-/// The atomic "who owns the current table-metadata pointer" seam of an Iceberg
+/// The atomic "who owns the current table-metadata pointer" boundary of an Iceberg
 /// commit. The default [FilesystemCommitCoordinator] reproduces libbigdata's
 /// O_EXCL `vNNNNN.commit` marker + lease-reclaim on a bare filesystem. Supply a
 /// catalog-backed implementation (REST / Glue / Hive) for true cross-engine
@@ -57,15 +65,15 @@ class IcebergMetadataPublish {
 ///
 /// HONEST SCOPE: on a bare filesystem the CAS window is narrowed but not fully
 /// closed; real cross-engine CAS of the current-metadata pointer requires the
-/// caller's catalog service. This interface is the injection seam for one.
+/// caller's catalog service. This interface is the injection boundary for one.
 abstract interface class IcebergCommitCoordinator {
   /// Repeatedly: (1) read current metadata via [readCurrent] (the expected
   /// pointer), (2) derive the next [build] version, (3) call [build] to stage
   /// side files and produce the metadata JSON, (4) atomically install it as the
   /// new current pointer iff the pointer is still the one read in (1). On a lost
-  /// CAS, retry from (1); if it cannot win, throw [IcebergCommitConflict].
-  /// Returns the committed version.
-  Future<int> commit({
+  /// CAS, retry from (1); if it cannot win, return [Kind.conflict]. Returns the
+  /// committed version, or [Kind.indeterminate] when the outcome is unknown.
+  Future<Result<int, ErrorDetails>> commit({
     required String root,
     required Future<Map<String, dynamic>?> Function() readCurrent,
     required Future<IcebergMetadataPublish> Function(
@@ -78,9 +86,8 @@ abstract interface class IcebergCommitCoordinator {
 
 /// Default coordinator: the O_EXCL `vNNNNN.commit` marker + lease-reclaim commit
 /// loop, moved here verbatim from the writer so behavior is byte-for-byte
-/// unchanged. Only the terminal contention throw is [IcebergCommitConflict]
-/// (which extends [StateError] with the same historical message).
-class FilesystemCommitCoordinator implements IcebergCommitCoordinator {
+/// unchanged. Terminal contention returns [Kind.conflict].
+base class FilesystemCommitCoordinator implements IcebergCommitCoordinator {
   /// [maxAttempts] contended tries before surfacing a conflict; contention
   /// backs off exponentially from [baseDelay], capped at [maxDelay], with full
   /// jitter so concurrent writers don't lockstep-collide (thundering herd). The
@@ -106,10 +113,10 @@ class FilesystemCommitCoordinator implements IcebergCommitCoordinator {
 
   /// A version-claim marker older than this is presumed orphaned by a crashed
   /// writer (a real commit takes milliseconds) and is reclaimed.
-  static const _commitLease = Duration(minutes: 5);
+  static const _lease = Duration(minutes: 5);
 
   @override
-  Future<int> commit({
+  Future<Result<int, ErrorDetails>> commit({
     required String root,
     required Future<Map<String, dynamic>?> Function() readCurrent,
     required Future<IcebergMetadataPublish> Function(
@@ -117,10 +124,20 @@ class FilesystemCommitCoordinator implements IcebergCommitCoordinator {
       int version,
     )
     build,
-  }) async {
+  }) => capture(() => _loop(root, readCurrent, build));
+
+  Future<int> _loop(
+    String root,
+    Future<Map<String, dynamic>?> Function() readCurrent,
+    Future<IcebergMetadataPublish> Function(
+      Map<String, dynamic>? previous,
+      int version,
+    )
+    build,
+  ) async {
     // Secure entropy so writers in separate processes/isolates don't seed the
     // same jitter sequence and re-collide in lockstep.
-    final rand = Random.secure();
+    final random = Random.secure();
     final start = DateTime.now();
     for (var attempt = 0; ; attempt++) {
       final previous = await readCurrent();
@@ -132,20 +149,20 @@ class FilesystemCommitCoordinator implements IcebergCommitCoordinator {
         await marker.create(exclusive: true);
       } on PathExistsException {
         // The version is claimed. If the marker is stale, the holder is presumed
-        // dead — reclaim it. If it is fresh (or already released), a writer
+        // dead: reclaim it. If it is fresh (or already released), a writer
         // is/was active: back off and retry (the next iteration re-reads the
         // latest version). Bounded so a wedged marker surfaces a conflict.
         if (await marker.exists()) {
           final age = DateTime.now().difference((await marker.stat()).modified);
-          if (age > _commitLease) {
+          if (age > _lease) {
             try {
               await marker.delete();
             } catch (_) {}
             continue;
           }
         }
-        // Surface a conflict once EITHER bound is hit — the attempt count or the
-        // wall-clock deadline — so a caller with a request SLO isn't held for the
+        // Surface a conflict once EITHER bound is hit: the attempt count or the
+        // wall-clock deadline, so a caller with a request SLO isn't held for the
         // full attempt budget.
         final elapsed = DateTime.now().difference(start);
         if (attempt >= maxAttempts ||
@@ -156,7 +173,7 @@ class FilesystemCommitCoordinator implements IcebergCommitCoordinator {
         await Future<void>.delayed(
           fullJitterBackoff(
             attempt,
-            rand,
+            random,
             baseMs: baseDelay.inMilliseconds,
             capMs: maxDelay.inMilliseconds,
           ),
@@ -164,42 +181,61 @@ class FilesystemCommitCoordinator implements IcebergCommitCoordinator {
         continue;
       }
 
+      // The claim only proves no one else is publishing [version] NOW. Another
+      // writer may have published it (and released its marker) after we read
+      // [previous], so re-read: if the table moved, our version is stale and
+      // publishing it would be a second metadata file at the same version.
+      // Release the claim and retry from the fresh state.
+      final latest = await readCurrent();
+      if (latest?['_version'] != previous?['_version']) {
+        try {
+          await marker.delete();
+        } catch (_) {}
+        final elapsed = DateTime.now().difference(start);
+        if (attempt >= maxAttempts ||
+            (maxElapsed != null && elapsed >= maxElapsed!)) {
+          throw IcebergCommitConflict(root, version);
+        }
+        continue;
+      }
+
       // Record our claim's identity (its mtime) so we can detect a concurrent
       // writer reclaiming the marker while our build runs.
-      final claimStamp = (await marker.stat()).modified;
+      final stamp = (await marker.stat()).modified;
       try {
-        final pub = await build(previous, version);
+        final staged = await build(previous, version);
         // Re-verify we still own the claim before publishing: a slow build that
         // outlived the lease could have had its marker reclaimed by another
-        // writer computing the SAME version — publishing now would create
+        // writer computing the SAME version: publishing now would create
         // split-brain metadata. Fail loud (retryable) rather than publish.
         // Best-effort (filesystem mtime granularity narrows, not closes, the
-        // window — a catalog coordinator with fencing is the real fix).
-        if (!await marker.exists() ||
-            (await marker.stat()).modified != claimStamp) {
+        // window: a catalog coordinator with fencing is the real fix).
+        if (!await marker.exists() || (await marker.stat()).modified != stamp) {
           throw IcebergCommitConflict(root, version);
         }
         // metadata.json is the commit point (the highest-numbered one is
         // current), so it must appear atomically: stage to a temp file, then
         // rename. A crash mid-write leaves the temp, never a half-written
         // current metadata.
-        final metaPath = '$root/metadata/${pub.metadataFileName}';
-        final temp = File('$metaPath.tmp');
-        await temp.writeAsString(pub.metadataJson, flush: true);
+        // A fresh temp name per writer: a fixed `.tmp` would let two writers
+        // staging the same version write one file.
+        final target = '$root/metadata/${staged.metadataFileName}';
+        final temp = File('$target.${ids.token()}.tmp');
+        await temp.writeAsString(staged.metadataJson, flush: true);
         // The rename IS the publish. On NFS / object-backed filesystems (or after
         // a lost response) it can land remotely yet report an error. If the
-        // destination now exists — or we can't tell — the commit may have
+        // destination now exists (or we can't tell) the commit may have
         // PUBLISHED, so surface IcebergCommitIndeterminate (the writer RETAINS its
         // staged data on it) rather than letting a raw error propagate to the
         // writer's cleanup, which would delete files the published snapshot
         // references. Only a confirmed-absent destination is a clean pre-publish
         // failure to rethrow.
         try {
-          await temp.rename(metaPath);
-        } catch (e) {
+          await temp.rename(target);
+        } catch (error) {
           bool present;
           try {
-            present = await File(metaPath).exists();
+            present = await File(target).exists();
           } catch (_) {
             present =
                 true; // can't stat → fail safe (assume it may have landed)
@@ -207,19 +243,25 @@ class FilesystemCommitCoordinator implements IcebergCommitCoordinator {
           if (present) {
             throw IcebergCommitIndeterminate(
               root,
-              'metadata rename reported an error but $metaPath exists ($e)',
+              'metadata rename reported an error but $target exists ($error)',
+              error,
             );
           }
+          // A clean failure before the publish: the temp would otherwise be
+          // left behind, and nothing sweeps it.
+          try {
+            if (await temp.exists()) await temp.delete();
+          } catch (_) {}
           rethrow;
         }
         return version;
       } finally {
-        // Release the transient version claim (published or failed) — but ONLY
+        // Release the transient version claim (published or failed), but ONLY
         // if we still own it; if another writer reclaimed the stale marker and
         // created its own, deleting it would drop that writer's live claim.
         try {
           if (await marker.exists() &&
-              (await marker.stat()).modified == claimStamp) {
+              (await marker.stat()).modified == stamp) {
             await marker.delete();
           }
         } catch (_) {}
@@ -240,7 +282,7 @@ class FilesystemCommitCoordinator implements IcebergCommitCoordinator {
 /// use this coordinator on a lock-honoring filesystem). POSIX `fcntl` locks are
 /// per-process, so this does NOT serialize concurrent writers within one process
 /// (isolates/async). An external engine publishing without the lock is not
-/// coordinated — a REST/Glue/Hive catalog coordinator is still the answer for
+/// coordinated: a REST/Glue/Hive catalog coordinator is still the answer for
 /// true cross-engine CAS. Readers ([IcebergTable]) need no lock: a publish is an
 /// atomic rename, so a reader sees the old or the new metadata, never a partial
 /// state.
@@ -254,11 +296,11 @@ class FileLockIcebergCommitCoordinator implements IcebergCommitCoordinator {
 
   /// Bounds the wait to acquire the commit lock. Null (default) waits forever;
   /// set a [Duration] so a hung/orphaned lock holder (e.g. a crashed pod on NFS)
-  /// fails loud with a [TimeoutException] instead of stranding the caller.
+  /// fails loud with [Kind.timeout] instead of stranding the caller.
   final Duration? timeout;
 
   @override
-  Future<int> commit({
+  Future<Result<int, ErrorDetails>> commit({
     required String root,
     required Future<Map<String, dynamic>?> Function() readCurrent,
     required Future<IcebergMetadataPublish> Function(
@@ -266,14 +308,16 @@ class FileLockIcebergCommitCoordinator implements IcebergCommitCoordinator {
       int version,
     )
     build,
-  }) => withFileLock(
-    '$root/metadata/_commit.lock',
-    () => inner.commit(root: root, readCurrent: readCurrent, build: build),
-    timeout: timeout,
+  }) => guard(
+    () => withFileLock(
+      '$root/metadata/_commit.lock',
+      () => inner.commit(root: root, readCurrent: readCurrent, build: build),
+      timeout: timeout,
+    ),
   );
 }
 
-/// An Iceberg commit coordinator backed by a shared [LocalCatalog] registry —
+/// An Iceberg commit coordinator backed by a shared [LocalCatalog] registry:
 /// the SAME fenced-CAS primitive the Delta registry coordinator uses (one
 /// registry coordinates both formats). Holds the registry lock over the whole
 /// read-current → build → publish, records the committed version AND the
@@ -291,7 +335,7 @@ class LocalCatalogIcebergCommitCoordinator implements IcebergCommitCoordinator {
   final IcebergCommitCoordinator inner;
 
   @override
-  Future<int> commit({
+  Future<Result<int, ErrorDetails>> commit({
     required String root,
     required Future<Map<String, dynamic>?> Function() readCurrent,
     required Future<IcebergMetadataPublish> Function(
@@ -300,42 +344,44 @@ class LocalCatalogIcebergCommitCoordinator implements IcebergCommitCoordinator {
     )
     build,
   }) async {
-    // The registry is persisted by `guarded` AFTER this body returns — so a
+    // The registry is persisted by `guarded` AFTER this body returns, so a
     // registry-write failure lands AFTER the real metadata.json has published.
     // Left raw, the writer would treat it as pre-publish and DELETE the staged
     // data/manifest files the published metadata references (corrupting the
     // table). Once the metadata is durable, any later failure is INDETERMINATE:
-    // the commit landed, only the advisory pointer wasn't recorded — so the
+    // the commit landed, only the advisory pointer wasn't recorded, so the
     // writer must RETAIN its files (the highest-numbered metadata.json is
     // current regardless).
     var published = false;
-    try {
-      return await catalog.guarded(root, (txn) async {
-        String? metadataFile;
-        final version = await inner.commit(
-          root: root,
-          readCurrent: readCurrent,
-          build: (previous, v) async {
-            final pub = await build(previous, v);
-            metadataFile = pub.metadataFileName; // capture the current pointer
-            return pub;
-          },
-        );
+    Result<int, ErrorDetails> indeterminate(Object cause) => Err(
+      IcebergCommitIndeterminate(
+        root,
+        'the metadata.json published but the catalog registry pointer '
+        'could not be recorded: $cause',
+        cause,
+      ).details,
+    );
+    final recorded = await catalog.guarded(root, (transaction) async {
+      String? pointer;
+      final outcome = await inner.commit(
+        root: root,
+        readCurrent: readCurrent,
+        build: (previous, version) async {
+          final staged = await build(previous, version);
+          pointer = staged.metadataFileName; // capture the current pointer
+          return staged;
+        },
+      );
+      if (outcome case Ok(:final value)) {
         published = true;
-        txn.put(root, version: version, pointer: metadataFile);
-        return version;
-      });
-    } catch (e) {
-      if (published &&
-          e is! IcebergCommitConflict &&
-          e is! IcebergCommitIndeterminate) {
-        throw IcebergCommitIndeterminate(
-          root,
-          'the metadata.json published but the catalog registry pointer could '
-          'not be recorded: $e',
-        );
+        transaction.put(root, version: value, pointer: pointer);
       }
-      rethrow;
-    }
+      return outcome;
+    });
+    return switch (recorded) {
+      Ok(:final value) => value,
+      Err(:final error) when published => indeterminate(error),
+      Err(:final error) => Err(error),
+    };
   }
 }

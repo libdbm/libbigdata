@@ -3,7 +3,152 @@ import 'dart:io';
 import 'package:libbigdata/libbigdata.dart';
 import 'package:test/test.dart';
 
+import 'support/results.dart';
+
 void main() {
+  group('CSV values', () {
+    test('a timestamp without a zone is UTC', () async {
+      final table = await CsvReader(
+        options: CsvOptions(
+          schema: Schema(
+            fields: [Field(name: 't', dataType: DataType.timestamp)],
+          ),
+        ),
+      ).readString('t\n2024-01-01 10:00:00\n').ok;
+      expect(table.column('t')![0], DateTime.utc(2024, 1, 1, 10));
+      final formatted = await CsvReader(
+        options: CsvOptions(
+          timestampFormat: 'yyyy/MM/dd HH:mm',
+          schema: Schema(
+            fields: [Field(name: 't', dataType: DataType.timestamp)],
+          ),
+        ),
+      ).readString('t\n2024/01/01 10:00\n').ok;
+      expect(formatted.column('t')![0], DateTime.utc(2024, 1, 1, 10));
+    });
+
+    test(
+      'the thousands separator is stripped only from grouped digits',
+      () async {
+        final table = await CsvReader(
+          options: CsvOptions.european(),
+        ).readString('a;b\n1.2.3;1.234,5\n10.0.1;2.000,25\n').ok;
+        expect(table.schema.field('a')!.dataType, DataType.string);
+        expect(table.column('a')!.toList(), ['1.2.3', '10.0.1']);
+        expect(table.column('b')!.toList(), [1234.5, 2000.25]);
+      },
+    );
+
+    test('a custom escape character is itself escaped on write', () async {
+      const options = CsvOptions(escape: r'\');
+      final table = Table.fromRows('t', [
+        {'v': r'a\b,c'},
+        {'v': r'x,\'},
+      ]);
+      final text = CsvWriter(options).writeTableToString(table);
+      final back = await CsvReader(options: options).readString(text).ok;
+      expect(back.column('v')!.toList(), [r'a\b,c', r'x,\']);
+    });
+
+    test('a string equal to a null token survives a round trip', () async {
+      final table = Table.fromRows('t', [
+        {'c': 'NA', 'n': 'null'},
+        {'c': 'x', 'n': 'NaN'},
+      ]);
+      final text = CsvWriter().writeTableToString(table);
+      final back = await CsvReader().readString(text).ok;
+      expect(back.toRows(), [
+        {'c': 'NA', 'n': 'null'},
+        {'c': 'x', 'n': 'NaN'},
+      ]);
+    });
+  });
+
+  group('every read path agrees', () {
+    late Directory dir;
+    setUp(() => dir = Directory.systemTemp.createTempSync('csv_paths_'));
+    tearDown(() => dir.deleteSync(recursive: true));
+
+    /// [content] read through readString, readFile and readBatches, each as
+    /// (schema, rows).
+    Future<List<(String, List<Map<String, dynamic>>)>> read(
+      String content, [
+      CsvOptions options = const CsvOptions(),
+    ]) async {
+      final path = '${dir.path}/in.csv';
+      File(path).writeAsStringSync(content);
+      final reader = CsvReader(options: options);
+      String schema(Table t) => [
+        for (final f in t.schema.fields) '${f.name}:${f.dataType.name}',
+      ].join(',');
+      final text = await reader.readString(content).ok;
+      final file = await reader.readFile(path).ok;
+      final batches = [await for (final b in reader.readBatches(path)) b.ok];
+      final rows = [for (final b in batches) ...b.toRows()];
+      return [
+        (schema(text), text.toRows()),
+        (schema(file), file.toRows()),
+        (batches.isEmpty ? '' : schema(batches.first), rows),
+      ];
+    }
+
+    void same(
+      List<(String, List<Map<String, dynamic>>)> results,
+      String schema,
+      List<Map<String, dynamic>> rows,
+    ) {
+      for (final (index, (s, r)) in results.indexed) {
+        final path = ['readString', 'readFile', 'readBatches'][index];
+        expect(s, schema, reason: path);
+        expect(r, rows, reason: path);
+      }
+    }
+
+    test('a comment line before the header', () async {
+      same(
+        await read('# exported\na,b\n1,2\n', const CsvOptions(comment: '#')),
+        'a:int64,b:int64',
+        [
+          {'a': 1, 'b': 2},
+        ],
+      );
+    });
+
+    test('a blank line before the header', () async {
+      same(await read('\na,b\n1,2\n'), 'a:int64,b:int64', [
+        {'a': 1, 'b': 2},
+      ]);
+    });
+
+    test('carriage-return line endings', () async {
+      same(await read('a,b\r1,2\r3,4\r'), 'a:int64,b:int64', [
+        {'a': 1, 'b': 2},
+        {'a': 3, 'b': 4},
+      ]);
+    });
+
+    test('a header-only file keeps its columns', () async {
+      same(await read('a,b\n'), 'a:string,b:string', []);
+    });
+
+    test('an empty header cell gets one name everywhere', () async {
+      same(await read('a,,c\n1,2,3\n'), 'a:int64,column_1:int64,c:int64', [
+        {'a': 1, 'column_1': 2, 'c': 3},
+      ]);
+    });
+
+    test('a CRLF inside a quoted field is kept', () async {
+      same(await read('a,b\r\n"x\r\ny",2\r\n'), 'a:string,b:int64', [
+        {'a': 'x\r\ny', 'b': 2},
+      ]);
+    });
+
+    test('maxRows counts data rows, not the header', () async {
+      final text = await CsvReader().readString('a\n1\n2\n', maxRows: 2).ok;
+      expect(text.rowCount, 2);
+    });
+  });
+
   group('reading & writing', () {
     group('CSV Reading Tests', () {
       late Directory tempDir;
@@ -25,8 +170,8 @@ void main() {
 2,Bob,25
 3,Charlie,35''');
 
-        final df = await DataFrameIO.readCsv(csvFile.path);
-        final table = await df.execute();
+        final df = await DataFrameIO.readCsv(csvFile.path).ok;
+        final table = await df.execute().ok;
 
         expect(table.rowCount, equals(3));
         expect(table.columnCount, equals(3));
@@ -46,9 +191,9 @@ void main() {
 
         final df = await DataFrameIO.readCsv(
           csvFile.path,
-          CsvOptions(delimiter: '|'),
-        );
-        final table = await df.execute();
+          options: CsvOptions(delimiter: '|'),
+        ).ok;
+        final table = await df.execute().ok;
 
         expect(table.rowCount, equals(2));
         final rows = table.toRows();
@@ -63,8 +208,8 @@ void main() {
 "Jane Smith","Another ""quoted"" value","Has ""quotes"" in notes"
 "Bob, Jr.","Name with, comma","Also has, comma here"''');
 
-        final df = await DataFrameIO.readCsv(csvFile.path);
-        final table = await df.execute();
+        final df = await DataFrameIO.readCsv(csvFile.path).ok;
+        final table = await df.execute().ok;
 
         final rows = table.toRows();
         // Test comma handling in quoted fields
@@ -98,8 +243,8 @@ void main() {
             'nan',
           },
         );
-        final df = await DataFrameIO.readCsv(csvFile.path, options);
-        final table = await df.execute();
+        final df = await DataFrameIO.readCsv(csvFile.path, options: options).ok;
+        final table = await df.execute().ok;
 
         final rows = table.toRows();
         expect(rows[1]['name'], isNull);
@@ -114,8 +259,8 @@ void main() {
 100,2.718,false,world
 -5,0.0,true,test''');
 
-        final df = await DataFrameIO.readCsv(csvFile.path);
-        final table = await df.execute();
+        final df = await DataFrameIO.readCsv(csvFile.path).ok;
+        final table = await df.execute().ok;
 
         final schema = table.schema;
         // Integer columns infer as int64 in both the eager and streaming paths
@@ -134,8 +279,8 @@ void main() {
         }
         csvFile.writeAsStringSync(buffer.toString());
 
-        final df = await DataFrameIO.readCsv(csvFile.path);
-        final table = await df.execute();
+        final df = await DataFrameIO.readCsv(csvFile.path).ok;
+        final table = await df.execute().ok;
 
         expect(table.rowCount, equals(10000));
         final rows = table.toRows();
@@ -155,9 +300,9 @@ void main() {
 
         final df = await DataFrameIO.readCsv(
           csvFile.path,
-          CsvOptions(nullValues: {''}),
-        );
-        final table = await df.execute();
+          options: CsvOptions(nullValues: {''}),
+        ).ok;
+        final table = await df.execute().ok;
 
         final rows = table.toRows();
 
@@ -190,9 +335,9 @@ void main() {
 
         final df = await DataFrameIO.readCsv(
           csvFile.path,
-          CsvOptions(hasHeader: false),
-        );
-        final table = await df.execute();
+          options: CsvOptions(hasHeader: false),
+        ).ok;
+        final table = await df.execute().ok;
 
         expect(table.rowCount, equals(3));
         expect(
@@ -209,7 +354,9 @@ void main() {
         final csvFile = File('${tempDir.path}/multiline.csv');
         csvFile.writeAsStringSync('id,note\n1,"line one\nline two"\n2,plain');
 
-        final table = await (await DataFrameIO.readCsv(csvFile.path)).execute();
+        final table = await (await DataFrameIO.readCsv(
+          csvFile.path,
+        ).ok).execute().ok;
         final rows = table.toRows();
         expect(rows[0]['note'], equals('line one\nline two'));
         expect(rows[1]['note'], equals('plain'));
@@ -220,14 +367,8 @@ void main() {
         csvFile.writeAsStringSync('id,note\n1,"oops never closed\n2,more');
 
         expect(
-          () => DataFrameIO.readCsv(csvFile.path).then((d) => d.execute()),
-          throwsA(
-            isA<FormatException>().having(
-              (e) => e.message,
-              'message',
-              contains('line 2'),
-            ),
-          ),
+          DataFrameIO.readCsv(csvFile.path),
+          failsWith(Kind.corrupt, contains('line 2')),
         );
       });
 
@@ -236,15 +377,15 @@ void main() {
         csvFile.writeAsStringSync('id,note\n1,"oops never closed\n2,more');
 
         expect(
-          DataFrameIO.readCsvBatches(csvFile.path).toList(),
-          throwsA(isA<FormatException>()),
+          DataFrameIO.readCsvBatches(csvFile.path).last,
+          failsWith(Kind.corrupt),
         );
       });
     });
 
     // CSV inference is string-parse based and never consulted the shared
     // numeric lattice, so a column mixing an integer with a float inferred
-    // float64 — rounding any integer past 2^53. Schema.infer (and therefore
+    // float64: rounding any integer past 2^53. Schema.infer (and therefore
     // JSON) already promotes such a column to a lossless decimal; CSV now
     // matches, deriving the scale from the sampled values.
     group('mixed integer/float columns infer a lossless decimal', () {
@@ -255,7 +396,7 @@ void main() {
       Future<Table> read(String body, [CsvOptions? options]) async {
         final file = File('${dir.path}/t.csv');
         file.writeAsStringSync(body);
-        return CsvReader(options: options).readFile(file.path);
+        return CsvReader(options: options).readFile(file.path).ok;
       }
 
       test('a large int mixed with a float is not rounded', () async {
@@ -290,7 +431,7 @@ void main() {
       });
 
       test('a non-finite value keeps the column float64', () async {
-        // Infinity cannot be a decimal — fall back rather than throw. (NaN is a
+        // Infinity cannot be a decimal: fall back rather than throw. (NaN is a
         // default null token, so it never reaches inference as a value.)
         final t = await read('v\n1\nInfinity\n');
         expect(t.schema.field('v')!.dataType, DataType.float64);
@@ -308,13 +449,13 @@ void main() {
       test('the decimal column round-trips through the writer', () async {
         final t = await read('v\n1\n2.25\n');
         final out = '${dir.path}/out.csv';
-        await CsvWriter().writeTable(t, out);
+        await CsvWriter().writeTable(t, out).ok;
         expect(File(out).readAsStringSync(), contains('2.25'));
       });
 
       group('eager paths keep the decimal scale (audit 7)', () {
         // The eager returns rebuilt their schema from the built columns via
-        // _schemaOf, which dropped scale/precision — the unscaled BigInt then
+        // _schemaOf, which dropped scale/precision: the unscaled BigInt then
         // rendered at scale 0 (2.25 as 225, a 100x lie). The streaming
         // readFile path kept the inferred schema and was correct, which is
         // why every existing decimal test missed this.
@@ -325,7 +466,7 @@ void main() {
         }
 
         test('readString', () async {
-          check(await CsvReader().readString('v\n1\n2.25'));
+          check(await CsvReader().readString('v\n1\n2.25').ok);
         });
 
         test('readFile with a custom line terminator (eager path)', () async {
@@ -334,7 +475,7 @@ void main() {
           check(
             await CsvReader(
               options: const CsvOptions(lineTerminator: ';'),
-            ).readFile(file.path),
+            ).readFile(file.path).ok,
           );
         });
 
@@ -343,14 +484,14 @@ void main() {
           // configured `-1` as the integer -1 instead of null.
           final t = await CsvReader(
             options: const CsvOptions(nullValues: {'-1'}),
-          ).readString('v\n5\n-1\n7');
+          ).readString('v\n5\n-1\n7').ok;
           expect(t.toRows().map((r) => r['v']), [5, null, 7]);
         });
 
         test('hex-looking strings stay strings (audit 7)', () async {
           // Dart's int.tryParse accepts 0x literals, so a column of '0xFF'
           // silently inferred int64 holding 255.
-          final t = await CsvReader().readString('v\n0xFF\n0x10');
+          final t = await CsvReader().readString('v\n0xFF\n0x10').ok;
           expect(t.schema.field('v')!.dataType, DataType.string);
           expect(t.toRows().map((r) => r['v']), ['0xFF', '0x10']);
         });
@@ -367,18 +508,18 @@ void main() {
             CsvReader(
               options: CsvOptions(schema: narrow(DataType.int8)),
             ).readString('v\n300'),
-            throwsA(isA<FormatException>()),
+            failsWith(Kind.corrupt),
           );
           await expectLater(
             CsvReader(
               options: CsvOptions(schema: narrow(DataType.int16)),
             ).readString('v\n40000'),
-            throwsA(isA<FormatException>()),
+            failsWith(Kind.corrupt),
           );
           // In-range values keep the declared type (int16 was silently int32).
           final ok = await CsvReader(
             options: CsvOptions(schema: narrow(DataType.int16)),
-          ).readString('v\n123');
+          ).readString('v\n123').ok;
           expect(ok.schema.field('v')!.dataType, DataType.int16);
           expect(ok.toRows().single['v'], 123);
         });
@@ -398,7 +539,7 @@ void main() {
                 ],
               ),
             ),
-          ).readString('v\n1\n2.25');
+          ).readString('v\n1\n2.25').ok;
           check(t);
         });
       });
@@ -406,7 +547,7 @@ void main() {
 
     // typeInferenceSampleSize was inert: _inferSchema re-capped every column to
     // a hardcoded 100 values, so raising the option changed nothing and a
-    // wider value appearing after row 100 was missed — the exact hazard
+    // wider value appearing after row 100 was missed: the exact hazard
     // Table.fromRows refuses to take by inferring over ALL rows.
     group('typeInferenceSampleSize is honoured', () {
       late Directory dir;
@@ -416,7 +557,7 @@ void main() {
       Future<Table> read(String body, CsvOptions options) async {
         final file = File('${dir.path}/t.csv');
         file.writeAsStringSync(body);
-        return CsvReader(options: options).readFile(file.path);
+        return CsvReader(options: options).readFile(file.path).ok;
       }
 
       String wideAt(int row) {
@@ -494,7 +635,7 @@ void main() {
         ];
 
         final df = DataFrame.fromRows(data);
-        await df.writeCsv(outputFile.path);
+        await df.writeCsv(outputFile.path).ok;
 
         final content = outputFile.readAsStringSync();
         expect(content, contains('id,name,age'));
@@ -512,7 +653,9 @@ void main() {
         ];
 
         final df = DataFrame.fromRows(data);
-        await df.writeCsv(outputFile.path, CsvOptions(delimiter: '|'));
+        await df
+            .writeCsv(outputFile.path, options: CsvOptions(delimiter: '|'))
+            .ok;
 
         final content = outputFile.readAsStringSync();
         expect(content, contains('id|value'));
@@ -529,7 +672,7 @@ void main() {
         ];
 
         final df = DataFrame.fromRows(data);
-        await df.writeCsv(outputFile.path);
+        await df.writeCsv(outputFile.path).ok;
 
         final content = outputFile.readAsStringSync();
         expect(content, contains('"John, Doe"'));
@@ -546,7 +689,7 @@ void main() {
         ];
 
         final df = DataFrame.fromRows(data);
-        await df.writeCsv(outputFile.path);
+        await df.writeCsv(outputFile.path).ok;
 
         final content = outputFile.readAsStringSync();
         final lines = content.trim().split('\n');
@@ -563,7 +706,9 @@ void main() {
         ];
 
         final df = DataFrame.fromRows(data);
-        await df.writeCsv(outputFile.path, CsvOptions(hasHeader: false));
+        await df
+            .writeCsv(outputFile.path, options: CsvOptions(hasHeader: false))
+            .ok;
 
         final content = outputFile.readAsStringSync();
         expect(content, isNot(contains('id,name')));
@@ -581,10 +726,10 @@ void main() {
         ];
 
         final df1 = DataFrame.fromRows(data);
-        await df1.writeCsv(outputFile.path);
+        await df1.writeCsv(outputFile.path).ok;
 
-        final df2 = await DataFrameIO.readCsv(outputFile.path);
-        final table = await df2.execute();
+        final df2 = await DataFrameIO.readCsv(outputFile.path).ok;
+        final table = await df2.execute().ok;
 
         final rows = table.toRows();
         expect(rows[0]['int'], equals(42));
@@ -626,7 +771,7 @@ void main() {
       test('skipRows drops preamble before the header', () async {
         final df = await CsvReader(
           options: const CsvOptions(skipRows: 2),
-        ).readString('junk1\njunk2\na,b\n1,2\n3,4');
+        ).readString('junk1\njunk2\na,b\n1,2\n3,4').ok;
         expect(await readRows(df), [
           {'a': 1, 'b': 2},
           {'a': 3, 'b': 4},
@@ -636,14 +781,14 @@ void main() {
       test('maxRows caps the row count', () async {
         final df = await CsvReader(
           options: const CsvOptions(maxRows: 2),
-        ).readString('a\n1\n2\n3\n4');
+        ).readString('a\n1\n2\n3\n4').ok;
         expect((await readRows(df)).length, 2);
       });
 
       test('columnNames names a headerless file', () async {
         final df = await CsvReader(
           options: const CsvOptions(hasHeader: false, columnNames: ['x', 'y']),
-        ).readString('1,2\n3,4');
+        ).readString('1,2\n3,4').ok;
         expect(await readRows(df), [
           {'x': 1, 'y': 2},
           {'x': 3, 'y': 4},
@@ -653,7 +798,7 @@ void main() {
       test('inferTypes:false keeps every column as strings', () async {
         final df = await CsvReader(
           options: const CsvOptions(inferTypes: false),
-        ).readString('a,b\n1,2.5');
+        ).readString('a,b\n1,2.5').ok;
         final t = df;
         expect(
           t.schema.fields.every((f) => f.dataType == DataType.string),
@@ -669,14 +814,14 @@ void main() {
       test('a ragged row is rejected by default', () {
         expect(
           CsvReader().readString('a,b,c\n1,2,3\n4,5'),
-          throwsA(isA<FormatException>()),
+          failsWith(Kind.corrupt),
         );
       });
 
       test('ragged rows permitted when allowVariableFields is true', () async {
         final df = await CsvReader(
           options: const CsvOptions(allowVariableFields: true),
-        ).readString('a,b,c\n1,2,3\n4,5');
+        ).readString('a,b,c\n1,2,3\n4,5').ok;
         final rows = await readRows(df);
         expect(rows.length, 2);
         expect(rows[1]['c'], isNull); // short row null-padded
@@ -687,7 +832,7 @@ void main() {
       test('comma decimal and dot thousands parse as numbers', () async {
         final df = await CsvReader(
           options: CsvOptions.european(),
-        ).readString('price;qty\n1.234,50;3\n9,99;10');
+        ).readString('price;qty\n1.234,50;3\n9,99;10').ok;
         final t = df;
         expect(t.schema.fields[0].dataType, DataType.float64);
         expect(t.schema.fields[1].dataType, DataType.int64);
@@ -702,22 +847,22 @@ void main() {
       test('dateFormat infers and parses a date column', () async {
         final df = await CsvReader(
           options: const CsvOptions(dateFormat: 'dd/MM/yyyy'),
-        ).readString('d\n31/12/2023\n01/06/2024');
+        ).readString('d\n31/12/2023\n01/06/2024').ok;
         final t = df;
         expect(t.schema.fields[0].dataType, DataType.date);
         expect(t.column('d')!.toList(), [
-          DateTime(2023, 12, 31),
-          DateTime(2024, 6, 1),
+          DateTime.utc(2023, 12, 31),
+          DateTime.utc(2024, 6, 1),
         ]);
       });
 
       test('timestampFormat parses date + time', () async {
         final df = await CsvReader(
           options: const CsvOptions(timestampFormat: 'yyyy-MM-dd HH:mm:ss'),
-        ).readString('ts\n2023-01-02 03:04:05');
+        ).readString('ts\n2023-01-02 03:04:05').ok;
         final t = df;
         expect(t.schema.fields[0].dataType, DataType.timestamp);
-        expect(t.column('ts')!.toList(), [DateTime(2023, 1, 2, 3, 4, 5)]);
+        expect(t.column('ts')!.toList(), [DateTime.utc(2023, 1, 2, 3, 4, 5)]);
       });
     });
 
@@ -725,7 +870,7 @@ void main() {
       test('backslash escape inside quotes', () async {
         final df = await CsvReader(
           options: const CsvOptions(escape: '\\'),
-        ).readString('a\n"x\\"y"');
+        ).readString('a\n"x\\"y"').ok;
         expect((await readRows(df)).single['a'], 'x"y');
       });
     });
@@ -738,11 +883,12 @@ void main() {
           File(path).writeAsStringSync(
             'id,v\n${[for (var i = 0; i < 50; i++) '$i,${i * 2}'].join('\n')}\n',
           );
-          final eager = await CsvReader().readFile(path);
+          final eager = await CsvReader().readFile(path).ok;
           final eagerT = eager;
           final batched = <Map<String, dynamic>>[];
           Schema? batchSchema;
-          await for (final b in CsvReader().readBatches(path, size: 7)) {
+          await for (final b
+              in CsvReader().readBatches(path, batchSize: 7).ok) {
             batchSchema ??= b.schema;
             batched.addAll(b.toRows());
           }
@@ -766,7 +912,9 @@ void main() {
             {'id': 1, 'name': 'a'},
             {'id': 2, 'name': 'b'},
           ]);
-          await df.writeCsv(path, const CsvOptions(lineTerminator: '\r\n'));
+          await df
+              .writeCsv(path, options: const CsvOptions(lineTerminator: '\r\n'))
+              .ok;
 
           final text = File(path).readAsStringSync();
           expect(text, contains('\r\n'));
@@ -774,7 +922,7 @@ void main() {
           expect(text.replaceAll('\r\n', '').contains('\n'), isFalse);
 
           final back = await readRows(
-            await (await DataFrameIO.readCsv(path)).execute(),
+            await (await DataFrameIO.readCsv(path).ok).execute().ok,
           );
           expect(back, [
             {'id': 1, 'name': 'a'},
@@ -799,7 +947,7 @@ void main() {
         );
         final df = await CsvReader(
           options: CsvOptions(schema: schema),
-        ).readString('a,b,c\n1,2.5,x\n2,3.5,y');
+        ).readString('a,b,c\n1,2.5,x\n2,3.5,y').ok;
         final table = df;
 
         // Inference would have called column "a" int8; the schema forces int64.
@@ -821,7 +969,7 @@ void main() {
           // sampled width never wraps regardless of the sample.
           final df = await CsvReader(
             options: const CsvOptions(typeInferenceSampleSize: 2),
-          ).readString('n\n1\n2\n300');
+          ).readString('n\n1\n2\n300').ok;
           final table = df;
 
           expect(table.schema.fields[0].dataType, equals(DataType.int64));
@@ -840,7 +988,7 @@ void main() {
           CsvReader(
             options: CsvOptions(schema: schema),
           ).readString('n\n1\nabc\n3'),
-          throwsA(isA<FormatException>()),
+          failsWith(Kind.corrupt),
         );
       });
 
@@ -854,7 +1002,7 @@ void main() {
           );
           final df = await CsvReader(
             options: CsvOptions(schema: schema, strict: false),
-          ).readString('n\n1\nabc\n3');
+          ).readString('n\n1\nabc\n3').ok;
           final table = df;
 
           expect(table.column('n')!.toList(), equals([1, null, 3]));
@@ -870,7 +1018,7 @@ void main() {
           CsvReader(
             options: CsvOptions(schema: schema, strict: false),
           ).readString('n\n1\nabc'),
-          throwsA(isA<FormatException>()),
+          failsWith(Kind.corrupt),
         );
       });
 
@@ -885,12 +1033,12 @@ void main() {
           CsvReader(
             options: CsvOptions(schema: schema),
           ).readString('b\ntrue\ntru'),
-          throwsA(isA<FormatException>()),
+          failsWith(Kind.corrupt),
         );
         // permissive: garbage bool -> null (NOT false)
         final df = await CsvReader(
           options: CsvOptions(schema: schema, strict: false),
-        ).readString('b\ntrue\ntru\nfalse');
+        ).readString('b\ntrue\ntru\nfalse').ok;
         expect(df.column('b')!.toList(), equals([true, null, false]));
       });
     });
@@ -913,11 +1061,11 @@ void main() {
 
       final batches = await DataFrameIO.readCsvBatches(
         path,
-        size: 100,
-      ).toList();
+        batchSize: 100,
+      ).ok.toList();
       expect(batches.length, 3); // 100 + 100 + 50
 
-      final tables = [for (final b in batches) await b.execute()];
+      final tables = [for (final b in batches) await b.execute().ok];
       expect(tables.map((t) => t.rowCount).toList(), [100, 100, 50]);
 
       // One stable schema across every batch.
@@ -952,9 +1100,9 @@ void main() {
       final tables = [
         for (final b in await DataFrameIO.readCsvBatches(
           path,
-          size: 16,
-        ).toList())
-          await b.execute(),
+          batchSize: 16,
+        ).ok.toList())
+          await b.execute().ok,
       ];
       final vals = [
         for (final t in tables) ...t.column('v')!.toList().cast<int>(),
@@ -973,10 +1121,10 @@ void main() {
       final filtered = [
         for (final b in await DataFrameIO.readCsvBatches(
           path,
-          size: 30,
-          filter: 'grp == 1',
-        ).toList())
-          ...(await b.execute()).column('id')!.toList().cast<int>(),
+          batchSize: 30,
+          filter: RowFilter.compare('grp', FilterOp.eq, 1),
+        ).ok.toList())
+          ...(await b.execute().ok).column('id')!.toList().cast<int>(),
       ];
       expect(filtered.every((id) => id.isOdd), isTrue);
       expect(filtered.length, 50);
@@ -984,10 +1132,10 @@ void main() {
       final limited = [
         for (final b in await DataFrameIO.readCsvBatches(
           path,
-          size: 30,
+          batchSize: 30,
           limit: 25,
-        ).toList())
-          ...(await b.execute()).column('id')!.toList().cast<int>(),
+        ).ok.toList())
+          ...(await b.execute().ok).column('id')!.toList().cast<int>(),
       ];
       expect(limited.length, 25);
     });
@@ -996,8 +1144,8 @@ void main() {
       final path = write('q.csv', 'id,note\n1,"line one\nline two"\n2,plain');
       final t = await (await DataFrameIO.readCsvBatches(
         path,
-        size: 10,
-      ).toList()).map((b) => b.execute()).first;
+        batchSize: 10,
+      ).ok.toList()).map((b) => b.execute().ok).first;
       final table = t;
       expect(table.rowCount, 2);
       expect(table.column('note')!.toList()[0], 'line one\nline two');
@@ -1007,13 +1155,13 @@ void main() {
       final rows = [for (int i = 0; i < 120; i++) '$i,v$i'];
       final path = write('m.csv', 'id,name\n${rows.join('\n')}');
 
-      final whole = await (await DataFrameIO.readCsv(path)).execute();
+      final whole = await (await DataFrameIO.readCsv(path).ok).execute().ok;
       final streamed = [
         for (final b in await DataFrameIO.readCsvBatches(
           path,
-          size: 50,
-        ).toList())
-          ...(await b.execute()).column('name')!.toList(),
+          batchSize: 50,
+        ).ok.toList())
+          ...(await b.execute().ok).column('name')!.toList(),
       ];
       expect(streamed, whole.column('name')!.toList());
     });
@@ -1028,13 +1176,16 @@ void main() {
     Future<List<Object?>> read(bool strict) async {
       final df = await CsvReader(
         options: CsvOptions(strict: strict),
-      ).readString(content);
+      ).readString(content).ok;
       final table = df;
       return table.toRows().map((r) => r['c']).toList();
     }
 
-    test('strict mode throws on text after a closing quote', () {
-      expect(read(true), throwsA(isA<FormatException>()));
+    test('strict mode fails on text after a closing quote', () {
+      expect(
+        CsvReader(options: CsvOptions(strict: true)).readString(content),
+        failsWith(Kind.corrupt),
+      );
     });
 
     test(
@@ -1074,8 +1225,8 @@ void main() {
           0x0D, 0x0A, // CRLF
         ]);
 
-        final df = await DataFrameIO.readCsv(csvFile.path);
-        final table = await df.execute();
+        final df = await DataFrameIO.readCsv(csvFile.path).ok;
+        final table = await df.execute().ok;
 
         expect(table.rowCount, equals(2));
         final rows = table.toRows();
@@ -1087,8 +1238,8 @@ void main() {
         final csvFile = File('${tempDir.path}/no_trailing_comma.csv');
         csvFile.writeAsStringSync('Name,Age,City\nAlice,30,NYC\nBob,25,LA');
 
-        final df = await DataFrameIO.readCsv(csvFile.path);
-        final table = await df.execute();
+        final df = await DataFrameIO.readCsv(csvFile.path).ok;
+        final table = await df.execute().ok;
 
         expect(table.columnCount, equals(3));
         final rows = table.toRows();
@@ -1100,8 +1251,8 @@ void main() {
         final csvFile = File('${tempDir.path}/with_header.csv');
         csvFile.writeAsStringSync('Name,Age\nAlice,30\nBob,25');
 
-        final df = await DataFrameIO.readCsv(csvFile.path);
-        final table = await df.execute();
+        final df = await DataFrameIO.readCsv(csvFile.path).ok;
+        final table = await df.execute().ok;
 
         expect(table.schema.fieldNames, equals(['Name', 'Age']));
         expect(table.rowCount, equals(2));
@@ -1117,9 +1268,9 @@ void main() {
 
           final df = await DataFrameIO.readCsv(
             csvFile.path,
-            CsvOptions(trimFields: false),
-          );
-          final table = await df.execute();
+            options: CsvOptions(trimFields: false),
+          ).ok;
+          final table = await df.execute().ok;
 
           final rows = table.toRows();
           expect(rows[0]['Name'], equals(' Alice '));
@@ -1135,8 +1286,8 @@ void main() {
 Bob,25,LA
 "Charlie","35","San Francisco"''');
 
-        final df = await DataFrameIO.readCsv(csvFile.path);
-        final table = await df.execute();
+        final df = await DataFrameIO.readCsv(csvFile.path).ok;
+        final table = await df.execute().ok;
 
         final rows = table.toRows();
         expect(rows[0]['Name'], equals('Alice'));
@@ -1154,8 +1305,8 @@ Apt 4B
 NYC",30
 "Bob","456 Oak Rd",25''');
 
-        final df = await DataFrameIO.readCsv(csvFile.path);
-        final table = await df.execute();
+        final df = await DataFrameIO.readCsv(csvFile.path).ok;
+        final table = await df.execute().ok;
 
         final rows = table.toRows();
         expect(table.rowCount, equals(2));
@@ -1173,8 +1324,8 @@ NYC",30
 "Bob","Uses 6"" nails"
 "Charlie","No quotes here"''');
 
-        final df = await DataFrameIO.readCsv(csvFile.path);
-        final table = await df.execute();
+        final df = await DataFrameIO.readCsv(csvFile.path).ok;
+        final table = await df.execute().ok;
 
         final rows = table.toRows();
         expect(rows[0]['Quote'], equals('She said "Hello" to me'));
@@ -1188,8 +1339,8 @@ NYC",30
 "Smith, John","1,234.56","Payment for Jan, Feb, Mar"
 Alice,567.89,No commas here''');
 
-        final df = await DataFrameIO.readCsv(csvFile.path);
-        final table = await df.execute();
+        final df = await DataFrameIO.readCsv(csvFile.path).ok;
+        final table = await df.execute().ok;
 
         final rows = table.toRows();
         expect(rows[0]['Name'], equals('Smith, John'));
@@ -1205,8 +1356,8 @@ Alice,,Smith
 ,Bob,Jones
 Carol,Ann,''');
 
-        final df = await DataFrameIO.readCsv(csvFile.path);
-        final table = await df.execute();
+        final df = await DataFrameIO.readCsv(csvFile.path).ok;
+        final table = await df.execute().ok;
 
         final rows = table.toRows();
         expect(rows[0]['Middle'], equals(''));
@@ -1221,8 +1372,8 @@ Carol,Ann,''');
 "Alice",""
 "",""''');
 
-        final df = await DataFrameIO.readCsv(csvFile.path);
-        final table = await df.execute();
+        final df = await DataFrameIO.readCsv(csvFile.path).ok;
+        final table = await df.execute().ok;
 
         final rows = table.toRows();
         expect(rows[0]['Name'], equals(''));
@@ -1252,8 +1403,8 @@ Carol,Ann,''');
           0x0D, 0x0A, // CRLF
         ]);
 
-        final df = await DataFrameIO.readCsv(csvFile.path);
-        final table = await df.execute();
+        final df = await DataFrameIO.readCsv(csvFile.path).ok;
+        final table = await df.execute().ok;
 
         expect(table.rowCount, equals(3));
         final rows = table.toRows();
@@ -1268,8 +1419,8 @@ Carol,Ann,''');
 """ABC123""","John",100
 """DEF456""","""Jane Smith""",200''');
 
-        final df = await DataFrameIO.readCsv(csvFile.path);
-        final table = await df.execute();
+        final df = await DataFrameIO.readCsv(csvFile.path).ok;
+        final table = await df.execute().ok;
 
         final rows = table.toRows();
         // According to RFC 4180, """ABC123""" should parse as "ABC123" (with quotes)
@@ -1288,8 +1439,8 @@ Carol,Ann,''');
 1999,Chevy,"Venture ""Extended Edition, Very Large""",,5000.00
 1996,Jeep,Grand Cherokee,"MUST SELL! air, moon roof, loaded",4799.00''');
 
-        final df = await DataFrameIO.readCsv(csvFile.path);
-        final table = await df.execute();
+        final df = await DataFrameIO.readCsv(csvFile.path).ok;
+        final table = await df.execute().ok;
 
         expect(table.rowCount, equals(4));
 
@@ -1342,8 +1493,8 @@ Carol,Ann,''');
         csvFile.writeAsStringSync(buffer.toString());
 
         final stopwatch = Stopwatch()..start();
-        final df = await DataFrameIO.readCsv(csvFile.path);
-        final table = await df.execute();
+        final df = await DataFrameIO.readCsv(csvFile.path).ok;
+        final table = await df.execute().ok;
         stopwatch.stop();
 
         print('\nPerformance for 10K rows with quotes:');
@@ -1382,8 +1533,11 @@ Carol,Ann,''');
             {'s': 'x'},
           ]);
           const opts = CsvOptions(nullOutput: r'\N');
-          await df.writeCsv(path, opts);
-          final back = await (await DataFrameIO.readCsv(path, opts)).execute();
+          await df.writeCsv(path, options: opts).ok;
+          final back = await (await DataFrameIO.readCsv(
+            path,
+            options: opts,
+          ).ok).execute().ok;
           expect(back.rowCount, 3); // no row dropped
           expect(back.column('s')!.toList(), [null, '', 'x']);
         },
@@ -1395,7 +1549,7 @@ Carol,Ann,''');
           final path = '${dir.path}/d.csv';
           await DataFrame.fromRows([
             {'a': 1, 'b': null},
-          ]).writeCsv(path);
+          ]).writeCsv(path).ok;
           final text = await File(path).readAsString();
           expect(text.trim().split('\n').last, '1,'); // null is an empty field
         },
@@ -1427,8 +1581,11 @@ Carol,Ann,''');
             {'s': null},
             {'s': r'\N'}, // real value collides with the sentinel
             {'s': 'x'},
-          ]).writeCsv(path, opts);
-          final back = await (await DataFrameIO.readCsv(path, opts)).execute();
+          ]).writeCsv(path, options: opts).ok;
+          final back = await (await DataFrameIO.readCsv(
+            path,
+            options: opts,
+          ).ok).execute().ok;
           expect(back.column('s')!.toList(), [null, r'\N', 'x']);
         },
       );
@@ -1456,7 +1613,7 @@ Carol,Ann,''');
             Stream.fromIterable([two('a', 'b'), two('b', 'a')]),
             sink,
           ),
-          throwsA(isA<StateError>()),
+          failsWith(Kind.schema),
         );
         await sink.close();
       });
@@ -1473,17 +1630,24 @@ Carol,Ann,''');
       });
     });
 
-    group('#8 readCsvOptimized enforces caps', () {
+    group('#8 readCsv with pushdown enforces caps', () {
       test('an over-cap result throws (maxRows)', () async {
         final path = '${dir.path}/o.csv';
         File(path).writeAsStringSync('a\n1\n2\n3\n');
-        await expectLater(
-          DataFrameIO.readCsvOptimized(path, maxRows: 1),
-          throwsA(isA<StateError>()),
-        );
+        // The frame is lazy: its terminal fails.
+        final capped = await DataFrameIO.readCsv(
+          path,
+          batchSize: 1,
+          maxRows: 1,
+        ).ok;
+        await expectLater(capped.execute(), failsWith(Kind.limit));
         // Opt-out reads it all.
-        final df = await DataFrameIO.readCsvOptimized(path, maxRows: null);
-        expect((await df.execute(maxRows: null)).rowCount, 3);
+        final df = await DataFrameIO.readCsv(
+          path,
+          batchSize: 1,
+          maxRows: null,
+        ).ok;
+        expect((await df.execute(maxRows: null).ok).rowCount, 3);
       });
     });
 
@@ -1494,10 +1658,10 @@ Carol,Ann,''');
 
       test('CSV export streams and round-trips a large result', () async {
         final path = '${dir.path}/out.csv';
-        await frame(5000).writeCsv(path);
+        await frame(5000).writeCsv(path).ok;
         final back = await (await DataFrameIO.readCsv(
           path,
-        )).execute(maxRows: null);
+        ).ok).execute(maxRows: null).ok;
         expect(back.rowCount, 5000);
         final ids = back.column('id')!.toList();
         expect(ids.first, 0);
@@ -1517,13 +1681,13 @@ Carol,Ann,''');
           options: const CsvOptions(maxRecordBytes: 1000),
         );
         await expectLater(
-          reader.readBatches(path).toList(),
-          throwsA(isA<FormatException>()),
+          reader.readBatches(path).last,
+          failsWith(Kind.corrupt),
         );
       });
     });
 
-    group('projection guards + readCsvOptimized (regression)', () {
+    group('projection guards + readCsv pushdown (regression)', () {
       String writeCsv() {
         final path = '${dir.path}/data.csv';
         final rows = ['id,name', for (int i = 0; i < 20; i++) '$i,item_$i'];
@@ -1534,49 +1698,40 @@ Carol,Ann,''');
       group('projection errors on unknown columns', () {
         test('CSV select of an unknown column throws', () {
           expect(
-            DataFrameIO.readCsvOptimized(
-              writeCsv(),
-              selectColumns: ['id', 'nope'],
-            ),
-            throwsA(isA<ArgumentError>()),
+            DataFrameIO.readCsv(writeCsv(), columns: ['id', 'nope']),
+            failsWith(Kind.invalid),
           );
         });
 
         test('a valid projection still works', () async {
-          final df = await DataFrameIO.readCsvOptimized(
-            writeCsv(),
-            selectColumns: ['id'],
-          );
-          final table = await df.execute();
+          final df = await DataFrameIO.readCsv(writeCsv(), columns: ['id']).ok;
+          final table = await df.execute().ok;
           expect(table.schema.fields.map((f) => f.name), ['id']);
           expect(table.rowCount, 20);
         });
       });
 
-      group('readCsvOptimized is bounded and correct', () {
+      group('readCsv pushdown is bounded and correct', () {
         test('filter pushdown', () async {
-          final df = await DataFrameIO.readCsvOptimized(
+          final df = await DataFrameIO.readCsv(
             writeCsv(),
-            filter: 'id>15',
-          );
-          final table = await df.execute();
+            filter: RowFilter.compare('id', FilterOp.gt, 15),
+          ).ok;
+          final table = await df.execute().ok;
           expect(table.rowCount, 4); // 16,17,18,19
           expect(table.column('id')!.toList().first, 16);
         });
 
         test('limit pushdown', () async {
-          final df = await DataFrameIO.readCsvOptimized(writeCsv(), limit: 5);
-          final table = await df.execute();
+          final df = await DataFrameIO.readCsv(writeCsv(), limit: 5).ok;
+          final table = await df.execute().ok;
           expect(table.rowCount, 5);
           expect(table.column('id')!.toList(), [0, 1, 2, 3, 4]);
         });
 
         test('a small buffer spans batches', () async {
-          final df = await DataFrameIO.readCsvOptimized(
-            writeCsv(),
-            bufferSize: 3,
-          );
-          final table = await df.execute();
+          final df = await DataFrameIO.readCsv(writeCsv(), batchSize: 3).ok;
+          final table = await df.execute().ok;
           expect(table.rowCount, 20);
           expect(table.column('id')!.toList().last, 19);
         });
@@ -1597,7 +1752,7 @@ Carol,Ann,''');
     Future<Table> read(String content) async {
       final path = '${dir.path}/f.csv';
       File(path).writeAsStringSync(content);
-      return (await DataFrameIO.readCsv(path)).execute();
+      return (await DataFrameIO.readCsv(path).ok).execute().ok;
     }
 
     test('an odd bare quote does not swallow the next row', () async {
@@ -1634,16 +1789,15 @@ Carol,Ann,''');
     });
 
     test('a genuinely unterminated quoted field still throws', () async {
-      await expectLater(
-        read('a,b\nx,"never closed\n'),
-        throwsA(isA<FormatException>()),
-      );
+      final path = '${dir.path}/f.csv';
+      File(path).writeAsStringSync('a,b\nx,"never closed\n');
+      await expectLater(DataFrameIO.readCsv(path), failsWith(Kind.corrupt));
     });
   });
 
-  // The standalone CsvReader(filter:) API. SQL never reaches this code — the
+  // The standalone CsvReader(filter:) API. SQL never reaches this code: the
   // planner drops the pushdown and filters exactly (scan.dart: "CSV can't prune
-  // by stats") — so there is no query layer above it to correct a wrong answer.
+  // by stats"), so there is no query layer above it to correct a wrong answer.
   group('reader filter', () {
     late Directory dir;
     setUp(() => dir = Directory.systemTemp.createTempSync('csvfilter_'));
@@ -1655,54 +1809,67 @@ Carol,Ann,''');
       return path;
     }
 
-    Future<Table> read(String content, String filter) async =>
-        (await DataFrameIO.readCsvOptimized(
+    Future<Table> read(String content, RowFilter filter) async =>
+        (await DataFrameIO.readCsv(
           write(content),
           filter: filter,
-        )).execute();
+        ).ok).execute().ok;
 
     test('an unknown column throws instead of returning nothing', () async {
       await expectLater(
-        read('id,name\n1,a\n2,b\n', 'nope == 1'),
-        throwsA(
-          isA<ArgumentError>().having(
-            (e) => '${e.message}',
-            'message',
-            allOf(contains('nope'), contains('id')),
-          ),
+        DataFrameIO.readCsv(
+          write('id,name\n1,a\n2,b\n'),
+          filter: RowFilter.compare('nope', FilterOp.eq, 1),
         ),
+        failsWith(Kind.invalid, allOf(contains('nope'), contains('id'))),
       );
     });
 
     test('a known column still filters', () async {
-      final table = await read('id,name\n1,a\n2,b\n3,c\n', 'id > 1');
+      final table = await read(
+        'id,name\n1,a\n2,b\n3,c\n',
+        RowFilter.compare('id', FilterOp.gt, 1),
+      );
       expect(table.column('id')!.toList(), [2, 3]);
     });
 
     test('an int64 literal keeps its precision', () async {
       // Parsed as a double first, 9223372036854775807 rounds to ...776000.0 and
-      // so does its neighbour — both would match.
+      // so does its neighbour, both would match.
       final table = await read(
         'id\n9223372036854775807\n9223372036854775806\n',
-        'id == 9223372036854775807',
+        RowFilter.compare('id', FilterOp.eq, 9223372036854775807),
       );
       expect(table.column('id')!.toList(), [9223372036854775807]);
-    });
-
-    test('a hex literal still parses', () async {
-      final table = await read('id\n15\n16\n17\n', 'id == 0x10');
-      expect(table.column('id')!.toList(), [16]);
     });
 
     test('a non-boolean cell matches neither true nor false', () async {
       // 'banana' used to coerce to false, so `flag == false` matched it.
       const content = 'flag\ntrue\nfalse\nbanana\n';
-      expect((await read(content, 'flag == true')).rowCount, 1);
-      expect((await read(content, 'flag == false')).rowCount, 1);
+      expect(
+        (await read(
+          content,
+          RowFilter.compare('flag', FilterOp.eq, true),
+        )).rowCount,
+        1,
+      );
+      expect(
+        (await read(
+          content,
+          RowFilter.compare('flag', FilterOp.eq, false),
+        )).rowCount,
+        1,
+      );
     });
 
     test('an unparseable numeric cell matches nothing', () async {
-      expect((await read('id\n1\nx\n3\n', 'id > 0')).rowCount, 2);
+      expect(
+        (await read(
+          'id\n1\nx\n3\n',
+          RowFilter.compare('id', FilterOp.gt, 0),
+        )).rowCount,
+        2,
+      );
     });
   });
 
@@ -1731,7 +1898,7 @@ Carol,Ann,''');
         CsvReader(
           options: const CsvOptions(maxRecordBytes: 1024),
         ).readFile(path),
-        throwsA(isA<FormatException>()),
+        failsWith(Kind.corrupt),
       );
     });
 
@@ -1740,10 +1907,10 @@ Carol,Ann,''');
       () async {
         final path = write(20000);
         expect(
-          () => CsvReader(
+          CsvReader(
             options: const CsvOptions(maxRecordBytes: 1024),
-          ).readBatches(path).toList(),
-          throwsA(isA<FormatException>()),
+          ).readBatches(path).last,
+          failsWith(Kind.corrupt),
         );
       },
     );

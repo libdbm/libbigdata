@@ -25,7 +25,7 @@ class AvroOcfWriter {
     flush: true,
   );
 
-  /// Async variant of [writePath] — doesn't block the event loop on the write.
+  /// Async variant of [writePath]: doesn't block the event loop on the write.
   static Future<void> writePathAsync(
     String path,
     String schemaJson,
@@ -58,8 +58,8 @@ class AvroOcfWriter {
 
     if (records.isNotEmpty) {
       final body = AvroWriter();
-      for (final rec in records) {
-        schema.encode(body, rec);
+      for (final record in records) {
+        schema.encode(body, record);
       }
       final compressed = _compress(codec, body.toBytes());
       final header = AvroWriter()

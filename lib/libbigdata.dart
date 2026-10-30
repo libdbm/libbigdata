@@ -8,19 +8,23 @@ library;
 
 // Core data structures
 export 'src/core/data_type.dart';
-// Column: the immutable columnar types. A few members are `@internal`
-// (`NumericColumn.adopt`, `rawBuffer`, `rawNullBitmap`) and expose the raw
-// mutable backing storage for trusted internal hot paths — Dart cannot hide
-// class members from a wholesale export, so these are the analyzer-enforced
-// (advisory) boundary, NOT public API. Consumers use the safe unmodifiable
-// `buffer`/`nullBitmap` getters and the copying `NumericColumn.intN`/`floatN`
-// factories. Fully removing them from the surface would need a public-interface
-// / internal-impl split (a deliberate follow-up).
-export 'src/core/column.dart';
+// Column: the immutable columnar types. Each public type builds through
+// copying factories and reads through safe members (`buffer`/`nullBitmap` are
+// unmodifiable views); its implementation, which can adopt or expose backing
+// buffers, is a vector class the export hides.
+export 'src/core/column.dart'
+    hide
+        distinctStatsCap,
+        decimalStats,
+        NumericVector,
+        StringVector,
+        BoolVector,
+        ListVector;
 export 'src/core/schema.dart';
-export 'src/core/data_chunk.dart';
+export 'src/core/data_chunk.dart' hide defaultChunkSize;
 export 'src/core/decimal.dart';
-export 'src/core/table.dart';
+export 'src/core/result.dart';
+export 'src/core/table.dart' hide unifyTables;
 
 // API. `dataframe.dart` also declares the `Operation` plan nodes the DataFrame
 // builds internally; they are deliberately not exported.
@@ -28,11 +32,13 @@ export 'src/api/dataframe.dart' show DataFrame, JoinType;
 export 'src/api/io_extensions.dart';
 export 'src/formats/arrow/arrow_writer.dart' show ArrowCompression;
 
-// Utilities
+// Utilities. The logging package's Level and Logger come with it, so
+// configuring the library's logging needs no second import.
 export 'src/util/logging_config.dart';
+export 'package:logging/logging.dart' show Level, Logger, LogRecord;
 
 // Format support
-export 'src/formats/csv/csv_reader.dart';
+export 'src/formats/csv/csv_reader.dart' hide parseTemporal;
 export 'src/formats/csv/csv_writer.dart';
 export 'src/formats/csv/csv_options.dart';
 export 'src/formats/json/json_reader.dart';
@@ -40,21 +46,16 @@ export 'src/formats/json/json_writer.dart';
 export 'src/formats/parquet/parquet_reader.dart'
     show ParquetReader, ParquetReaderOptions;
 export 'src/formats/parquet/parquet_writer.dart';
-export 'src/formats/parquet/filter/row_filter.dart' show RowFilter, FilterOp;
+export 'src/formats/parquet/compression.dart' show ParquetCompression;
+export 'src/formats/parquet/filter/row_filter.dart'
+    show RowFilter, FilterOp, ColumnBounds;
 export 'src/formats/dataset/dataset.dart' show Dataset;
 export 'src/formats/delta/delta_table.dart' show DeltaTable;
 export 'src/formats/delta/delta_writer.dart' show DeltaWriter, DeltaWriteMode;
-// The commit-outcome taxonomy a writer rethrows so a caller can tell a
-// definitely-failed commit (CommitConflict — retry + clean up) from one whose
-// outcome is unknown (DeltaCommitIndeterminate — inspect the pointer, do NOT
-// blindly retry or delete staged files). (Iceberg's pair is on its coordinator
-// export below; note the base classes differ — Iceberg extends StateError,
-// Delta implements Exception — but each is catchable by its concrete type.)
-export 'src/formats/delta/delta_log.dart'
-    show CommitConflict, DeltaCommitIndeterminate;
 export 'src/formats/delta/invariants.dart' show InvariantEvaluator, Invariant;
 export 'src/sql/execution/sql_invariants.dart' show SqlInvariantEvaluator;
-export 'src/core/local_catalog.dart' show LocalCatalog;
+export 'src/core/local_catalog.dart' show LocalCatalog, CatalogTxn;
+export 'src/formats/delta/delta_log.dart' show DeltaLog;
 export 'src/formats/delta/delta_commit_coordinator.dart'
     show
         DeltaCommitCoordinator,
@@ -72,11 +73,17 @@ export 'src/formats/iceberg/iceberg_backend.dart'
         FilesystemIcebergBackend,
         FileLockIcebergBackend,
         LocalCatalogIcebergBackend;
+// A commit's outcome is its Result: Kind.conflict means it definitely did not
+// land (retry), Kind.indeterminate that it may have (inspect the table before
+// retrying or cleaning up).
 export 'src/formats/iceberg/iceberg_commit_coordinator.dart'
     show
-        IcebergCommitConflict,
-        IcebergCommitIndeterminate,
-        IcebergMetadataPublish;
+        IcebergMetadataPublish,
+        IcebergCommitCoordinator,
+        FilesystemCommitCoordinator;
 
 // SQL
-export 'src/sql/execution/sql_engine.dart' show SqlEngine, sql;
+export 'src/sql/execution/sql_engine.dart' show SqlEngine, SqlDataFrame, sql;
+export 'src/sql/execution/engine_options.dart' show EngineOptions;
+export 'src/sql/execution/memory_manager.dart' show MemoryManager;
+export 'src/sql/operators/spill.dart' show SpillBudget;

@@ -8,17 +8,15 @@ import '../../core/schema.dart';
 import '../../core/table.dart';
 import 'arrow_buffers.dart';
 import 'arrow_message.dart';
-import '../../core/ids.dart' as ids;
-
-// Secure entropy for the write temp-file token so concurrent writers to the same
-// destination can't collide.
 
 /// Optional Arrow IPC body compression (per-buffer).
 enum ArrowCompression { none, lz4, zstd }
 
 /// Writes a [Table] as a real Apache Arrow IPC **file** (random-access):
 /// `ARROW1` magic + a Schema message + one or more RecordBatch messages +
-/// a Footer. Output is readable by pyarrow/pandas/Polars/DuckDB. Core types
+/// a Footer, or with [stream] the IPC **stream** format (`pa.ipc.new_stream`):
+/// the same messages, no magic or footer, ending with the end-of-stream
+/// marker. Output is readable by pyarrow/pandas/Polars/DuckDB. Core types
 /// only (see [encodeColumn]); other types raise `UnsupportedError`. With
 /// [compression], each body buffer is compressed (LZ4_FRAME or ZSTD) per the
 /// Arrow IPC body-compression spec.
@@ -32,112 +30,94 @@ class ArrowWriter {
     49,
   ]); // "ARROW1"
 
+  /// The end-of-stream marker: a continuation and a zero metadata length.
+  static final Uint8List _end = Uint8List.fromList(const [
+    255,
+    255,
+    255,
+    255,
+    0,
+    0,
+    0,
+    0,
+  ]);
+
   final File _file;
   final int batchSize;
   final ArrowCompression compression;
+  final bool stream;
 
   ArrowWriter(
     String path, {
     this.batchSize = 65536,
     this.compression = ArrowCompression.none,
+    this.stream = false,
   }) : _file = File(path) {
     if (batchSize <= 0) {
       throw ArgumentError.value(batchSize, 'batchSize', 'must be > 0');
     }
   }
 
-  /// Write [table] atomically: stream it to a sibling temp file (one record
-  /// batch per [batchSize] rows, so the whole encoded file isn't buffered in
-  /// memory) then rename onto the destination. On any failure the temp is
-  /// aborted/deleted and the rethrows — a pre-existing file at [_file] is never
-  /// left partial/corrupt (mirrors [ParquetWriter]).
-  Future<void> write(Table table) async {
-    final temp = '${_file.path}.${ids.token()}.tmp';
-    if (table.rowCount == 0) {
-      // Schema-only file: ArrowStreamWriter writes nothing when no batch is
-      // added, so encode the empty file directly.
-      try {
-        await File(
-          temp,
-        ).writeAsBytes(_encode(table.schema, const [], compression));
-        await replaceAtomic(File(temp), _file.path);
-      } catch (_) {
-        final f = File(temp);
-        if (await f.exists()) await f.delete();
-        rethrow;
-      }
-      return;
-    }
-    final writer = ArrowStreamWriter(
-      temp,
-      table.schema,
-      compression: compression,
-    );
-    try {
-      for (int s = 0; s < table.rowCount; s += batchSize) {
-        final end = (s + batchSize).clamp(0, table.rowCount);
-        await writer.add(table.slice(s, end));
-      }
-      await writer.close();
-      await replaceAtomic(File(temp), _file.path);
-    } catch (_) {
-      // abort() no-ops once close() nulled the handle, so a failed rename after
-      // a clean close would otherwise leak the finalized temp — delete it here
-      // explicitly (mirrors the writeBatches failure path).
-      await writer.abort();
-      final f = File(temp);
-      if (await f.exists()) await f.delete();
-      rethrow;
-    }
-  }
-
-  Future<void> writeStream(Table table) => write(table);
+  /// Write [table] atomically, one record batch per [batchSize] rows, as
+  /// [writeBatches] writes a stream of one table.
+  Future<void> write(Table table) =>
+      writeBatches(Stream.value(table), schema: table.schema);
 
   /// Stream tables to disk as consecutive record batches with bounded memory:
   /// each batch is encoded and flushed via [ArrowStreamWriter] as it arrives,
-  /// rather than buffering every [Table] before encoding. Atomic like [write]:
+  /// rather than buffering every [Table] before encoding; a table larger than
+  /// [batchSize] rows is written as several batches. Atomic ([publish]):
   /// everything goes to a sibling temp file that is renamed onto [_file] only
   /// after a clean close, so a throw mid-stream (or a partial write) never
   /// corrupts or deletes a pre-existing file at the destination.
-  Future<void> writeBatches(Stream<Table> tables, {Schema? schema}) async {
-    final temp = '${_file.path}.${ids.token()}.tmp';
-    ArrowStreamWriter? writer;
-    Schema? s = schema;
-    try {
-      await for (final t in tables) {
-        s ??= t.schema;
-        writer ??= ArrowStreamWriter(temp, s, compression: compression);
-        await writer.add(t);
-      }
-      if (writer != null) {
-        await writer.close();
-        await replaceAtomic(File(temp), _file.path);
-        return;
-      }
-    } catch (_) {
-      // A throw mid-stream (unsupported type, disk full) must not leak the open
-      // file handle, leave a partial temp, or touch the destination.
-      await writer?.abort();
-      final f = File(temp);
-      if (await f.exists()) await f.delete();
-      rethrow;
-    }
-    // No batches arrived: write a schema-only (empty) file, or error if we have
-    // no schema to write.
-    if (s == null) {
-      throw ArgumentError(
-        'writeBatches needs a schema when no tables are given',
-      );
-    }
-    try {
-      await File(temp).writeAsBytes(_encode(s, const [], compression));
-      await replaceAtomic(File(temp), _file.path);
-    } catch (_) {
-      final f = File(temp);
-      if (await f.exists()) await f.delete();
-      rethrow;
-    }
-  }
+  Future<void> writeBatches(Stream<Table> tables, {Schema? schema}) =>
+      publish(_file.path, (temp) async {
+        ArrowStreamWriter? writer;
+        Schema? resolved = schema;
+        try {
+          await for (final table in tables) {
+            resolved ??= table.schema;
+            // A table with no rows adds no batch, so the writer (and its
+            // file) starts with the first row; all-empty input is
+            // schema-only below.
+            for (var start = 0; start < table.rowCount; start += batchSize) {
+              final end = start + batchSize;
+              writer ??= ArrowStreamWriter(
+                temp,
+                resolved,
+                compression: compression,
+                stream: stream,
+              );
+              await writer.add(
+                start == 0 && end >= table.rowCount
+                    ? table
+                    : table.slice(
+                        start,
+                        end < table.rowCount ? end : table.rowCount,
+                      ),
+              );
+            }
+          }
+          if (writer != null) {
+            await writer.close();
+            return;
+          }
+        } catch (_) {
+          // Release the open file handle; publish deletes the temp.
+          await writer?.abort();
+          rethrow;
+        }
+        // No batches arrived: write a schema-only (empty) file, or error if
+        // we have no schema to write.
+        if (resolved == null) {
+          throw ArgumentError(
+            'writeBatches needs a schema when no tables are given',
+          );
+        }
+        await File(
+          temp,
+        ).writeAsBytes(_encode(resolved, const [], compression, stream));
+      });
 
   /// Encode a single [table], splitting into record batches of [batchSize] rows.
   static Uint8List encodeTable(
@@ -159,13 +139,14 @@ class ArrowWriter {
         batches.add(table.slice(start, end));
       }
     }
-    return _encode(table.schema, batches, compression);
+    return _encode(table.schema, batches, compression, false);
   }
 
   static Uint8List _encode(
     Schema schema,
     List<Table> batches,
     ArrowCompression compression,
+    bool stream,
   ) {
     final fields = schema.fields;
     final codec = switch (compression) {
@@ -173,15 +154,17 @@ class ArrowWriter {
       ArrowCompression.lz4 => Lz4Codec(),
       ArrowCompression.zstd => ZstdCodec(),
     };
-    final codecCode = switch (compression) {
+    final code = switch (compression) {
       ArrowCompression.none => null,
       ArrowCompression.lz4 => compressionLz4Frame,
       ArrowCompression.zstd => compressionZstd,
     };
 
     final out = BytesBuilder();
-    out.add(_magic);
-    out.add(Uint8List(2)); // pad magic to 8 bytes
+    if (!stream) {
+      out.add(_magic);
+      out.add(Uint8List(2)); // pad magic to 8 bytes
+    }
 
     _writeMessage(out, buildSchemaMessage(fields), Uint8List(0));
 
@@ -195,25 +178,29 @@ class ArrowWriter {
         final encoded = encodeColumn(batch.columns[c], fields[c]);
         nodes.addAll(encoded.nodes);
         for (final raw in encoded.buffers) {
-          _writeBodyBuffer(body, buffers, raw, codec);
+          _append(body, buffers, raw, codec);
         }
       }
-      final bodyBytes = body.toBytes();
+      final bytes = body.toBytes();
       final message = buildRecordBatchMessage(
         batch.rowCount,
         nodes,
         buffers,
-        bodyBytes.length,
-        codec: codecCode,
+        bytes.length,
+        codec: code,
       );
-      final metaLength = _writeMessage(out, message, bodyBytes);
+      final metaLength = _writeMessage(out, message, bytes);
       blocks.add((
         offset: offset,
         metaLength: metaLength,
-        bodyLength: bodyBytes.length,
+        bodyLength: bytes.length,
       ));
     }
 
+    if (stream) {
+      out.add(_end);
+      return out.toBytes();
+    }
     final footer = buildFooter(fields, blocks);
     out.add(footer);
     out.add(_int32(footer.length));
@@ -225,7 +212,7 @@ class ArrowWriter {
   /// (offset,length) and padding the body to 8 bytes. With a [codec], each
   /// buffer carries an int64 prefix: the uncompressed length, or -1 if stored
   /// raw because compression did not help. Empty buffers carry no prefix.
-  static void _writeBodyBuffer(
+  static void _append(
     BytesBuilder body,
     List<BufferInfo> buffers,
     Uint8List raw,
@@ -237,12 +224,12 @@ class ArrowWriter {
       buffers.add((offset: offset, length: raw.length));
     } else {
       final compressed = codec.compress(raw);
-      final useCompressed = compressed.length < raw.length;
-      final payload = useCompressed ? compressed : raw;
+      final smaller = compressed.length < raw.length;
+      final payload = smaller ? compressed : raw;
       final prefix = Uint8List(8);
       ByteData.view(
         prefix.buffer,
-      ).setInt64(0, useCompressed ? raw.length : -1, Endian.little);
+      ).setInt64(0, smaller ? raw.length : -1, Endian.little);
       body.add(prefix);
       body.add(payload);
       buffers.add((offset: offset, length: 8 + payload.length));
@@ -269,68 +256,73 @@ class ArrowWriter {
     return 8 + padded;
   }
 
-  static Uint8List _int32(int v) {
-    final b = Uint8List(4);
-    ByteData.view(b.buffer).setInt32(0, v, Endian.little);
-    return b;
+  static Uint8List _int32(int value) {
+    final bytes = Uint8List(4);
+    ByteData.view(bytes.buffer).setInt32(0, value, Endian.little);
+    return bytes;
   }
 
-  static Uint8List _uint32(int v) {
-    final b = Uint8List(4);
-    ByteData.view(b.buffer).setUint32(0, v, Endian.little);
-    return b;
+  static Uint8List _uint32(int value) {
+    final bytes = Uint8List(4);
+    ByteData.view(bytes.buffer).setUint32(0, value, Endian.little);
+    return bytes;
   }
 }
 
-/// Incremental Arrow IPC file writer: appends one RecordBatch message to disk per
-/// [add], so only the current batch is resident (unlike [ArrowWriter], which
-/// builds the whole file in memory). Output is byte-compatible with [ArrowReader]
-/// (and pyarrow). The file is created lazily on the first [add]; [close] writes
-/// the footer. If nothing is added, no file is written.
+/// Incremental Arrow IPC writer: appends one RecordBatch message to disk per
+/// [add], so only the current batch is resident. It writes the IPC file
+/// format, or with [stream] the IPC stream format. Output is byte-compatible
+/// with [ArrowReader] (and pyarrow). The file is created lazily on the first
+/// [add]; [close] writes the footer (file) or the end-of-stream marker
+/// (stream). If nothing is added, no file is written.
 class ArrowStreamWriter {
   final String path;
   final List<Field> _fields;
   final CompressionCodec? _codec;
-  final int? _codecCode;
+  final int? _code;
   final List<BlockInfo> _blocks = [];
-  RandomAccessFile? _raf;
+  final bool stream;
+  RandomAccessFile? _handle;
   int _written = 0;
 
   ArrowStreamWriter(
     this.path,
     Schema schema, {
     ArrowCompression compression = ArrowCompression.none,
+    this.stream = false,
   }) : _fields = schema.fields,
        _codec = switch (compression) {
          ArrowCompression.none => null,
          ArrowCompression.lz4 => Lz4Codec(),
          ArrowCompression.zstd => ZstdCodec(),
        },
-       _codecCode = switch (compression) {
+       _code = switch (compression) {
          ArrowCompression.none => null,
          ArrowCompression.lz4 => compressionLz4Frame,
          ArrowCompression.zstd => compressionZstd,
        };
 
   Future<void> _open() async {
-    if (_raf != null) return;
-    _raf = await File(path).open(mode: FileMode.write);
+    if (_handle != null) return;
+    _handle = await File(path).open(mode: FileMode.write);
     final header = BytesBuilder();
-    header.add(ArrowWriter._magic);
-    header.add(Uint8List(2)); // pad magic to 8 bytes
+    if (!stream) {
+      header.add(ArrowWriter._magic);
+      header.add(Uint8List(2)); // pad magic to 8 bytes
+    }
     ArrowWriter._writeMessage(
       header,
       buildSchemaMessage(_fields),
       Uint8List(0),
     );
-    await _writeChunk(header.toBytes());
+    await _write(header.toBytes());
   }
 
   /// Append [batch] as one RecordBatch message (flushed to disk immediately).
   Future<void> add(Table batch) async {
     // Encoding is strictly positional against the frozen writer schema, so a
     // batch whose columns are reordered/renamed/retyped would silently store
-    // data under the wrong field. Require an EXACT type match — `isCompatibleWith`
+    // data under the wrong field. Require an EXACT type match: `isCompatibleWith`
     // permits int32→int64 widening, which would encode int64 values under an
     // int32 buffer and SILENTLY TRUNCATE them (Field.encodesAs guards decimal
     // scale/precision + nested shape too).
@@ -338,7 +330,7 @@ class ArrowStreamWriter {
       throw ArgumentError(
         'Batch schema does not match the Arrow writer schema; every batch must '
         'have the same columns in the same order and EXACT type (a wider batch '
-        'is not narrowed — declare the wider type when opening the writer)',
+        'is not narrowed: declare the wider type when opening the writer)',
       );
     }
     await _open();
@@ -350,63 +342,67 @@ class ArrowStreamWriter {
       final encoded = encodeColumn(batch.columns[c], _fields[c]);
       nodes.addAll(encoded.nodes);
       for (final raw in encoded.buffers) {
-        ArrowWriter._writeBodyBuffer(body, buffers, raw, _codec);
+        ArrowWriter._append(body, buffers, raw, _codec);
       }
     }
-    final bodyBytes = body.toBytes();
+    final bytes = body.toBytes();
     final message = buildRecordBatchMessage(
       batch.rowCount,
       nodes,
       buffers,
-      bodyBytes.length,
-      codec: _codecCode,
+      bytes.length,
+      codec: _code,
     );
     final framed = BytesBuilder();
-    final metaLength = ArrowWriter._writeMessage(framed, message, bodyBytes);
-    await _writeChunk(framed.toBytes());
+    final metaLength = ArrowWriter._writeMessage(framed, message, bytes);
+    await _write(framed.toBytes());
     _blocks.add((
       offset: offset,
       metaLength: metaLength,
-      bodyLength: bodyBytes.length,
+      bodyLength: bytes.length,
     ));
   }
 
-  /// Write the footer, flush to stable media, and close. No-op (no file) if
-  /// nothing was added.
+  /// Write the footer (or, for a stream, the end-of-stream marker), flush to
+  /// stable media, and close. No-op (no file) if nothing was added.
   ///
   /// The flush is an fsync: `close()` only reaches the OS, so a published file
   /// could otherwise outlive a crash with content that never hit the disk while
   /// the metadata pointing at it (which IS fsynced) survived.
   Future<void> close() async {
-    if (_raf == null) return;
-    final footer = buildFooter(_fields, _blocks);
-    final tail = BytesBuilder();
-    tail.add(footer);
-    tail.add(ArrowWriter._int32(footer.length));
-    tail.add(ArrowWriter._magic);
-    await _writeChunk(tail.toBytes());
-    await _raf!.flush();
-    await _raf!.close();
-    _raf = null;
+    if (_handle == null) return;
+    if (stream) {
+      await _write(ArrowWriter._end);
+    } else {
+      final footer = buildFooter(_fields, _blocks);
+      final tail = BytesBuilder();
+      tail.add(footer);
+      tail.add(ArrowWriter._int32(footer.length));
+      tail.add(ArrowWriter._magic);
+      await _write(tail.toBytes());
+    }
+    await _handle!.flush();
+    await _handle!.close();
+    _handle = null;
   }
 
   /// Best-effort teardown for the failure path: close the open file handle (so
   /// the descriptor is not leaked) and delete the partial file. No footer is
   /// written. Idempotent.
   Future<void> abort() async {
-    if (_raf == null) return;
+    if (_handle == null) return;
     try {
-      await _raf!.close();
+      await _handle!.close();
     } catch (_) {
       /* already closing/closed */
     }
-    _raf = null;
-    final f = File(path);
-    if (await f.exists()) await f.delete();
+    _handle = null;
+    final file = File(path);
+    if (await file.exists()) await file.delete();
   }
 
-  Future<void> _writeChunk(Uint8List bytes) async {
-    await _raf!.writeFrom(bytes);
+  Future<void> _write(Uint8List bytes) async {
+    await _handle!.writeFrom(bytes);
     _written += bytes.length;
   }
 }

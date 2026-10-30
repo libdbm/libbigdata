@@ -1,7 +1,7 @@
 part of 'physical_plan.dart';
 
 /// Comparison operators that produce a boolean mask.
-const _comparisonOps = {
+const _comparisons = {
   BinaryOperator.eq,
   BinaryOperator.neq,
   BinaryOperator.lt,
@@ -11,7 +11,7 @@ const _comparisonOps = {
 };
 
 /// Arithmetic operators that produce a numeric column.
-const _arithmeticOps = {
+const _arithmetic = {
   BinaryOperator.add,
   BinaryOperator.subtract,
   BinaryOperator.multiply,
@@ -30,7 +30,7 @@ abstract class PhysicalExpression {
 
   /// Nested shape (list/struct/map children) for a column reference that
   /// passes a nested column through. Like decimal scale, the shape lives on
-  /// the FIELD — dropping it at a projection boundary left spilled nested
+  /// the FIELD: dropping it at a projection boundary left spilled nested
   /// columns with children-less fields, which the Parquet spill writer
   /// rejects (`children.first` on empty). Empty for computed expressions.
   List<Field> get children => const [];
@@ -38,22 +38,17 @@ abstract class PhysicalExpression {
   Object? evaluate(RecordBatch batch, int rowIndex);
 
   /// Vectorized evaluation to a whole data column (projection outputs).
-  /// Default: per-row interpretation — overridden by the fast paths below.
+  /// Default: per-row interpretation, which the fast paths below override.
   Column evalColumn(RecordBatch batch) {
     final data = <dynamic>[];
     for (int i = 0; i < batch.rowCount; i++) {
       data.add(evaluate(batch, i));
     }
-    return ListColumn(
-      name: 'expr',
-      dataType: dataType,
-      data: data,
-      nullable: data.contains(null),
-    );
+    return columnFromValues('expr', dataType, data);
   }
 
   /// Vectorized evaluation to a boolean mask (filter predicates).
-  /// Default: per-row interpretation — overridden by the fast paths below.
+  /// Default: per-row interpretation, which the fast paths below override.
   BoolMask evalMask(RecordBatch batch) {
     final mask = BoolMask(batch.rowCount);
     for (int i = 0; i < batch.rowCount; i++) {
@@ -166,12 +161,11 @@ class PhysicalLiteralExpression extends PhysicalExpression {
   }
 }
 
-/// Binary expression
 /// `value [NOT] IN (list)`, evaluated in SQL three-valued logic.
 ///
 /// When every list element is a constant AND the probe's type compares by
 /// value, the list becomes a set and the batch is scanned once. Otherwise it
-/// falls back to one comparison per element combined with OR/AND — identical to
+/// falls back to one comparison per element combined with OR/AND: identical to
 /// what the equivalent expanded predicate would do, which keeps a
 /// non-constant list (`x IN (y, 2)`) working.
 class PhysicalInExpression extends PhysicalExpression {
@@ -190,7 +184,7 @@ class PhysicalInExpression extends PhysicalExpression {
   ///
   /// `decimal` is excluded: it stores an unscaled BigInt, and `BigInt.from(1)`
   /// does not equal the literal `1`, so a set probe would silently miss every
-  /// row where a comparison also (currently) misses — but by a different route.
+  /// row where a comparison also (currently) misses, but by a different route.
   /// `binary` is excluded because a Uint8List hashes by identity, which would
   /// drop every row. Both fall back to comparisons, keeping IN's answer exactly
   /// equal to the corresponding `=`/`<>`.
@@ -220,7 +214,7 @@ class PhysicalInExpression extends PhysicalExpression {
   DataType get dataType => DataType.boolean;
 
   /// Vectorized, so the decimal scale alignment in the comparison kernels
-  /// applies here too — the per-row base fallback compares raw values and would
+  /// applies here too: the per-row base fallback compares raw values and would
   /// never match an unscaled decimal against a literal.
   @override
   Column evalColumn(RecordBatch batch) =>
@@ -291,6 +285,7 @@ class PhysicalInExpression extends PhysicalExpression {
   }
 }
 
+/// Binary expression
 class PhysicalBinaryExpression extends PhysicalExpression {
   final PhysicalExpression left;
   final BinaryOperator operator;
@@ -335,8 +330,8 @@ class PhysicalBinaryExpression extends PhysicalExpression {
 
   @override
   Object? evaluate(RecordBatch batch, int rowIndex) {
-    // LIKE's ONLY implementation is this per-row one — evalMask/evalColumn
-    // fall back to it — so it must not delegate to them (recursion).
+    // LIKE's ONLY implementation is this per-row one: evalMask/evalColumn
+    // fall back to it, so it must not delegate to them (recursion).
     if (operator == BinaryOperator.like || operator == BinaryOperator.notLike) {
       final leftValue = left.evaluate(batch, rowIndex);
       final rightValue = right.evaluate(batch, rowIndex);
@@ -356,28 +351,35 @@ class PhysicalBinaryExpression extends PhysicalExpression {
     return column[0];
   }
 
+  /// LIKE: `%` matches any run, `_` exactly one Unicode code point, everything
+  /// else itself (line terminators included). Greedy wildcard matching that
+  /// backtracks only to the most recent `%`, so it runs in O(n·m) worst case
+  /// and is safe on untrusted patterns, unlike a regex translation.
   bool _matchesPattern(String value, String pattern) {
-    // LIKE: % = any run, _ = one char. Build the regex char-by-char, escaping
-    // every other character — otherwise pattern metachars (`.`, `(`, `+`, …)
-    // would match as regex (`a.b` matching `acb`) or enable catastrophic
-    // backtracking (ReDoS). (RegExp.escape leaves `%`/`_` untouched since they
-    // aren't metacharacters, so they must be handled explicitly here.)
-    final buffer = StringBuffer('^');
-    for (final ch in pattern.split('')) {
-      if (ch == '%') {
-        buffer.write('.*');
-      } else if (ch == '_') {
-        buffer.write('.');
+    const percent = 0x25, underscore = 0x5F;
+    final text = value.runes.toList();
+    final glob = pattern.runes.toList();
+    var i = 0, j = 0, star = -1, mark = 0;
+    while (i < text.length) {
+      if (j < glob.length &&
+          glob[j] != percent &&
+          (glob[j] == underscore || glob[j] == text[i])) {
+        i++;
+        j++;
+      } else if (j < glob.length && glob[j] == percent) {
+        star = j++;
+        mark = i;
+      } else if (star >= 0) {
+        j = star + 1;
+        i = ++mark;
       } else {
-        buffer.write(RegExp.escape(ch));
+        return false;
       }
     }
-    buffer.write(r'$');
-    // dotAll: SQL's `_` is ANY character and `%` ANY sequence — a line
-    // terminator is not special. Without it `.` excludes \n \r \u2028 \u2029
-    // (ECMAScript semantics), so `'a\nb' LIKE '%'` was FALSE. `^`/`$` stay
-    // input-anchored (no multiLine), which is what LIKE wants.
-    return RegExp(buffer.toString(), dotAll: true).hasMatch(value);
+    while (j < glob.length && glob[j] == percent) {
+      j++;
+    }
+    return j == glob.length;
   }
 
   @override
@@ -388,12 +390,12 @@ class PhysicalBinaryExpression extends PhysicalExpression {
       final wantNull = operator == BinaryOperator.isNull;
       final mask = BoolMask(l.length);
       for (int i = 0; i < l.length; i++) {
-        // IS [NOT] NULL is always TRUE/FALSE — never UNKNOWN.
+        // IS [NOT] NULL is always TRUE/FALSE, never UNKNOWN.
         if ((l[i] == null) == wantNull) mask.setTrue(i);
       }
       return mask;
     }
-    if (_comparisonOps.contains(operator)) {
+    if (_comparisons.contains(operator)) {
       if (right is PhysicalLiteralExpression) {
         return Kernels.compareScalar(
           left.evalColumn(batch),
@@ -432,7 +434,7 @@ class PhysicalBinaryExpression extends PhysicalExpression {
 
   @override
   Column evalColumn(RecordBatch batch) {
-    if (_arithmeticOps.contains(operator)) {
+    if (_arithmetic.contains(operator)) {
       final l = left.evalColumn(batch);
       final r = right is PhysicalLiteralExpression
           ? (right as PhysicalLiteralExpression).value
@@ -447,7 +449,7 @@ class PhysicalBinaryExpression extends PhysicalExpression {
         resultScale: scale,
       );
     }
-    if (_comparisonOps.contains(operator) ||
+    if (_comparisons.contains(operator) ||
         operator == BinaryOperator.and ||
         operator == BinaryOperator.or ||
         operator == BinaryOperator.isNull ||
@@ -462,9 +464,9 @@ class PhysicalBinaryExpression extends PhysicalExpression {
 /// fallback for vectorization, which is correct and off the hot path.
 class PhysicalFunctionExpression extends PhysicalExpression {
   final String name;
-  final List<PhysicalExpression> args;
+  final List<PhysicalExpression> arguments;
 
-  PhysicalFunctionExpression(this.name, this.args);
+  PhysicalFunctionExpression(this.name, this.arguments);
 
   @override
   DataType get dataType {
@@ -482,12 +484,12 @@ class PhysicalFunctionExpression extends PhysicalExpression {
         return DataType.float64; // always toDouble()
       case 'ABS':
         // ABS preserves the argument's kind: num.abs() on an int stays an int.
-        return _isIntType(_argType(0)) ? DataType.int64 : DataType.float64;
+        return _isInteger(_argumentType(0)) ? DataType.int64 : DataType.float64;
       case 'MOD':
-        // `a % b` is int for two ints, else double — mirror the kernel rule.
+        // `a % b` is int for two ints, else double: mirror the kernel rule.
         return Kernels.arithResultType(
-          _argType(0),
-          _argType(1),
+          _argumentType(0),
+          _argumentType(1),
           BinaryOperator.modulo,
         );
       case 'UPPER':
@@ -500,25 +502,27 @@ class PhysicalFunctionExpression extends PhysicalExpression {
       case 'COALESCE':
         // The result may come from any argument, so type it to the widest common
         // type across them (values are coerced to this in evalColumn).
-        if (args.isEmpty) return DataType.string;
-        var type = args.first.dataType;
-        for (final a in args.skip(1)) {
+        if (arguments.isEmpty) return DataType.string;
+        var type = arguments.first.dataType;
+        for (final a in arguments.skip(1)) {
           type = DataType.commonType(type, a.dataType) ?? type;
         }
         return type;
       default:
-        return args.isNotEmpty ? args.first.dataType : DataType.string;
+        return arguments.isNotEmpty
+            ? arguments.first.dataType
+            : DataType.string;
     }
   }
 
   /// COALESCE may return any argument, so a decimal result must settle on the
-  /// widest scale and lift each argument to it — otherwise the output field
+  /// widest scale and lift each argument to it; otherwise the output field
   /// carries no scale and a decimal reads back as a scale-0 integer.
   @override
   int? get scale {
     if (dataType != DataType.decimal) return null;
     var widest = 0;
-    for (final a in args) {
+    for (final a in arguments) {
       final s = a.scale ?? 0;
       if (s > widest) widest = s;
     }
@@ -528,24 +532,24 @@ class PhysicalFunctionExpression extends PhysicalExpression {
   @override
   int? get precision => dataType == DataType.decimal ? 38 : null;
 
-  DataType _argType(int i) =>
-      i < args.length ? args[i].dataType : DataType.float64;
+  DataType _argumentType(int i) =>
+      i < arguments.length ? arguments[i].dataType : DataType.float64;
 
-  static bool _isIntType(DataType t) =>
+  static bool _isInteger(DataType t) =>
       t == DataType.int8 ||
       t == DataType.int16 ||
       t == DataType.int32 ||
       t == DataType.int64;
 
   /// Argument [i]'s evaluated value as a plain number: a decimal argument
-  /// holds an unscaled BigInt, which is NOT a num — casting it directly made
+  /// holds an unscaled BigInt, which is NOT a num: casting it directly made
   /// every math function over a decimal (including ABS(SUM(x)), since SUM(int)
   /// surfaces as decimal) throw a TypeError. Divide it back down by its scale,
-  /// mirroring the kernel's _decimalAsNum.
-  num? _numArg(List<dynamic> a, int i) {
+  /// mirroring the kernel's _decimalAsNumber.
+  num? _numeric(List<dynamic> a, int i) {
     final v = a[i];
     if (v == null) return null;
-    if (v is BigInt) return Kernels.decimalToNum(v, args[i].scale ?? 0);
+    if (v is BigInt) return Kernels.decimalToNum(v, arguments[i].scale ?? 0);
     return v as num;
   }
 
@@ -562,17 +566,12 @@ class PhysicalFunctionExpression extends PhysicalExpression {
       if (float && value != null) value = (value as num).toDouble();
       data.add(value);
     }
-    return ListColumn(
-      name: 'expr',
-      dataType: type,
-      data: data,
-      nullable: data.contains(null),
-    );
+    return columnFromValues('expr', type, data);
   }
 
   @override
   Object? evaluate(RecordBatch batch, int rowIndex) {
-    final a = <dynamic>[for (final e in args) e.evaluate(batch, rowIndex)];
+    final a = <dynamic>[for (final e in arguments) e.evaluate(batch, rowIndex)];
     switch (name.toUpperCase()) {
       case 'UPPER':
         return a[0]?.toString().toUpperCase();
@@ -580,7 +579,9 @@ class PhysicalFunctionExpression extends PhysicalExpression {
         return a[0]?.toString().toLowerCase();
       case 'LENGTH':
       case 'CHAR_LENGTH':
-        return a[0]?.toString().length;
+        // Code points, as LIKE's `_` counts them: a character outside the
+        // BMP is one, not its two UTF-16 code units.
+        return a[0]?.toString().runes.length;
       case 'TRIM':
         return a[0]?.toString().trim();
       case 'CONCAT':
@@ -588,27 +589,38 @@ class PhysicalFunctionExpression extends PhysicalExpression {
       case 'SUBSTR':
       case 'SUBSTRING':
         {
-          if (a[0] == null) return null;
-          final s = a[0].toString();
-          final from = ((a[1] as num).toInt() - 1).clamp(
-            0,
-            s.length,
-          ); // 1-based
-          final to = (a.length > 2 && a[2] != null)
-              ? (from + (a[2] as num).toInt()).clamp(0, s.length)
-              : s.length;
-          return s.substring(from, to);
+          // Postgres semantics: any NULL argument gives NULL, positions are
+          // 1-based and may start before the string (start 0 with length 2
+          // covers positions 0 and 1, so yields one character), and a
+          // negative length is an error rather than a raw RangeError.
+          // Positions count code points, so a surrogate pair is never split.
+          if (a.any((x) => x == null)) return null;
+          final s = a[0].toString().runes.toList();
+          final start = (a[1] as num).toInt();
+          final int end; // 1-based, exclusive
+          if (a.length > 2) {
+            final length = (a[2] as num).toInt();
+            if (length < 0) {
+              throw StateError('SUBSTR length must not be negative: $length');
+            }
+            end = start + length;
+          } else {
+            end = s.length + 1;
+          }
+          final from = (start - 1).clamp(0, s.length);
+          final to = (end - 1).clamp(from, s.length);
+          return String.fromCharCodes(s, from, to);
         }
       case 'COALESCE':
         // Coerce the WINNING argument to the declared result type/scale. Which
         // argument won matters: only it knows the scale its value is unscaled
         // at. (`firstWhere` alone returned a raw int under a decimal/float
-        // result — the same dtype lie CASE had.)
+        // result: the same dtype lie CASE had.)
         for (int i = 0; i < a.length; i++) {
           if (a[i] != null) {
             return coerceToResult(
               a[i],
-              args[i].scale ?? 0,
+              arguments[i].scale ?? 0,
               dataType,
               scale ?? 0,
             );
@@ -616,15 +628,24 @@ class PhysicalFunctionExpression extends PhysicalExpression {
         }
         return null;
       case 'ABS':
-        return a[0] == null ? null : _numArg(a, 0)!.abs();
+        if (a[0] == null) return null;
+        final value = _numeric(a, 0)!;
+        // -2^63 has no int64 absolute value; Dart's abs() returns it unchanged.
+        if (value is int && value == -9223372036854775807 - 1) {
+          throw StateError(
+            'integer overflow in "ABS": |$value| exceeds the signed 64-bit '
+            'range (cast the argument to a wider/decimal type)',
+          );
+        }
+        return value.abs();
       case 'ROUND':
         {
           if (a[0] == null) return null;
-          final v = _numArg(a, 0)!.toDouble();
+          final v = _numeric(a, 0)!.toDouble();
           if (a.length > 1 && a[1] != null) {
             final digits = (a[1] as num).toInt();
             // Rounding to >= 15 fractional digits adds no float64 precision, so
-            // it's a no-op — and computing 10^digits there would overflow to
+            // it's a no-op, and computing 10^digits there would overflow to
             // Infinity (then NaN). Clamp the low end too (10^-308 underflows to
             // 0 → division by 0). If scaling overflows for a huge value, return
             // it unchanged.
@@ -632,36 +653,37 @@ class PhysicalFunctionExpression extends PhysicalExpression {
             final f = math.pow(10, digits < -307 ? -307 : digits);
             final scaled = v * f;
             if (!scaled.isFinite) return v;
-            return scaled.round() / f;
+            // roundToDouble: round() returns an int, which clamps at 2^63.
+            return scaled.roundToDouble() / f;
           }
           return v.roundToDouble();
         }
       case 'FLOOR':
-        return a[0] == null ? null : _numArg(a, 0)!.floorToDouble();
+        return a[0] == null ? null : _numeric(a, 0)!.floorToDouble();
       case 'CEIL':
       case 'CEILING':
-        return a[0] == null ? null : _numArg(a, 0)!.ceilToDouble();
+        return a[0] == null ? null : _numeric(a, 0)!.ceilToDouble();
       case 'SQRT':
-        return a[0] == null ? null : math.sqrt(_numArg(a, 0)!.toDouble());
+        return a[0] == null ? null : math.sqrt(_numeric(a, 0)!.toDouble());
       case 'POWER':
       case 'POW':
         return (a[0] == null || a[1] == null)
             ? null
-            : math.pow(_numArg(a, 0)!.toDouble(), _numArg(a, 1)!.toDouble());
+            : math.pow(_numeric(a, 0)!.toDouble(), _numeric(a, 1)!.toDouble());
       case 'MOD':
         // Via the kernel twin: MOD's dataType comes from arithResultType, so a
-        // decimal operand makes the result decimal — the value must then be an
+        // decimal operand makes the result decimal: the value must then be an
         // unscaled BigInt at [scale], not a raw num (and 0 divides to NULL).
         return (a[0] == null || a[1] == null)
             ? null
             : Kernels.arithScalar(
                 a[0],
-                _argType(0),
-                args[0].scale ?? 0,
+                _argumentType(0),
+                arguments[0].scale ?? 0,
                 BinaryOperator.modulo,
                 a[1],
-                _argType(1),
-                args[1].scale ?? 0,
+                _argumentType(1),
+                arguments[1].scale ?? 0,
                 resultScale: scale,
               );
       default:
@@ -681,16 +703,16 @@ class PhysicalWhen {
 /// CASE WHEN ... THEN ... [ELSE ...] END.
 class PhysicalCaseExpression extends PhysicalExpression {
   final List<PhysicalWhen> whens;
-  final PhysicalExpression? elseExpr;
+  final PhysicalExpression? elseExpression;
   final DataType resultType;
 
-  PhysicalCaseExpression(this.whens, this.elseExpr, this.resultType);
+  PhysicalCaseExpression(this.whens, this.elseExpression, this.resultType);
 
   @override
   DataType get dataType => resultType;
 
   /// Every branch is a candidate result, so a decimal CASE must settle on ONE
-  /// scale — the widest — and lift each branch to it. Without this the output
+  /// scale (the widest) and lift each branch to it. Without this the output
   /// field carries no scale at all and a decimal result reads back as a scale-0
   /// integer (1.50 as 150), the same defect MIN/MAX were fixed for.
   @override
@@ -701,7 +723,7 @@ class PhysicalCaseExpression extends PhysicalExpression {
       final s = w.result.scale ?? 0;
       if (s > widest) widest = s;
     }
-    final e = elseExpr;
+    final e = elseExpression;
     final s = e?.scale ?? 0;
     return s > widest ? s : widest;
   }
@@ -713,7 +735,7 @@ class PhysicalCaseExpression extends PhysicalExpression {
   /// vectorized and per-row paths cannot disagree: `evalColumn` is defined in
   /// terms of `evaluate`, so fixing the source fixes both. (Branch types are
   /// widened to a common `resultType` by the planner, but the VALUES were left
-  /// alone — a float64-declared column then held Dart ints, which a Parquet
+  /// alone: a float64-declared column then held Dart ints, which a Parquet
   /// write rejects and which splits one decimal value across two DISTINCT
   /// groups, since `BigInt.from(0) != 0`.)
   @override
@@ -728,7 +750,7 @@ class PhysicalCaseExpression extends PhysicalExpression {
         );
       }
     }
-    final e = elseExpr;
+    final e = elseExpression;
     if (e == null) return null;
     return coerceToResult(
       e.evaluate(batch, rowIndex),
@@ -740,8 +762,18 @@ class PhysicalCaseExpression extends PhysicalExpression {
 }
 
 /// CAST(expr AS type).
+/// [predicate] as a filter condition. A value that is not boolean is cast to
+/// BOOLEAN, as DuckDB does: a nonzero number keeps the row, and text follows
+/// CAST's rules (true-like text keeps it; anything else casts to NULL, which
+/// drops it).
+PhysicalExpression condition(PhysicalExpression predicate) =>
+    predicate.dataType == DataType.boolean ||
+        predicate.dataType == DataType.null_
+    ? predicate
+    : PhysicalCastExpression(predicate, DataType.boolean);
+
 class PhysicalCastExpression extends PhysicalExpression {
-  final PhysicalExpression expr;
+  final PhysicalExpression expression;
   final DataType targetType;
 
   /// Explicit `DECIMAL(p,s)` parameters; null for other targets and for bare
@@ -750,7 +782,7 @@ class PhysicalCastExpression extends PhysicalExpression {
   final int? targetScale;
 
   PhysicalCastExpression(
-    this.expr,
+    this.expression,
     this.targetType, {
     this.targetPrecision,
     this.targetScale,
@@ -760,31 +792,32 @@ class PhysicalCastExpression extends PhysicalExpression {
   DataType get dataType => targetType;
 
   /// `CAST(<decimal> AS DECIMAL)` passes the unscaled value straight through, so
-  /// it must keep the SOURCE's scale — reporting null here declared a scale-0
+  /// it must keep the SOURCE's scale: reporting null here declared a scale-0
   /// decimal over scale-1 data and rendered 1.5 as "15". An explicit
   /// `DECIMAL(p,s)` overrides both.
   @override
   int? get precision => targetType == DataType.decimal
-      ? (targetPrecision ?? expr.precision ?? 38)
+      ? (targetPrecision ?? expression.precision ?? 38)
       : null;
 
   @override
-  int? get scale =>
-      targetType == DataType.decimal ? (targetScale ?? expr.scale ?? 0) : null;
+  int? get scale => targetType == DataType.decimal
+      ? (targetScale ?? expression.scale ?? 0)
+      : null;
 
   @override
   Object? evaluate(RecordBatch batch, int rowIndex) {
-    final v = expr.evaluate(batch, rowIndex);
+    final v = expression.evaluate(batch, rowIndex);
     if (v == null) return null;
     // A decimal is an UNSCALED BigInt: 1.5 at scale 1 arrives as BigInt(15).
     // Every branch below tests `v is num`, which a BigInt is not, so each one
     // fell through to the string/passthrough path and cast the RAW unscaled
-    // integer — CAST(1.5 AS DOUBLE) gave 15.0, off by exactly 10^scale.
+    // integer: CAST(1.5 AS DOUBLE) gave 15.0, off by exactly 10^scale.
     // Resolve the real value first; decimal→decimal keeps the representation.
     if (v is BigInt &&
-        expr.dataType == DataType.decimal &&
+        expression.dataType == DataType.decimal &&
         targetType != DataType.decimal) {
-      return _fromDecimal(v, expr.scale ?? 0);
+      return _fromDecimal(v, expression.scale ?? 0);
     }
     switch (targetType) {
       case DataType.int8:
@@ -801,9 +834,11 @@ class PhysicalCastExpression extends PhysicalExpression {
                   v >= 9223372036854775808.0)) {
             return null;
           }
-          return v.toInt();
+          // Round half away from zero, as DuckDB and PostgreSQL do.
+          return _fits(v is double ? v.round() : v.toInt());
         }
-        return int.tryParse(v.toString());
+        final parsed = int.tryParse(v.toString());
+        return parsed == null ? null : _fits(parsed);
       case DataType.float32:
       case DataType.float64:
         return v is num ? v.toDouble() : double.tryParse(v.toString());
@@ -814,20 +849,20 @@ class PhysicalCastExpression extends PhysicalExpression {
         if (s == null) {
           // Bare DECIMAL: an integer casts to scale-0 BigInt; a BigInt passes
           // through (keeping the source scale); a non-integer needs an
-          // explicit scale — refuse.
+          // explicit scale: refuse.
           if (v is BigInt) return v;
           if (v is int) return BigInt.from(v);
           throw StateError(
             'CAST to DECIMAL from a non-integer value ($v) needs an explicit '
-            'scale — use DECIMAL(p,s)',
+            'scale: use DECIMAL(p,s)',
           );
         }
         // Explicit DECIMAL(p,s): produce the unscaled value AT s. Anything
         // that would drop digits fails LOUD (same contract as toUnscaled /
-        // unscaledFromString) — SQL engines round here, but a silent rounding
+        // unscaledFromString): SQL engines round here, but a silent rounding
         // is a wrong stored value in a type whose whole point is exactness.
-        if (v is BigInt && expr.dataType == DataType.decimal) {
-          return rescaleUnscaled(v, expr.scale ?? 0, s);
+        if (v is BigInt && expression.dataType == DataType.decimal) {
+          return rescaleUnscaled(v, expression.scale ?? 0, s);
         }
         if (v is int) return BigInt.from(v) * BigInt.from(10).pow(s);
         if (v is num) {
@@ -836,14 +871,43 @@ class PhysicalCastExpression extends PhysicalExpression {
         }
         return unscaledFromString(v.toString(), s);
       case DataType.boolean:
-        return v is bool
-            ? v
-            : (v.toString().toLowerCase() == 'true' || v.toString() == '1');
+        // DuckDB's rules: a number is true when nonzero, and text is one of
+        // true/t/yes/y/1 or false/f/no/n/0 in any case. Other text is NULL
+        // here (DuckDB raises), as unparsable text is for every other cast.
+        if (v is bool) return v;
+        if (v is num) return v != 0;
+        return switch (v.toString().toLowerCase()) {
+          'true' || 't' || 'yes' || 'y' || '1' => true,
+          'false' || 'f' || 'no' || 'n' || '0' => false,
+          _ => null,
+        };
       case DataType.string:
         return v.toString();
+      case DataType.date:
+        final at = v is DateTime ? v : parseUtc(v.toString());
+        return at == null ? null : dateOf(at);
+      case DataType.timestamp:
+        return v is DateTime ? v : parseUtc(v.toString());
       default:
         return v;
     }
+  }
+
+  /// [value] when it fits the integer [targetType], else an error naming the
+  /// type, as in DuckDB.
+  int _fits(int value) {
+    final bits = switch (targetType) {
+      DataType.int8 => 8,
+      DataType.int16 => 16,
+      DataType.int32 => 32,
+      _ => 64,
+    };
+    if (bits < 64 && value.toSigned(bits) != value) {
+      throw FormatException(
+        'CAST value $value is out of range for ${targetType.name}',
+      );
+    }
+    return value;
   }
 
   /// [unscaled] / 10^[scale] cast to [targetType]. Formatting once and parsing
@@ -854,10 +918,16 @@ class PhysicalCastExpression extends PhysicalExpression {
       case DataType.int16:
       case DataType.int32:
       case DataType.int64:
-        // SQL truncates toward zero; BigInt's ~/ already does. A quotient past
-        // int64 yields NULL, like the out-of-range double cast above.
-        final whole = unscaled ~/ BigInt.from(10).pow(scale);
-        return whole.isValidInt ? whole.toInt() : null;
+        // Round half away from zero, as DuckDB and PostgreSQL do. A result
+        // past int64 yields NULL, like the out-of-range double cast above.
+        final unit = BigInt.from(10).pow(scale);
+        final half = unit ~/ BigInt.two;
+        final whole = unscaled.isNegative
+            ? -((-unscaled + half) ~/ unit)
+            : (unscaled + half) ~/ unit;
+        return whole.isValidInt ? _fits(whole.toInt()) : null;
+      case DataType.boolean:
+        return unscaled != BigInt.zero;
       case DataType.float32:
       case DataType.float64:
         return double.tryParse(formatDecimal(unscaled, scale));

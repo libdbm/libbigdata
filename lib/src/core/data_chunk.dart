@@ -1,21 +1,43 @@
 import 'package:meta/meta.dart';
 import 'column.dart';
 import 'columnar.dart';
+import 'data_type.dart';
+import 'decimal.dart';
 import 'schema.dart';
+
+/// Row [index] of [columns] as a map keyed by [schema]'s field names.
+///
+/// A decimal column is stored unscaled with its scale on the field, so a bare
+/// value is a meaningless integer (1.50 reads as 150); here it becomes a
+/// [Decimal], which round-trips back through `Table.fromRows`.
+Map<String, dynamic> rowAt(Schema schema, List<Column> columns, int index) => {
+  for (var i = 0; i < columns.length; i++)
+    schema.fields[i].name: switch (columns[i][index]) {
+      final BigInt value when schema.fields[i].dataType == DataType.decimal =>
+        Decimal(value, schema.fields[i].scale ?? 0),
+      final value => value,
+    },
+};
 
 /// Default chunk size for vectorized processing
 const int defaultChunkSize = 2048;
 
 /// Represents a chunk of data for vectorized processing
 @immutable
-class DataChunk {
+final class DataChunk {
+  /// The columns, in [schema] order, all of [rowCount] rows.
   final List<Column> columns;
+
+  /// The fields describing [columns].
   final Schema schema;
+
+  /// The number of rows.
   final int rowCount;
 
   // Defensively wrap the caller's list (mirroring Table.columns) so a later
   // external mutation can't desync the cached rowCount / schema from the actual
-  // columns — this is an @immutable, exported type.
+  // columns; this is an @immutable, exported type.
+  /// A chunk of [columns] described by [schema]; validated as for [Table].
   DataChunk({required List<Column> columns, required this.schema})
     : columns = List.unmodifiable(columns),
       rowCount = columns.isEmpty ? 0 : columns.first.length {
@@ -25,18 +47,8 @@ class DataChunk {
   void _validate() => validateColumns(columns, schema);
 
   /// Create an empty chunk with the given schema
-  factory DataChunk.empty(Schema schema) {
-    final columns = schema.fields.map((field) {
-      return ListColumn(
-        name: field.name,
-        dataType: field.dataType,
-        data: [],
-        nullable: field.nullable,
-      );
-    }).toList();
-
-    return DataChunk(columns: columns, schema: schema);
-  }
+  factory DataChunk.empty(Schema schema) =>
+      DataChunk(columns: emptyColumns(schema), schema: schema);
 
   /// Create a chunk from row data
   factory DataChunk.fromRows(List<Map<String, dynamic>> rows, Schema schema) {
@@ -72,11 +84,7 @@ class DataChunk {
       throw RangeError('Row index $index out of range [0, $rowCount)');
     }
 
-    final row = <String, dynamic>{};
-    for (int i = 0; i < columns.length; i++) {
-      row[schema.fields[i].name] = columns[i][index];
-    }
-    return row;
+    return rowAt(schema, columns, index);
   }
 
   /// Convert chunk to list of rows
@@ -97,35 +105,22 @@ class DataChunk {
       );
     }
 
-    final slicedColumns = columns
-        .map((column) => column.slice(start, stop))
-        .toList();
-    return DataChunk(columns: slicedColumns, schema: schema);
+    final sliced = columns.map((column) => column.slice(start, stop)).toList();
+    return DataChunk(columns: sliced, schema: schema);
   }
 
   /// Filter chunk by indices
   DataChunk filter(List<int> indices) {
-    final filteredColumns = columns
-        .map((column) => column.filter(indices))
-        .toList();
-    return DataChunk(columns: filteredColumns, schema: schema);
+    final filtered = columns.map((column) => column.filter(indices)).toList();
+    return DataChunk(columns: filtered, schema: schema);
   }
 
   /// Select subset of columns
-  DataChunk select(List<String> columnNames) {
-    final schema = this.schema.select(columnNames);
-    final selectedColumns = <Column>[];
-
-    for (final name in columnNames) {
-      final column = this.column(name);
-      if (column == null) {
-        throw ArgumentError('Column not found: $name');
-      }
-      selectedColumns.add(column);
-    }
-
-    return DataChunk(columns: selectedColumns, schema: schema);
-  }
+  DataChunk select(List<String> names) => DataChunk(
+    // The schema first, so a missing name fails as it always has.
+    schema: schema.select(names),
+    columns: selectColumns(names, column),
+  );
 
   /// Append another chunk (must have same schema)
   DataChunk append(DataChunk other) {
@@ -136,7 +131,7 @@ class DataChunk {
     // Typed bulk concat (NumericColumn → setRange, no boxing; non-numeric falls
     // back to a boxed copy that preserves dtype) instead of materializing both
     // columns into boxed lists and rebuilding.
-    final combinedColumns = [
+    final combined = [
       for (int i = 0; i < columns.length; i++)
         Column.concat([columns[i], other.columns[i]]),
     ];
@@ -144,8 +139,8 @@ class DataChunk {
     // the DataChunk constructor's validation doesn't reject the promoted column
     // (mirrors Table.append).
     return DataChunk(
-      columns: combinedColumns,
-      schema: promotedSchema(schema, combinedColumns),
+      columns: combined,
+      schema: promotedSchema(schema, combined),
     );
   }
 
@@ -161,14 +156,14 @@ class DataChunk {
   bool get isNotEmpty => rowCount > 0;
 
   /// Split into smaller chunks
-  List<DataChunk> split(int chunkSize) {
-    if (chunkSize <= 0) {
+  List<DataChunk> split(int size) {
+    if (size <= 0) {
       throw ArgumentError('Chunk size must be positive');
     }
 
     final chunks = <DataChunk>[];
-    for (int start = 0; start < rowCount; start += chunkSize) {
-      final end = (start + chunkSize).clamp(0, rowCount);
+    for (int start = 0; start < rowCount; start += size) {
+      final end = (start + size).clamp(0, rowCount);
       chunks.add(slice(start, end));
     }
     return chunks;
@@ -186,8 +181,8 @@ class DataChunk {
       }
 
       buffer.writeln('Preview (first 5 rows):');
-      final previewRows = rowCount > 5 ? 5 : rowCount;
-      for (int i = 0; i < previewRows; i++) {
+      final shown = rowCount > 5 ? 5 : rowCount;
+      for (int i = 0; i < shown; i++) {
         buffer.write('  ');
         final row = this.row(i);
         buffer.writeln(row);
@@ -202,26 +197,33 @@ class DataChunk {
 }
 
 /// Iterator for processing data in chunks
-class ChunkIterator {
+final class ChunkIterator {
   final List<DataChunk> _chunks;
-  int _currentIndex = 0;
+  int _index = 0;
 
+  /// An iterator over the given chunks, positioned at the first.
   ChunkIterator(this._chunks);
 
-  bool get hasNext => _currentIndex < _chunks.length;
+  /// Whether [next] has a chunk to return.
+  bool get hasNext => _index < _chunks.length;
 
+  /// The next chunk, or null after the last.
   DataChunk? next() {
     if (!hasNext) return null;
-    return _chunks[_currentIndex++];
+    return _chunks[_index++];
   }
 
+  /// Go back to the first chunk.
   void reset() {
-    _currentIndex = 0;
+    _index = 0;
   }
 
+  /// The number of chunks.
   int get totalChunks => _chunks.length;
 
-  int get currentChunk => _currentIndex;
+  /// How many chunks [next] has returned since the start or the last [reset].
+  int get currentChunk => _index;
 
+  /// The number of rows across every chunk.
   int get totalRows => _chunks.fold(0, (sum, chunk) => sum + chunk.rowCount);
 }

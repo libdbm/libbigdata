@@ -9,11 +9,17 @@ import '../../core/schema.dart';
 import '../../core/data_type.dart';
 import '../exec/kernels.dart';
 import '../execution/engine_options.dart';
+import '../execution/memory_manager.dart';
 import '../planner/physical_plan.dart';
-import '../planner/logical_plan.dart' show SetOpType;
+import '../planner/logical_plan.dart' show JoinType, SetOpType, semiLike;
 import 'spill.dart';
+import '../../core/limits.dart';
+import '../../core/failure.dart';
+import '../../core/result.dart';
 
 part 'physical_aggregate.dart';
+part 'physical_join.dart';
 part 'physical_limit.dart';
+part 'physical_sample.dart';
 part 'physical_sort.dart';
 part 'physical_setop.dart';

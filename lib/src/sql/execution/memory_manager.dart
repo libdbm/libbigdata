@@ -9,23 +9,23 @@
 /// buffer and spills to disk when the global pool is exhausted, then [release]s
 /// when it spills/clears/closes.
 ///
-/// Reservation is advisory accounting (a counter), not an allocator — it never
+/// Reservation is advisory accounting (a counter), not an allocator; it never
 /// blocks; a denied [reserve] simply tells the caller to spill instead.
 ///
 /// CONTRACT: this class is isolate-private and synchronous. [reserve]/[release]
 /// do a plain read-modify-write of [_used] with no `await` in between, so on
-/// Dart's single event loop they can't interleave — no lock is needed. Do NOT
+/// Dart's single event loop they can't interleave: no lock is needed. Do NOT
 /// share one instance across isolates, and do NOT introduce an `await` inside the
 /// reserve/release critical section; either would require a real lock or serial
 /// queue to keep the counter consistent.
-class MemoryManager {
+base class MemoryManager {
   /// Total bytes operators may hold in memory at once across everything sharing
   /// this manager.
   final int budget;
 
   /// When true, an oversized-when-empty request is DENIED (a strict ceiling)
   /// rather than granted for progress. Safe because a denied [reserve] makes the
-  /// caller spill, not fail — but it does forfeit the deadlock-avoidance
+  /// caller spill, not fail, but it does forfeit the deadlock-avoidance
   /// guarantee for an indivisible unit larger than the whole budget, so it is
   /// opt-in. Default (`false`) keeps the advisory, progress-guaranteeing behavior.
   final bool hardCap;

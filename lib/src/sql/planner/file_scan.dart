@@ -1,8 +1,11 @@
 import 'dart:async';
 
+import '../../core/failure.dart';
+import '../../core/result.dart';
 import '../../core/schema.dart';
 import '../../core/table.dart';
 import '../../core/row_filter.dart';
+import '../../core/scan.dart';
 import '../../formats/scan.dart';
 import 'physical_plan.dart';
 
@@ -19,6 +22,10 @@ class PhysicalFileScan extends PhysicalPlan {
   final String? alias;
   final int batchSize;
 
+  /// Opens the scan of [path] with its reader's options; null opens
+  /// `openScan(path)`.
+  final Scan Function()? open;
+
   PhysicalFileScan({
     required this.path,
     required Schema schema,
@@ -26,6 +33,7 @@ class PhysicalFileScan extends PhysicalPlan {
     this.projection,
     this.alias,
     this.batchSize = defaultBatchSize,
+    this.open,
   }) : _schema = schema;
 
   @override
@@ -52,14 +60,23 @@ class _FileScanIterator extends RecordBatchIterator {
 
   @override
   Future<RecordBatch?> next() async {
+    await pause();
     _batches ??= StreamIterator(
-      openScan(_plan.path).batches(
+      (_plan.open?.call() ?? openScan(_plan.path)).batches(
         size: _plan.batchSize,
         projection: _plan.projection,
         filter: _plan.filter,
       ),
     );
-    if (!await _batches!.moveNext()) return null;
+    try {
+      if (!await _batches!.moveNext()) return null;
+    } on FormatException catch (e) {
+      throw Failure.of(
+        Kind.corrupt,
+        'Failed to read ${_plan.path}: ${e.message}',
+        e,
+      );
+    }
     final table = _batches!.current;
     // Assemble columns in the scan schema's field order (by base name), so
     // every format lines up with `schema` regardless of the reader's own

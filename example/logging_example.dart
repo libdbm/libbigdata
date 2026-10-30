@@ -1,5 +1,5 @@
 import 'dart:io';
-import 'package:logging/logging.dart';
+
 import 'package:libbigdata/libbigdata.dart';
 
 void main() async {
@@ -10,14 +10,15 @@ void main() async {
   final logger = LoggingConfig.getLogger('example');
   logger.info('Starting Parquet processing example');
 
-  // Example 2: Custom logging levels
+  // Example 2: Custom logging levels. Calling initialize again replaces the
+  // previous configuration.
   print('\n=== Custom Logging Levels ===');
   LoggingConfig.initialize(level: Level.FINE, enableColors: true);
 
-  final parquetLogger = LoggingConfig.getLogger(Loggers.parquet);
-  parquetLogger.fine('Processing Parquet metadata...');
-  parquetLogger.info('File parsed successfully');
-  parquetLogger.warning('Unknown encoding detected');
+  final deltaLogger = LoggingConfig.getLogger(Loggers.delta);
+  deltaLogger.fine('Reading the Delta log...');
+  deltaLogger.info('Commit published');
+  deltaLogger.warning('Commit conflict; retrying');
 
   // Example 3: File logging
   print('\n=== File Logging ===');
@@ -30,15 +31,18 @@ void main() async {
   testLogger.info('This message goes to both console and file');
   testLogger.severe('Error processing file', 'Simulated error');
 
-  // Example 4: Different logger categories
+  // Example 4: The library's loggers, all under Loggers.root, so one of them
+  // can be turned up on its own.
   print('\n=== Logger Categories ===');
   final dataframeLogger = LoggingConfig.getLogger(Loggers.dataframe);
-  final queryLogger = LoggingConfig.getLogger(Loggers.query);
-  final storageLogger = LoggingConfig.getLogger(Loggers.storage);
+  final sqlLogger = LoggingConfig.getLogger(Loggers.sql);
+  final jsonLogger = LoggingConfig.getLogger(Loggers.json);
 
+  Logger(Loggers.root).level = Level.INFO;
+  jsonLogger.level = Level.FINE;
   dataframeLogger.info('DataFrame operation started');
-  queryLogger.config('SQL query parsed');
-  storageLogger.fine('Reading from storage layer');
+  sqlLogger.config('Not shown: below the root level');
+  jsonLogger.fine('Shown: the json logger was turned up');
 
   // Example 5: Hierarchical logging
   print('\n=== Hierarchical Logging ===');

@@ -5,7 +5,10 @@ import 'dart:io';
 import 'package:libbigdata/libbigdata.dart';
 import 'package:libbigdata/src/sql/operators/spill.dart';
 import 'package:libbigdata/src/sql/planner/physical_plan.dart';
+import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
+
+import 'support/results.dart';
 
 /// Leaked `spill-*` files under [d] (recursive). Each SqlEngine now spills into
 /// a per-session subdir with a `.live` marker (expected infrastructure), so a
@@ -45,22 +48,22 @@ void main() {
       a = '${dir.path}/a.parquet';
       b = '${dir.path}/b.parquet';
       c = '${dir.path}/c.parquet';
-      await ParquetWriter(a).write(t([1, 2, 3], 'a'));
-      await ParquetWriter(b).write(t([2, 3, 4], 'b'));
-      await ParquetWriter(c).write(t([3, 4, 5], 'c'));
-      engine = SqlEngine(allowExternalPaths: true);
+      await ParquetWriter(a).write(t([1, 2, 3], 'a')).ok;
+      await ParquetWriter(b).write(t([2, 3, 4], 'b')).ok;
+      await ParquetWriter(c).write(t([3, 4, 5], 'c')).ok;
+      engine = SqlEngine.open(allowExternalPaths: true).ok;
     });
     tearDown(() => dir.deleteSync(recursive: true));
 
     Future<List<Map<String, dynamic>>> rows(String sql) async =>
-        (await engine.execute(sql)).toRows();
+        (await engine.execute(sql).ok).toRows();
 
     group('SKIP file-read error typing (finding 11)', skip: true, () {});
     group('_unused', () {
       test('a missing file surfaces FileSystemException', () async {
         await expectLater(
           engine.execute("SELECT * FROM '${dir.path}/missing.parquet'"),
-          throwsA(isA<FileSystemException>()),
+          failsWith(Kind.missing),
         );
       });
 
@@ -69,16 +72,18 @@ void main() {
         await File(bad).writeAsBytes(List.filled(64, 0x00));
         await expectLater(
           engine.execute("SELECT * FROM '$bad'"),
-          throwsA(isA<FormatException>()),
+          failsWith(Kind.corrupt),
         );
       });
     });
 
     group('JOIN over file paths (#multi-file FROM)', () {
       test('qualified columns from both sides resolve correctly', () async {
-        final r = await engine.execute(
-          "SELECT a.name, b.name FROM '$a' a JOIN '$b' b ON a.id = b.id",
-        );
+        final r = await engine
+            .execute(
+              "SELECT a.name, b.name FROM '$a' a JOIN '$b' b ON a.id = b.id",
+            )
+            .ok;
         expect(r.schema.fieldNames, ['a.name', 'b.name']);
         expect(r.toRows(), [
           {'a.name': 'a2', 'b.name': 'b2'},
@@ -87,9 +92,9 @@ void main() {
       });
 
       test('SELECT * keeps both ON keys and qualifies collisions', () async {
-        final r = await engine.execute(
-          "SELECT * FROM '$a' a JOIN '$b' b ON a.id = b.id",
-        );
+        final r = await engine
+            .execute("SELECT * FROM '$a' a JOIN '$b' b ON a.id = b.id")
+            .ok;
         expect(r.schema.fieldNames, ['a.id', 'a.name', 'b.id', 'b.name']);
         expect(r.rowCount, 2);
       });
@@ -116,7 +121,7 @@ void main() {
       test('a bare ambiguous column throws', () {
         expect(
           engine.execute("SELECT name FROM '$a' a JOIN '$b' b ON a.id=b.id"),
-          throwsA(isA<StateError>()),
+          failsWith(Kind.invalid),
         );
       });
 
@@ -156,14 +161,16 @@ void main() {
           final d2 = Directory('${dir.path}/d2')..createSync();
           await ParquetWriter(
             '${d1.path}/data.parquet',
-          ).write(t([1, 2, 3], 'x'));
+          ).write(t([1, 2, 3], 'x')).ok;
           await ParquetWriter(
             '${d2.path}/data.parquet',
-          ).write(t([2, 3, 4], 'y'));
-          final r = await engine.execute(
-            "SELECT p.name, q.name FROM '${d1.path}/data.parquet' p "
-            "JOIN '${d2.path}/data.parquet' q ON p.id = q.id",
-          );
+          ).write(t([2, 3, 4], 'y')).ok;
+          final r = await engine
+              .execute(
+                "SELECT p.name, q.name FROM '${d1.path}/data.parquet' p "
+                "JOIN '${d2.path}/data.parquet' q ON p.id = q.id",
+              )
+              .ok;
           expect(r.schema.fieldNames, ['p.name', 'q.name']);
           expect(r.toRows(), [
             {'p.name': 'x2', 'q.name': 'y2'},
@@ -173,9 +180,9 @@ void main() {
       );
 
       test('USING (id) yields a single key column', () async {
-        final r = await engine.execute(
-          "SELECT * FROM '$a' a JOIN '$b' b USING (id)",
-        );
+        final r = await engine
+            .execute("SELECT * FROM '$a' a JOIN '$b' b USING (id)")
+            .ok;
         expect(r.schema.fieldNames.where((n) => n == 'id').length, 1);
         expect(r.rowCount, 2);
       });
@@ -183,7 +190,7 @@ void main() {
 
     group('comma cross-join (#multi-file FROM)', () {
       test('comma FROM is a cartesian product', () async {
-        final r = await engine.execute("SELECT * FROM '$a', '$b'");
+        final r = await engine.execute("SELECT * FROM '$a', '$b'").ok;
         expect(r.rowCount, 9);
         expect(r.schema.fieldNames, ['a.id', 'a.name', 'b.id', 'b.name']);
       });
@@ -201,7 +208,7 @@ void main() {
 
     group('regression: single-table queries unchanged', () {
       test('single file SELECT * keeps bare names', () async {
-        final r = await engine.execute("SELECT * FROM '$a'");
+        final r = await engine.execute("SELECT * FROM '$a'").ok;
         expect(r.schema.fieldNames, ['id', 'name']);
         expect(r.rowCount, 3);
       });
@@ -268,14 +275,19 @@ void main() {
 
         Future<List<List<Object?>>> run(String type, int budget) async {
           final e = budget == 0
-              ? SqlEngine(spillThresholdBytes: 0)
-              : SqlEngine(spillThresholdBytes: budget, spillDir: dir.path);
+              ? SqlEngine.open(spillThresholdBytes: 0).ok
+              : SqlEngine.open(
+                  spillThresholdBytes: budget,
+                  spillDir: dir.path,
+                ).ok;
           e.registerTable('l', left);
           e.registerTable('r', right);
-          final t = await e.execute(
-            'SELECT l.k AS lk, l.v AS lv, r.v AS rv '
-            'FROM l $type JOIN r ON l.k = r.k',
-          );
+          final t = await e
+              .execute(
+                'SELECT l.k AS lk, l.v AS lv, r.v AS rv '
+                'FROM l $type JOIN r ON l.k = r.k',
+              )
+              .ok;
           final rows = t
               .toRows()
               .map((r) => [r['lk'], r['lv'], r['rv']])
@@ -299,11 +311,97 @@ void main() {
     );
   });
 
+  group('join build side', () {
+    // small (3 rows) JOIN big (2000 rows) builds on small, the left side; the
+    // output must still be left columns then right, with the shared key once.
+    late SqlEngine engine;
+
+    Table big() => Table.fromRows('big', [
+      for (var i = 0; i < 2000; i++) {'k': i ~/ 2, 'v': i},
+    ]);
+
+    setUp(() {
+      engine = SqlEngine.open().ok;
+      engine.registerTable(
+        'small',
+        Table.fromRows('small', [
+          for (final k in [5, 7, 4000]) {'k': k, 'a': 'a$k'},
+        ]),
+      );
+      engine.registerTable('big', big());
+    });
+
+    tearDown(() => engine.dispose());
+
+    List<List<Object?>> sorted(Table table) {
+      final rows = [
+        for (final row in table.toRows()) [...row.values],
+      ];
+      rows.sort((x, y) => x.toString().compareTo(y.toString()));
+      return rows;
+    }
+
+    test('ON keeps every column in order', () async {
+      final table = await engine
+          .execute('SELECT * FROM small s JOIN big b ON s.k = b.k')
+          .ok;
+      expect(table.schema.fields.map((f) => f.name), ['s.k', 'a', 'b.k', 'v']);
+      expect(sorted(table), [
+        [5, 'a5', 5, 10],
+        [5, 'a5', 5, 11],
+        [7, 'a7', 7, 14],
+        [7, 'a7', 7, 15],
+      ]);
+    });
+
+    test('USING keeps the key once, from the left', () async {
+      final table = await engine
+          .execute('SELECT * FROM small JOIN big USING (k)')
+          .ok;
+      expect(table.schema.fields.map((f) => f.name), ['k', 'a', 'v']);
+      expect(sorted(table), [
+        [5, 'a5', 10],
+        [5, 'a5', 11],
+        [7, 'a7', 14],
+        [7, 'a7', 15],
+      ]);
+    });
+
+    test('a left side too large to build on is probed instead', () async {
+      // 400 left rows estimated smaller than 2000 right rows, but past a 1 KiB
+      // threshold: the rows read while building are replayed as the probe
+      // side of the usual (spilling) right-side build.
+      final dir = Directory.systemTemp.createTempSync('buildside_');
+      addTearDown(() => dir.deleteSync(recursive: true));
+      final mid = Table.fromRows('mid', [
+        for (var i = 0; i < 400; i++) {'k': i * 3, 'a': 'a$i'},
+      ]);
+      Future<List<List<Object?>>> run(SqlEngine e) async {
+        e.registerTable('mid', mid);
+        e.registerTable('big', big());
+        return sorted(
+          await e.execute('SELECT * FROM mid m JOIN big b ON m.k = b.k').ok,
+        );
+      }
+
+      final memory = SqlEngine.open(spillThresholdBytes: 0).ok;
+      final spilling = SqlEngine.open(
+        spillThresholdBytes: 1024,
+        spillDir: dir.path,
+      ).ok;
+      addTearDown(memory.dispose);
+      addTearDown(spilling.dispose);
+      final expected = await run(memory);
+      expect(expected, hasLength(668));
+      expect(await run(spilling), expected);
+    });
+  });
+
   group('multi-key joins', () {
     late SqlEngine engine;
 
     setUp(() {
-      engine = SqlEngine();
+      engine = SqlEngine.open().ok;
       engine.registerTable(
         'o',
         Table.fromRows('o', [
@@ -327,9 +425,9 @@ void main() {
     test('an ANDed ON matches on the composite key', () async {
       // Only (1,10) and (2,10) exist on both sides; (1,20) and (1,99) must not
       // cross-match on a single column.
-      final r = await engine.execute(
-        'SELECT o.v, p.w FROM o JOIN p ON o.a = p.a AND o.b = p.b',
-      );
+      final r = await engine
+          .execute('SELECT o.v, p.w FROM o JOIN p ON o.a = p.a AND o.b = p.b')
+          .ok;
       expect(r.toRows(), [
         {'v': 'x', 'w': 'P'},
         {'v': 'z', 'w': 'Q'},
@@ -337,9 +435,9 @@ void main() {
     });
 
     test('a reversed ANDed ON binds each key to its own side', () async {
-      final r = await engine.execute(
-        'SELECT o.v FROM o JOIN p ON p.a = o.a AND p.b = o.b',
-      );
+      final r = await engine
+          .execute('SELECT o.v FROM o JOIN p ON p.a = o.a AND p.b = o.b')
+          .ok;
       expect(r.toRows(), [
         {'v': 'x'},
         {'v': 'z'},
@@ -347,7 +445,7 @@ void main() {
     });
 
     test('multi-column USING coalesces the shared keys', () async {
-      final r = await engine.execute('SELECT * FROM o JOIN p USING (a, b)');
+      final r = await engine.execute('SELECT * FROM o JOIN p USING (a, b)').ok;
       expect(r.schema.fieldNames, ['a', 'b', 'v', 'w']);
       expect(r.toRows(), [
         {'a': 1, 'b': 10, 'v': 'x', 'w': 'P'},
@@ -356,10 +454,12 @@ void main() {
     });
 
     test('a LEFT join on a composite key nulls the unmatched side', () async {
-      final r = await engine.execute(
-        'SELECT o.v, p.w FROM o LEFT JOIN p ON o.a = p.a AND o.b = p.b '
-        'ORDER BY o.v',
-      );
+      final r = await engine
+          .execute(
+            'SELECT o.v, p.w FROM o LEFT JOIN p ON o.a = p.a AND o.b = p.b '
+            'ORDER BY o.v',
+          )
+          .ok;
       expect(r.toRows(), [
         {'v': 'x', 'w': 'P'},
         {'v': 'y', 'w': null},
@@ -370,7 +470,7 @@ void main() {
     test('a composite-key join survives a spill', () async {
       // A tiny positive threshold forces grace partitioning; 0 would DISABLE
       // spilling (`spills` is `spillThresholdBytes > 0`).
-      final spilling = SqlEngine(spillThresholdBytes: 256);
+      final spilling = SqlEngine.open(spillThresholdBytes: 256).ok;
       try {
         spilling.registerTable(
           'o',
@@ -384,9 +484,11 @@ void main() {
             for (int i = 0; i < 500; i++) {'a': i, 'b': i % 7, 'w': 'w$i'},
           ]),
         );
-        final r = await spilling.execute(
-          'SELECT COUNT(*) AS n FROM o JOIN p ON o.a = p.a AND o.b = p.b',
-        );
+        final r = await spilling
+            .execute(
+              'SELECT COUNT(*) AS n FROM o JOIN p ON o.a = p.a AND o.b = p.b',
+            )
+            .ok;
         expect(r.toRows(), [
           {'n': 500},
         ]);
@@ -398,7 +500,7 @@ void main() {
     test('a non-equi join condition fails loud', () async {
       await expectLater(
         engine.execute('SELECT * FROM o JOIN p ON o.a = p.a AND o.b > p.b'),
-        throwsA(isA<UnsupportedError>()),
+        failsWith(Kind.unsupported),
       );
     });
   });
@@ -407,7 +509,7 @@ void main() {
     // A decimal column stores an UNSCALED BigInt with its scale on the Field, so
     // the SAME value has a different BigInt per scale: 1.5 is 15@scale1 but
     // 150@scale2. Joining on the raw BigInt therefore both MISSED equal values
-    // and MATCHED unequal ones — 2.5@scale1 and 0.25@scale2 are both BigInt(25),
+    // and MATCHED unequal ones: 2.5@scale1 and 0.25@scale2 are both BigInt(25),
     // a false match the join silently emitted.
     Table decimals(String name, List<int> unscaled, int scale) => Table(
       name: name,
@@ -435,7 +537,7 @@ void main() {
     late SqlEngine engine;
 
     setUp(() {
-      engine = SqlEngine();
+      engine = SqlEngine.open().ok;
       // t: 1.5, 2.5 (scale 1)   u: 1.50, 0.25 (scale 2)
       // The only true match is 1.5 = 1.50.
       engine.registerTable('t', decimals('t', [15, 25], 1));
@@ -445,7 +547,9 @@ void main() {
     tearDown(() => engine.dispose());
 
     test('a decimal join matches by VALUE across differing scales', () async {
-      final r = await engine.execute('SELECT t.d FROM t JOIN u ON t.d = u.d');
+      final r = await engine
+          .execute('SELECT t.d FROM t JOIN u ON t.d = u.d')
+          .ok;
       expect(r.rowCount, 1);
       expect(r.toRows(), [
         {'d': Decimal(BigInt.from(15), 1)},
@@ -482,11 +586,11 @@ void main() {
           ],
         ),
       );
-      final e = SqlEngine();
+      final e = SqlEngine.open().ok;
       e.registerTable('w', w);
       // Only row 0 (d == i) matches. The lossy double path rounds 2^53+1 to
       // 2^53 and would return NO match (false negative).
-      final r = await e.execute('SELECT d FROM w WHERE d = i');
+      final r = await e.execute('SELECT d FROM w WHERE d = i').ok;
       await e.dispose();
       expect(r.rowCount, 1);
       expect(r.toRows(), [
@@ -497,11 +601,11 @@ void main() {
     test(
       'a decimal join does not match unequal values sharing a BigInt',
       () async {
-        // 2.5 (25@1) must NOT match 0.25 (25@2) — the false-positive direction,
+        // 2.5 (25@1) must NOT match 0.25 (25@2): the false-positive direction,
         // which an ANTI join would turn into an emitted row that should be gone.
-        final r = await engine.execute(
-          "SELECT t.d FROM t JOIN u ON t.d = u.d WHERE t.d > 2",
-        );
+        final r = await engine
+            .execute("SELECT t.d FROM t JOIN u ON t.d = u.d WHERE t.d > 2")
+            .ok;
         expect(r.rowCount, 0);
       },
     );
@@ -511,13 +615,13 @@ void main() {
       // canonicalize identically, or equal values land in different partitions
       // and are never compared at all. A tiny positive threshold forces it (0
       // would DISABLE spilling).
-      final spilling = SqlEngine(spillThresholdBytes: 256);
+      final spilling = SqlEngine.open(spillThresholdBytes: 256).ok;
       try {
         spilling.registerTable('t', decimals('t', [15, 25], 1));
         spilling.registerTable('u', decimals('u', [150, 25], 2));
-        final r = await spilling.execute(
-          'SELECT t.d FROM t JOIN u ON t.d = u.d',
-        );
+        final r = await spilling
+            .execute('SELECT t.d FROM t JOIN u ON t.d = u.d')
+            .ok;
         expect(r.rowCount, 1);
         expect(r.toRows(), [
           {'d': Decimal(BigInt.from(15), 1)},
@@ -560,7 +664,7 @@ void main() {
     );
 
     late SqlEngine engine;
-    setUp(() => engine = SqlEngine());
+    setUp(() => engine = SqlEngine.open().ok);
     tearDown(() => engine.dispose());
 
     test(
@@ -568,7 +672,9 @@ void main() {
       () async {
         engine.registerTable('a', ints('a', [5, 6]));
         engine.registerTable('b', decs('b', [500], 2)); // 5.00
-        final r = await engine.execute('SELECT a.d FROM a JOIN b ON a.d = b.d');
+        final r = await engine
+            .execute('SELECT a.d FROM a JOIN b ON a.d = b.d')
+            .ok;
         expect(r.rowCount, 1);
         expect(r.toRows(), [
           {'d': 5},
@@ -581,7 +687,9 @@ void main() {
       () async {
         engine.registerTable('a', ints('a', [5]));
         engine.registerTable('b', decs('b', [5], 2)); // 0.05, not 5
-        final r = await engine.execute('SELECT a.d FROM a JOIN b ON a.d = b.d');
+        final r = await engine
+            .execute('SELECT a.d FROM a JOIN b ON a.d = b.d')
+            .ok;
         expect(r.rowCount, 0);
       },
     );
@@ -591,7 +699,9 @@ void main() {
       () async {
         engine.registerTable('i', ints('i', [5]));
         engine.registerTable('d', decs('d', [5], 2)); // 0.05
-        final r = await engine.execute('SELECT d FROM i UNION SELECT d FROM d');
+        final r = await engine
+            .execute('SELECT d FROM i UNION SELECT d FROM d')
+            .ok;
         expect(r.rowCount, 2);
         expect(r.toRows().map((e) => e['d']).toSet(), {
           Decimal(BigInt.from(500), 2),
@@ -603,7 +713,9 @@ void main() {
     test('int UNION decimal dedups an equal value to one row', () async {
       engine.registerTable('i', ints('i', [5]));
       engine.registerTable('d', decs('d', [500], 2)); // 5.00
-      final r = await engine.execute('SELECT d FROM i UNION SELECT d FROM d');
+      final r = await engine
+          .execute('SELECT d FROM i UNION SELECT d FROM d')
+          .ok;
       expect(r.rowCount, 1);
       expect(r.toRows(), [
         {'d': Decimal(BigInt.from(500), 2)},
@@ -647,7 +759,7 @@ void main() {
         );
         await expectLater(
           engine.execute('SELECT x FROM i UNION SELECT x FROM f'),
-          throwsA(isA<ArgumentError>()),
+          failsWith(Kind.invalid),
         );
       },
     );
@@ -663,7 +775,7 @@ void main() {
       ),
     );
     setUp(() {
-      engine = SqlEngine();
+      engine = SqlEngine.open().ok;
       engine.registerTable('a', ints('a', [1, 2, 3]));
       engine.registerTable('b', ints('b', [1]));
       engine.registerTable('c', ints('c', [2]));
@@ -699,9 +811,9 @@ void main() {
     tearDown(() => engine.dispose());
 
     Future<List> ns(String sql) async =>
-        (await engine.execute(sql)).toRows().map((r) => r['n']).toList();
+        (await engine.execute(sql).ok).toRows().map((r) => r['n']).toList();
     Future<List> ids(String sql) async =>
-        (await engine.execute(sql)).toRows().map((r) => r['id']).toList();
+        (await engine.execute(sql).ok).toRows().map((r) => r['id']).toList();
 
     test('EXCEPT chains are left-associative', () async {
       // (a EXCEPT b) EXCEPT c = {3}, not a EXCEPT (b EXCEPT c) = {2,3}.
@@ -781,22 +893,24 @@ void main() {
         1,
         3,
       ]);
-      // Defaults (Postgres/DuckDB): NULLS LAST for ASC, NULLS FIRST for DESC.
+      // Default (DuckDB): NULLS LAST in both directions.
       expect(await ids('SELECT id FROM t ORDER BY amt'), [3, 1, 2]);
-      expect(await ids('SELECT id FROM t ORDER BY amt DESC'), [2, 1, 3]);
+      expect(await ids('SELECT id FROM t ORDER BY amt DESC'), [1, 3, 2]);
     });
 
     test('two unaliased computed columns get distinct names', () async {
-      final r = await engine.execute('SELECT n + 1, n * 10 FROM a');
+      final r = await engine.execute('SELECT n + 1, n * 10 FROM a').ok;
       expect(r.schema.fieldNames.toSet().length, 2);
     });
 
     test(
       'COALESCE into a string renders non-string branches to string',
       () async {
-        final r = await engine.execute(
-          "SELECT COALESCE(CAST(amt AS VARCHAR), 'none') AS r FROM t",
-        );
+        final r = await engine
+            .execute(
+              "SELECT COALESCE(CAST(amt AS VARCHAR), 'none') AS r FROM t",
+            )
+            .ok;
         expect(r.schema.field('r')!.dataType, DataType.string);
         expect(r.toRows().every((e) => e['r'] is String), isTrue);
       },
@@ -827,7 +941,7 @@ void main() {
     );
 
     // A probe table mixing rows that match the hot key (0), a non-matching key
-    // (5, absent from the single-key build), and null keys — to exercise both the
+    // (5, absent from the single-key build), and null keys, to exercise both the
     // matched path and the unmatched-left pass of the block-nested-loop fallback.
     Table probe() => Table(
       name: 't',
@@ -863,14 +977,19 @@ void main() {
 
       Future<List<List<Object?>>> run(String type, int budget) async {
         final e = budget == 0
-            ? SqlEngine(spillThresholdBytes: 0)
-            : SqlEngine(spillThresholdBytes: budget, spillDir: dir.path);
+            ? SqlEngine.open(spillThresholdBytes: 0).ok
+            : SqlEngine.open(
+                spillThresholdBytes: budget,
+                spillDir: dir.path,
+              ).ok;
         e.registerTable('l', left);
         e.registerTable('r', right);
-        final t = await e.execute(
-          'SELECT l.k AS lk, l.v AS lv, r.v AS rv '
-          'FROM l $type JOIN r ON l.k = r.k',
-        );
+        final t = await e
+            .execute(
+              'SELECT l.k AS lk, l.v AS lv, r.v AS rv '
+              'FROM l $type JOIN r ON l.k = r.k',
+            )
+            .ok;
         // Row order differs (BNL groups by build block), so sort before compare.
         final rows = t
             .toRows()
@@ -912,17 +1031,22 @@ void main() {
           // pairs into a COUNT, so opt out of the service-safe caps (incl. the
           // new equi-join maxOutputRows guard) that would otherwise reject it.
           final e = budget == 0
-              ? SqlEngine(spillThresholdBytes: 0, unbounded: true)
-              : SqlEngine(
+              ? SqlEngine.open(spillThresholdBytes: 0, unbounded: true).ok
+              : SqlEngine.open(
                   spillThresholdBytes: budget,
                   spillDir: dir.path,
                   unbounded: true,
-                );
+                ).ok;
           e.registerTable('l', left);
           e.registerTable('r', right);
-          return (await e.execute(
-                'SELECT COUNT(*) AS n FROM l JOIN r ON l.k = r.k',
-              )).column('n')!.toList().first
+          return (await e
+                      .execute(
+                        'SELECT COUNT(*) AS n FROM l JOIN r ON l.k = r.k',
+                      )
+                      .ok)
+                  .column('n')!
+                  .toList()
+                  .first
               as int;
         }
 
@@ -1011,11 +1135,14 @@ void main() {
 
     Future<List<String>> run(int budget, String sql) async {
       final engine = budget == 0
-          ? SqlEngine(spillThresholdBytes: 0)
-          : SqlEngine(spillThresholdBytes: budget, spillDir: spillDir.path);
+          ? SqlEngine.open(spillThresholdBytes: 0).ok
+          : SqlEngine.open(
+              spillThresholdBytes: budget,
+              spillDir: spillDir.path,
+            ).ok;
       engine.registerTable('l', left(ln));
       engine.registerTable('r', right(rn));
-      final rows = (await engine.execute(sql)).toRows();
+      final rows = (await engine.execute(sql).ok).toRows();
       return rows.map((r) => r.toString()).toList()..sort();
     }
 
@@ -1063,20 +1190,20 @@ void main() {
       List<String> sorted(Table t) =>
           t.toRows().map((r) => r.toString()).toList()..sort();
 
-      final mem = SqlEngine(spillThresholdBytes: 0)
+      final mem = SqlEngine.open(spillThresholdBytes: 0).ok
         ..registerTable('l', left(ln))
         ..registerTable('d', dim());
       final spill =
-          SqlEngine(spillThresholdBytes: 2048, spillDir: spillDir.path)
+          SqlEngine.open(spillThresholdBytes: 2048, spillDir: spillDir.path).ok
             ..registerTable('l', left(ln))
             ..registerTable('d', dim());
       const sql = 'SELECT * FROM l JOIN d USING (k)';
-      final memRows = sorted(await mem.execute(sql));
-      final spillRows = sorted(await spill.execute(sql));
+      final memRows = sorted(await mem.execute(sql).ok);
+      final spillRows = sorted(await spill.execute(sql).ok);
       expect(
-        (await spill.execute(
-          sql,
-        )).schema.fieldNames.where((n) => n == 'k').length,
+        (await spill.execute(sql).ok).schema.fieldNames
+            .where((n) => n == 'k')
+            .length,
         1,
       );
       expect(spillRows, memRows);
@@ -1091,15 +1218,15 @@ void main() {
     );
 
     test('spill files are cleaned up after the query', () async {
-      final engine = SqlEngine(
+      final engine = SqlEngine.open(
         spillThresholdBytes: 2048,
         spillDir: spillDir.path,
-      );
+      ).ok;
       engine.registerTable('l', left(ln));
       engine.registerTable('r', right(rn));
-      await engine.execute(
-        'SELECT l.id, r.rv FROM l FULL JOIN r ON l.k = r.rk',
-      );
+      await engine
+          .execute('SELECT l.id, r.rv FROM l FULL JOIN r ON l.k = r.rk')
+          .ok;
       final leftover = spillDir
           .listSync()
           .where((f) => f.path.contains('spill-'))
@@ -1108,15 +1235,15 @@ void main() {
     });
 
     test('CROSS JOIN stays correct (in-memory path)', () async {
-      final engine = SqlEngine(
+      final engine = SqlEngine.open(
         spillThresholdBytes: 2048,
         spillDir: spillDir.path,
-      );
+      ).ok;
       engine.registerTable('l', left(50));
       engine.registerTable('r', right(40));
-      final r = await engine.execute(
-        'SELECT COUNT(*) AS n FROM l CROSS JOIN r',
-      );
+      final r = await engine
+          .execute('SELECT COUNT(*) AS n FROM l CROSS JOIN r')
+          .ok;
       expect(r.column('n')!.toList().first, 50 * 40);
     });
   });
@@ -1143,11 +1270,14 @@ void main() {
 
       Future<List<Map<String, dynamic>>> go(int budget) async {
         final e = budget == 0
-            ? SqlEngine(spillThresholdBytes: 0)
-            : SqlEngine(spillThresholdBytes: budget, spillDir: spillDir.path);
+            ? SqlEngine.open(spillThresholdBytes: 0).ok
+            : SqlEngine.open(
+                spillThresholdBytes: budget,
+                spillDir: spillDir.path,
+              ).ok;
         e.registerTable('l', t('l', 'x', left, 0));
         e.registerTable('r', t('r', 'y', right, 1000));
-        return (await e.execute('SELECT x, y FROM l CROSS JOIN r')).toRows();
+        return (await e.execute('SELECT x, y FROM l CROSS JOIN r').ok).toRows();
       }
 
       final memory = await go(0);
@@ -1161,21 +1291,219 @@ void main() {
     });
 
     test('CROSS JOIN still honors maxOutputRows under spill', () async {
-      final e = SqlEngine(
+      final e = SqlEngine.open(
         spillThresholdBytes: 2048,
         spillDir: spillDir.path,
         maxOutputRows: 100,
-      );
+      ).ok;
       e.registerTable('l', t('l', 'x', 20, 0));
       e.registerTable('r', t('r', 'y', 4000, 1000));
       await expectLater(
         e.execute('SELECT x, y FROM l CROSS JOIN r'),
-        throwsA(isA<StateError>()),
+        failsWith(Kind.limit),
       );
     });
   });
 
   group('set operations', () {
+    group('chains', () {
+      late SqlEngine engine;
+      setUp(() {
+        engine = SqlEngine.open().ok;
+        Table table(String name, List<int> values) => Table.fromRows(name, [
+          for (final v in values) {'v': v},
+        ]);
+        engine.registerTable('a', table('a', [1, 1, 2, 3]));
+        engine.registerTable('b', table('b', [2, 3, 3, 4]));
+        engine.registerTable('c', table('c', [3, 5, 5]));
+        engine.registerTable('d', table('d', [1, 6, 6]));
+        engine.registerTable(
+          'n',
+          Table.fromRows('n', [
+            {'i': 7, 'f': 1.5},
+          ]),
+        );
+      });
+      tearDown(() => engine.dispose());
+
+      Future<List<Object?>> sorted(String query) async {
+        final table = await engine.execute(query).ok;
+        return [for (final row in table.toRows()) row['v']]
+          ..sort((x, y) => (x as int).compareTo(y as int));
+      }
+
+      test('mixed chains match DuckDB', () async {
+        const a = 'SELECT v FROM a', b = 'SELECT v FROM b';
+        const c = 'SELECT v FROM c', d = 'SELECT v FROM d';
+        final expected = {
+          '$a UNION ALL $b UNION $c UNION ALL $d': [1, 1, 2, 3, 4, 5, 6, 6],
+          '$a UNION $b UNION ALL $c': [1, 2, 3, 3, 4, 5, 5],
+          '$a UNION ALL $b EXCEPT $c UNION ALL $d': [1, 1, 2, 4, 6, 6],
+          '$a INTERSECT $b UNION ALL $c': [2, 3, 3, 5, 5],
+          '$a UNION ALL $b INTERSECT $c UNION $d': [1, 2, 3, 6],
+          '$a UNION ALL $b UNION ALL $c UNION ALL $d': [
+            1, 1, 1, 2, 2, 3, 3, 3, 3, 4, 5, 5, 6, 6, //
+          ],
+          '$a UNION $b UNION $c UNION $d': [1, 2, 3, 4, 5, 6],
+        };
+        for (final MapEntry(:key, :value) in expected.entries) {
+          expect(await sorted(key), value, reason: key);
+        }
+      });
+
+      test('branch types reconcile across the whole chain', () async {
+        Future<void> check(
+          String query,
+          String type,
+          List<Object?> values,
+        ) async {
+          final table = await engine.execute(query).ok;
+          final field = table.schema.fields.single;
+          expect(
+            '${field.dataType.name}(${field.precision},${field.scale})',
+            type,
+            reason: query,
+          );
+          expect(
+            [for (final row in table.toRows()) row.values.single],
+            values,
+            reason: query,
+          );
+        }
+
+        Decimal decimal(int unscaled, int scale) =>
+            Decimal(BigInt.from(unscaled), scale);
+        await check(
+          'SELECT 1 AS x UNION ALL SELECT 2.5 UNION ALL SELECT i FROM n',
+          'decimal(4,1)',
+          [decimal(10, 1), decimal(25, 1), decimal(70, 1)],
+        );
+        await check(
+          'SELECT CAST(1 AS INTEGER) AS x UNION ALL SELECT i FROM n '
+              'UNION ALL SELECT 1.25',
+          'decimal(12,2)',
+          [decimal(100, 2), decimal(700, 2), decimal(125, 2)],
+        );
+        await check(
+          'SELECT f AS x FROM n UNION ALL SELECT i FROM n UNION SELECT 3',
+          'float64(null,null)',
+          [1.5, 7.0, 3.0],
+        );
+      });
+
+      test('thousands of branches neither recurse nor crash', () async {
+        for (final count in [1000, 5000]) {
+          final all = List.filled(count, 'SELECT v FROM c').join(' UNION ALL ');
+          final rows = await engine.execute(
+            'SELECT COUNT(*) AS n FROM ($all) u',
+          );
+          expect(rows.ok.toRows().single['n'], count * 3, reason: '$count');
+          final distinct = List.filled(
+            count,
+            'SELECT v FROM c',
+          ).join(' UNION ');
+          expect(await sorted(distinct), [3, 5], reason: '$count');
+        }
+      });
+    });
+
+    group('depth limits', () {
+      late SqlEngine engine;
+      setUp(() {
+        engine = SqlEngine.open().ok;
+        engine.registerTable(
+          'c',
+          Table.fromRows('c', [
+            {'v': 3},
+          ]),
+        );
+      });
+      tearDown(() => engine.dispose());
+
+      String sum(int terms) => List.filled(terms, '1').join(' + ');
+
+      test(
+        'an expression at the depth limit runs; one deeper is invalid',
+        () async {
+          final at = await engine.execute('SELECT ${sum(4096)} AS x').ok;
+          expect(at.toRows().single['x'], 4096);
+          await expectLater(
+            engine.execute('SELECT ${sum(4097)} AS x'),
+            failsWith(Kind.invalid, contains('4096')),
+          );
+          final and = List.filled(4097, 'v = 3').join(' AND ');
+          await expectLater(
+            engine.execute('SELECT v FROM c WHERE $and'),
+            failsWith(Kind.invalid, contains('4096')),
+          );
+        },
+      );
+
+      test('nested chains count toward one depth', () async {
+        // Neither chain reaches the limit alone; nested, the tree is deeper.
+        await expectLater(
+          engine.execute('SELECT (${sum(3000)}) * 1 + ${sum(1500)} AS x'),
+          failsWith(Kind.invalid, contains('4096')),
+        );
+      });
+
+      test(
+        'EXCEPT and INTERSECT chains are limited to 2048 branches',
+        () async {
+          for (final keyword in ['EXCEPT', 'INTERSECT']) {
+            String chain(int branches) =>
+                List.filled(branches, 'SELECT v FROM c').join(' $keyword ');
+            final at = await engine.execute(chain(2048)).ok;
+            expect(at.rowCount, keyword == 'EXCEPT' ? 0 : 1, reason: keyword);
+            await expectLater(
+              engine.execute(chain(2049)),
+              failsWith(Kind.invalid, contains('2048')),
+              reason: keyword,
+            );
+          }
+        },
+      );
+    });
+
+    test('a set operation branch reads its own file', () async {
+      final dir = Directory.systemTemp.createTempSync('setop_file_');
+      final engine = SqlEngine.open(
+        spillDir: dir.path,
+        allowExternalPaths: true,
+      ).ok;
+      addTearDown(() async {
+        await engine.dispose();
+        dir.deleteSync(recursive: true);
+      });
+      Table single(List<int> values) => Table(
+        name: 't',
+        schema: Schema(
+          fields: [Field(name: 'id', dataType: DataType.int64)],
+        ),
+        columns: [
+          NumericColumn.int64(name: 'id', values: values, nullable: false),
+        ],
+      );
+      engine.registerTable('t', single([1, 2]));
+      final path = '${dir.path}/f.parquet';
+      await ParquetWriter(path).write(single([3, 4, 5])).ok;
+      final union = await engine
+          .execute(
+            "SELECT id FROM t UNION ALL SELECT id FROM '$path' ORDER BY id",
+          )
+          .ok;
+      expect(union.column('id')!.toList(), [1, 2, 3, 4, 5]);
+      // A file in a branch's IN subquery is registered too.
+      await ParquetWriter('${dir.path}/g.parquet').write(single([4])).ok;
+      final except = await engine
+          .execute(
+            "SELECT id FROM '$path' EXCEPT SELECT id FROM t WHERE id IN "
+            "(SELECT id FROM '${dir.path}/g.parquet') ORDER BY id",
+          )
+          .ok;
+      expect(except.column('id')!.toList(), [3, 4, 5]);
+    });
+
     /// Data for the spill group: overlapping, duplicate-bearing rows across two
     /// tables so UNION/INTERSECT/EXCEPT have real work under a tiny budget.
     Table data(String name, int n, int seed, int mod) {
@@ -1220,11 +1548,11 @@ void main() {
     );
 
     Future<List<int>> ids2(SqlEngine e, String q) async =>
-        (await e.execute(q)).column('id')!.toList().cast<int>()..sort();
+        (await e.execute(q).ok).column('id')!.toList().cast<int>()..sort();
 
     late SqlEngine engine;
     setUp(() {
-      engine = SqlEngine();
+      engine = SqlEngine.open().ok;
       engine.registerTable('t1', ids('t1', [1, 2, 3]));
       engine.registerTable('t2', ids('t2', [2, 3, 4]));
       engine.registerTable('dups', ids('dups', [1, 1, 2]));
@@ -1251,6 +1579,49 @@ void main() {
         await ids2(engine, 'SELECT id FROM dups UNION SELECT id FROM t2'),
         [1, 2, 3, 4],
       );
+    });
+
+    test('one-column keys keep first occurrences and NULLs', () async {
+      void register(String name, List<int?> keys, List<String?> texts) {
+        engine.registerTable(
+          name,
+          Table(
+            name: name,
+            columns: [
+              NumericColumn.int64(name: 'k', values: keys),
+              StringColumn(name: 's', values: texts),
+            ],
+            schema: Schema(
+              fields: [
+                Field(name: 'k', dataType: DataType.int64),
+                Field(name: 's', dataType: DataType.string),
+              ],
+            ),
+          ),
+        );
+      }
+
+      register(
+        'n1',
+        [3, null, 1, 3, null, 2],
+        ['c', null, 'a', 'c', null, 'b'],
+      );
+      register('n2', [2, null, 4, 4], ['b', null, 'd', 'd']);
+      Future<List<Object?>> rows(String sql) async =>
+          (await engine.execute(sql).ok).columns.first.toList();
+      for (final key in ['k', 's']) {
+        expect(await rows('SELECT $key FROM n1 UNION SELECT $key FROM n2'), [
+          ...(key == 'k' ? [3, null, 1, 2, 4] : ['c', null, 'a', 'b', 'd']),
+        ]);
+        expect(
+          await rows('SELECT $key FROM n1 INTERSECT SELECT $key FROM n2'),
+          key == 'k' ? [null, 2] : [null, 'b'],
+        );
+        expect(
+          await rows('SELECT $key FROM n1 EXCEPT SELECT $key FROM n2'),
+          key == 'k' ? [3, 1] : ['c', 'a'],
+        );
+      }
     });
 
     test('INTERSECT keeps common distinct rows', () async {
@@ -1315,9 +1686,9 @@ void main() {
           [2, 'z'],
         ]),
       );
-      final t = await engine.execute(
-        'SELECT k, v FROM a UNION SELECT k, v FROM b',
-      );
+      final t = await engine
+          .execute('SELECT k, v FROM a UNION SELECT k, v FROM b')
+          .ok;
       final rows = {for (final r in t.toRows()) '${r['k']}-${r['v']}'};
       expect(rows, {'1-x', '2-y', '2-z'}); // (2,y) deduped
     });
@@ -1332,11 +1703,14 @@ void main() {
 
       Future<List<Map<String, dynamic>>> run(int budget, String sql) async {
         final engine = budget == 0
-            ? SqlEngine(spillThresholdBytes: 0)
-            : SqlEngine(spillThresholdBytes: budget, spillDir: spillDir.path);
+            ? SqlEngine.open(spillThresholdBytes: 0).ok
+            : SqlEngine.open(
+                spillThresholdBytes: budget,
+                spillDir: spillDir.path,
+              ).ok;
         engine.registerTable('t1', data('t1', 6000, 7919, 800));
         engine.registerTable('t2', data('t2', 6000, 104729, 800));
-        return (await engine.execute(sql)).toRows();
+        return (await engine.execute(sql).ok).toRows();
       }
 
       Future<void> matches(String sql) async {
@@ -1408,18 +1782,18 @@ void main() {
         () async {
           for (final op in ['UNION', 'INTERSECT', 'EXCEPT']) {
             final sql = 'SELECT a, b, c FROM t1 $op SELECT a, b, c FROM t2';
-            final e = SqlEngine(
+            final e = SqlEngine.open(
               spillThresholdBytes: 512,
               spillDir: spillDir.path,
-            );
+            ).ok;
             e.registerTable('t1', dup('t1', 20000, 3));
             e.registerTable('t2', dup('t2', 20000, 5));
-            final spilled = (await e.execute(sql)).toRows();
+            final spilled = (await e.execute(sql).ok).toRows();
 
-            final m = SqlEngine(spillThresholdBytes: 0);
+            final m = SqlEngine.open(spillThresholdBytes: 0).ok;
             m.registerTable('t1', dup('t1', 20000, 3));
             m.registerTable('t2', dup('t2', 20000, 5));
-            final memory = (await m.execute(sql)).toRows();
+            final memory = (await m.execute(sql).ok).toRows();
 
             final a = spilled.map((r) => r.toString()).toList()..sort();
             final b = memory.map((r) => r.toString()).toList()..sort();
@@ -1434,22 +1808,30 @@ void main() {
       );
 
       test('high-cardinality UNION forces recursive re-partition', () async {
-        final engine = SqlEngine(
+        final engine = SqlEngine.open(
           spillThresholdBytes: 1024,
           spillDir: spillDir.path,
-        );
+        ).ok;
         engine.registerTable('t1', data('t1', 6000, 7919, 100000));
         engine.registerTable('t2', data('t2', 6000, 104729, 100000));
-        final spilled = (await engine.execute(
-          'SELECT a, b, c FROM t1 UNION SELECT a, b, c FROM t2',
-        )).toRows();
+        final spilled =
+            (await engine
+                    .execute(
+                      'SELECT a, b, c FROM t1 UNION SELECT a, b, c FROM t2',
+                    )
+                    .ok)
+                .toRows();
 
-        final mem = SqlEngine(spillThresholdBytes: 0);
+        final mem = SqlEngine.open(spillThresholdBytes: 0).ok;
         mem.registerTable('t1', data('t1', 6000, 7919, 100000));
         mem.registerTable('t2', data('t2', 6000, 104729, 100000));
-        final memory = (await mem.execute(
-          'SELECT a, b, c FROM t1 UNION SELECT a, b, c FROM t2',
-        )).toRows();
+        final memory =
+            (await mem
+                    .execute(
+                      'SELECT a, b, c FROM t1 UNION SELECT a, b, c FROM t2',
+                    )
+                    .ok)
+                .toRows();
 
         expect(spilled.length, memory.length);
         expect(_leakedSpills(spillDir), isEmpty);
@@ -1460,7 +1842,7 @@ void main() {
       // Two branches hold the SAME values at DIFFERENT scales: a decimal stores
       // an unscaled BigInt with its scale on the Field, so 1.5 is BigInt(15) at
       // scale 1 but BigInt(150) at scale 2. A set op compared/concatenated the
-      // raw BigInts — missing equal values AND matching unequal ones (2.5 and
+      // raw BigInts: missing equal values AND matching unequal ones (2.5 and
       // 0.25 are both BigInt(25)).
       Table decimals(String name, List<int> unscaled, int scale) => Table(
         name: name,
@@ -1486,12 +1868,12 @@ void main() {
       );
 
       Future<List<Decimal>> run(SqlEngine e, String q) async {
-        final r = await e.execute(q);
+        final r = await e.execute(q).ok;
         return [for (final row in r.toRows()) row['d'] as Decimal];
       }
 
       SqlEngine seed([int threshold = 256 << 20]) {
-        final e = SqlEngine(spillThresholdBytes: threshold);
+        final e = SqlEngine.open(spillThresholdBytes: threshold).ok;
         // t: 1.5, 2.5 (scale 1)   u: 1.50, 0.25 (scale 2)
         e.registerTable('t', decimals('t', [15, 25], 1));
         e.registerTable('u', decimals('u', [150, 25], 2));
@@ -1519,9 +1901,9 @@ void main() {
 
       test('UNION dedups by value and yields one scale', () async {
         final e = seed();
-        final r = await e.execute('SELECT d FROM t UNION SELECT d FROM u');
+        final r = await e.execute('SELECT d FROM t UNION SELECT d FROM u').ok;
         expect(r.schema.fields.first.scale, 2);
-        // {1.5, 2.5, 0.25} — 1.5 and 1.50 collapse to one row. Order is not
+        // {1.5, 2.5, 0.25}: 1.5 and 1.50 collapse to one row. Order is not
         // guaranteed (ORDER BY binds to the left branch), so compare as a set.
         expect(
           {for (final row in r.toRows()) row['d']},
@@ -1546,7 +1928,7 @@ void main() {
 
       // F5: rescaling the narrower branch UP adds integer→unscaled digits, so
       // result precision = widest integer digits + result scale. decimal(3,1) ∪
-      // decimal(3,2) is decimal(4,2), not decimal(3,2) — the latter can't
+      // decimal(3,2) is decimal(4,2), not decimal(3,2): the latter can't
       // represent 99.90 (a Parquet/Arrow write would emit an invalid contract).
       test('F5: reconciled precision widens for the added digits', () async {
         Table one(String name, int unscaled, int precision, int scale) => Table(
@@ -1571,13 +1953,13 @@ void main() {
             ],
           ),
         );
-        final e = SqlEngine();
+        final e = SqlEngine.open().ok;
         e.registerTable('a', one('a', 999, 3, 1)); // 99.9  decimal(3,1)
         e.registerTable('b', one('b', 125, 3, 2)); // 1.25  decimal(3,2)
-        final r = await e.execute('SELECT d FROM a UNION SELECT d FROM b');
+        final r = await e.execute('SELECT d FROM a UNION SELECT d FROM b').ok;
         final f = r.schema.fields.first;
         expect(f.scale, 2);
-        expect(f.precision, 4); // was 3 — too narrow to hold 99.90
+        expect(f.precision, 4); // was 3: too narrow to hold 99.90
         await e.dispose();
       });
     });
@@ -1611,20 +1993,70 @@ void main() {
       dir = Directory.systemTemp.createTempSync('sqlcte_');
       a = '${dir.path}/a.parquet';
       b = '${dir.path}/b.parquet';
-      await ParquetWriter(a).write(t([1, 2, 3], 'a'));
-      await ParquetWriter(b).write(t([2, 3, 4], 'b'));
-      engine = SqlEngine(allowExternalPaths: true);
+      await ParquetWriter(a).write(t([1, 2, 3], 'a')).ok;
+      await ParquetWriter(b).write(t([2, 3, 4], 'b')).ok;
+      engine = SqlEngine.open(allowExternalPaths: true).ok;
     });
     tearDown(() => dir.deleteSync(recursive: true));
 
     Future<List<Map<String, dynamic>>> rows(String sql) async =>
-        (await engine.execute(sql)).toRows();
+        (await engine.execute(sql).ok).toRows();
+
+    group('CTE names', () {
+      test('a repeated CTE name is rejected', () async {
+        await expectLater(
+          engine.execute(
+            "WITH x AS (SELECT id FROM '$a'), X AS (SELECT id FROM '$b') "
+            'SELECT * FROM x',
+          ),
+          failsWith(Kind.invalid, contains('Duplicate CTE name')),
+        );
+      });
+
+      test('a CTE never changes the catalog', () async {
+        final readOnly = SqlEngine.open(readOnly: true).ok;
+        addTearDown(readOnly.dispose);
+        readOnly.registerTable('accounts', t([1], 'a'));
+        await readOnly
+            .execute(
+              'WITH accounts AS (SELECT 9 AS id, 9 AS name) '
+              'SELECT * FROM accounts',
+            )
+            .ok;
+        await expectLater(
+          readOnly.execute(
+            'WITH accounts AS (SELECT 9 AS id, 9 AS name), '
+            'accounts AS (SELECT 0 AS id) SELECT * FROM accounts',
+          ),
+          failsWith(Kind.invalid, contains('Duplicate CTE name')),
+        );
+        final after = await readOnly.execute('SELECT * FROM accounts').ok;
+        expect(after.toRows(), [
+          {'id': 1, 'name': 'a1'},
+        ]);
+        expect(readOnly.listTables(), ['accounts']);
+      });
+
+      test('a CTE shadows a registered file of the same name', () async {
+        await engine.registerFile('t', a).ok;
+        final cte = await rows(
+          "WITH t AS (SELECT id + 100 AS id FROM '$b') SELECT id FROM t "
+          'ORDER BY id',
+        );
+        expect(cte.map((row) => row['id']), [102, 103, 104]);
+        // The file is back afterwards.
+        final file = await rows('SELECT id FROM t ORDER BY id');
+        expect(file.map((row) => row['id']), [1, 2, 3]);
+      });
+    });
 
     group('CTE materialization', () {
       test('CTE over a file body loads and qualifies', () async {
-        final r = await engine.execute(
-          "WITH t AS (SELECT id, name FROM '$a') SELECT t.name FROM t WHERE t.id > 1",
-        );
+        final r = await engine
+            .execute(
+              "WITH t AS (SELECT id, name FROM '$a') SELECT t.name FROM t WHERE t.id > 1",
+            )
+            .ok;
         expect(r.schema.fieldNames, ['name']);
         expect(r.toRows(), [
           {'name': 'a2'},
@@ -1633,9 +2065,9 @@ void main() {
       });
 
       test('CTE SELECT * keeps bare column names', () async {
-        final r = await engine.execute(
-          "WITH t AS (SELECT * FROM '$a') SELECT * FROM t",
-        );
+        final r = await engine
+            .execute("WITH t AS (SELECT * FROM '$a') SELECT * FROM t")
+            .ok;
         expect(r.schema.fieldNames, ['id', 'name']);
         expect(r.rowCount, 3);
       });
@@ -1651,18 +2083,22 @@ void main() {
       });
 
       test('self-join of a CTE under two aliases', () async {
-        final r = await engine.execute(
-          "WITH t AS (SELECT id, name FROM '$a') SELECT x.name, y.name FROM t x JOIN t y ON x.id = y.id",
-        );
+        final r = await engine
+            .execute(
+              "WITH t AS (SELECT id, name FROM '$a') SELECT x.name, y.name FROM t x JOIN t y ON x.id = y.id",
+            )
+            .ok;
         expect(r.schema.fieldNames, ['x.name', 'y.name']);
         expect(r.rowCount, 3);
         expect(r.toRows().first, {'x.name': 'a1', 'y.name': 'a1'});
       });
 
       test('CTE joined to a file', () async {
-        final r = await engine.execute(
-          "WITH t AS (SELECT id, name FROM '$a') SELECT t.name, b.name FROM t JOIN '$b' b ON t.id = b.id",
-        );
+        final r = await engine
+            .execute(
+              "WITH t AS (SELECT id, name FROM '$a') SELECT t.name, b.name FROM t JOIN '$b' b ON t.id = b.id",
+            )
+            .ok;
         expect(r.schema.fieldNames, ['t.name', 'b.name']);
         expect(r.toRows(), [
           {'t.name': 'a2', 'b.name': 'b2'},
@@ -1684,7 +2120,7 @@ void main() {
           engine.execute(
             "WITH RECURSIVE t AS (SELECT id, name FROM '$a') SELECT * FROM t",
           ),
-          throwsA(isA<UnsupportedError>()),
+          failsWith(Kind.unsupported),
         );
       });
 
@@ -1717,9 +2153,11 @@ void main() {
       });
 
       test('subquery joined to a file', () async {
-        final r = await engine.execute(
-          "SELECT s.name, b.name FROM (SELECT id, name FROM '$a') s JOIN '$b' b ON s.id = b.id",
-        );
+        final r = await engine
+            .execute(
+              "SELECT s.name, b.name FROM (SELECT id, name FROM '$a') s JOIN '$b' b ON s.id = b.id",
+            )
+            .ok;
         expect(r.schema.fieldNames, ['s.name', 'b.name']);
         expect(r.rowCount, 2);
       });
@@ -1754,18 +2192,18 @@ void main() {
       dir = Directory.systemTemp.createTempSync('sqlview_');
       a = '${dir.path}/a.parquet';
       b = '${dir.path}/b.parquet';
-      await ParquetWriter(a).write(t([1, 2, 3], 'a'));
-      await ParquetWriter(b).write(t([2, 3, 4], 'b'));
-      engine = SqlEngine(allowExternalPaths: true);
+      await ParquetWriter(a).write(t([1, 2, 3], 'a')).ok;
+      await ParquetWriter(b).write(t([2, 3, 4], 'b')).ok;
+      engine = SqlEngine.open(allowExternalPaths: true).ok;
     });
     tearDown(() => dir.deleteSync(recursive: true));
 
     Future<List<Map<String, dynamic>>> rows(String sql) async =>
-        (await engine.execute(sql)).toRows();
+        (await engine.execute(sql).ok).toRows();
 
     test('create then select, with alias qualification', () async {
-      await engine.execute("CREATE VIEW v AS (SELECT id, name FROM '$a')");
-      final r = await engine.execute("SELECT v.name FROM v WHERE v.id > 1");
+      await engine.execute("CREATE VIEW v AS (SELECT id, name FROM '$a')").ok;
+      final r = await engine.execute("SELECT v.name FROM v WHERE v.id > 1").ok;
       expect(r.schema.fieldNames, ['name']);
       expect(r.toRows(), [
         {'name': 'a2'},
@@ -1773,8 +2211,21 @@ void main() {
       ]);
     });
 
+    test('a view body needs no parentheses', () async {
+      await engine.execute("CREATE VIEW v AS SELECT id, name FROM '$a'").ok;
+      await engine
+          .execute(
+            "CREATE OR REPLACE VIEW w(p) AS SELECT id FROM v WHERE id > 1",
+          )
+          .ok;
+      expect(await rows('SELECT p FROM w ORDER BY p'), [
+        {'p': 2},
+        {'p': 3},
+      ]);
+    });
+
     test('a view persists across separate statements', () async {
-      await engine.execute("CREATE VIEW v AS (SELECT id, name FROM '$a')");
+      await engine.execute("CREATE VIEW v AS (SELECT id, name FROM '$a')").ok;
       expect(await rows("SELECT count(*) AS n FROM v"), [
         {'n': 3},
       ]);
@@ -1784,76 +2235,76 @@ void main() {
     });
 
     test('view column aliases (CREATE VIEW v(p, q))', () async {
-      await engine.execute(
-        "CREATE VIEW v(p, q) AS (SELECT id, name FROM '$a')",
-      );
+      await engine
+          .execute("CREATE VIEW v(p, q) AS (SELECT id, name FROM '$a')")
+          .ok;
       expect(await rows("SELECT v.p, v.q FROM v WHERE v.p = 2"), [
         {'p': 2, 'q': 'a2'},
       ]);
     });
 
     test('view joined to a file', () async {
-      await engine.execute("CREATE VIEW v AS (SELECT id, name FROM '$a')");
-      final r = await engine.execute(
-        "SELECT v.name, b.name FROM v JOIN '$b' b ON v.id = b.id",
-      );
+      await engine.execute("CREATE VIEW v AS (SELECT id, name FROM '$a')").ok;
+      final r = await engine
+          .execute("SELECT v.name, b.name FROM v JOIN '$b' b ON v.id = b.id")
+          .ok;
       expect(r.schema.fieldNames, ['v.name', 'b.name']);
       expect(r.rowCount, 2);
     });
 
     test('self-join of a view under two aliases', () async {
-      await engine.execute("CREATE VIEW v AS (SELECT id, name FROM '$a')");
-      final r = await engine.execute(
-        "SELECT x.name, y.name FROM v x JOIN v y ON x.id = y.id",
-      );
+      await engine.execute("CREATE VIEW v AS (SELECT id, name FROM '$a')").ok;
+      final r = await engine
+          .execute("SELECT x.name, y.name FROM v x JOIN v y ON x.id = y.id")
+          .ok;
       expect(r.schema.fieldNames, ['x.name', 'y.name']);
       expect(r.rowCount, 3);
     });
 
     test('view referencing another view', () async {
-      await engine.execute("CREATE VIEW v AS (SELECT id, name FROM '$a')");
-      await engine.execute("CREATE VIEW w AS (SELECT * FROM v)");
-      final r = await engine.execute("SELECT * FROM w");
+      await engine.execute("CREATE VIEW v AS (SELECT id, name FROM '$a')").ok;
+      await engine.execute("CREATE VIEW w AS (SELECT * FROM v)").ok;
+      final r = await engine.execute("SELECT * FROM w").ok;
       expect(r.schema.fieldNames, ['id', 'name']);
       expect(r.rowCount, 3);
     });
 
     test('CREATE OR REPLACE swaps the definition', () async {
-      await engine.execute("CREATE VIEW v AS (SELECT id, name FROM '$a')");
-      await engine.execute(
-        "CREATE OR REPLACE VIEW v AS (SELECT id, name FROM '$b')",
-      );
+      await engine.execute("CREATE VIEW v AS (SELECT id, name FROM '$a')").ok;
+      await engine
+          .execute("CREATE OR REPLACE VIEW v AS (SELECT id, name FROM '$b')")
+          .ok;
       expect(await rows("SELECT v.name FROM v WHERE v.id = 2"), [
         {'name': 'b2'},
       ]);
     });
 
     test('duplicate CREATE without OR REPLACE throws', () async {
-      await engine.execute("CREATE VIEW v AS (SELECT id FROM '$a')");
+      await engine.execute("CREATE VIEW v AS (SELECT id FROM '$a')").ok;
       expect(
         engine.execute("CREATE VIEW v AS (SELECT id FROM '$b')"),
-        throwsA(isA<ArgumentError>()),
+        failsWith(Kind.invalid),
       );
     });
 
     test('DROP VIEW removes it; referencing it afterwards fails', () async {
-      await engine.execute("CREATE VIEW v AS (SELECT id FROM '$a')");
-      await engine.execute("DROP VIEW v");
-      expect(engine.execute("SELECT * FROM v"), throwsA(isA<StateError>()));
+      await engine.execute("CREATE VIEW v AS (SELECT id FROM '$a')").ok;
+      await engine.execute("DROP VIEW v").ok;
+      expect(engine.execute("SELECT * FROM v"), failsWith(Kind.missing));
     });
 
     test('DROP VIEW absent throws; IF EXISTS is a no-op', () async {
-      expect(engine.execute("DROP VIEW nope"), throwsA(isA<ArgumentError>()));
-      await engine.execute("DROP VIEW IF EXISTS nope"); // does not throw
+      expect(engine.execute("DROP VIEW nope"), failsWith(Kind.missing));
+      await engine.execute("DROP VIEW IF EXISTS nope").ok; // does not throw
     });
 
     test('a self-referential view is rejected at reference time', () async {
-      await engine.execute("CREATE VIEW r AS (SELECT * FROM r)");
-      expect(engine.execute("SELECT * FROM r"), throwsA(isA<StateError>()));
+      await engine.execute("CREATE VIEW r AS (SELECT * FROM r)").ok;
+      expect(engine.execute("SELECT * FROM r"), failsWith(Kind.invalid));
     });
 
     test('a registered table shadows a view of the same name', () async {
-      await engine.execute("CREATE VIEW t AS (SELECT id FROM '$a')");
+      await engine.execute("CREATE VIEW t AS (SELECT id FROM '$a')").ok;
       engine.registerTable('t', t([99], 'real'));
       expect(await rows("SELECT id FROM t"), [
         {'id': 99},
@@ -1864,7 +2315,7 @@ void main() {
   group('expressions', () {
     late SqlEngine engine;
     setUp(() {
-      engine = SqlEngine();
+      engine = SqlEngine.open().ok;
       engine.registerTable(
         't',
         Table(
@@ -1900,7 +2351,7 @@ void main() {
     });
 
     Future<List<dynamic>> col(String sql, String name) async =>
-        (await engine.execute(sql)).column(name)!.toList();
+        (await engine.execute(sql).ok).column(name)!.toList();
 
     group('unary expressions work (not silent NULL)', () {
       test('WHERE with a negative literal', () async {
@@ -1920,7 +2371,7 @@ void main() {
       test('an unknown scalar function throws', () async {
         await expectLater(
           engine.execute('SELECT bogusfn(x) FROM t'),
-          throwsA(isA<UnsupportedError>()),
+          failsWith(Kind.unsupported),
         );
       });
     });
@@ -1979,17 +2430,19 @@ void main() {
     );
 
     SqlEngine engine() {
-      final e = SqlEngine();
+      final e = SqlEngine.open().ok;
       e.registerTable('t', sales());
       return e;
     }
 
     group('empty / all-null aggregates', () {
       test('global aggregate over empty input yields one NULL/0 row', () async {
-        final t = await engine().execute(
-          'SELECT COUNT(*) AS c, MAX(amt) AS m, SUM(amt) AS s '
-          'FROM t WHERE amt > 100000',
-        );
+        final t = await engine()
+            .execute(
+              'SELECT COUNT(*) AS c, MAX(amt) AS m, SUM(amt) AS s '
+              'FROM t WHERE amt > 100000',
+            )
+            .ok;
         expect(t.rowCount, 1);
         final row = t.toRows().single;
         expect(row['c'], 0);
@@ -1998,9 +2451,11 @@ void main() {
       });
 
       test('SUM over an all-NULL group is NULL, not 0', () async {
-        final t = await engine().execute(
-          'SELECT region, SUM(amt) AS s FROM t GROUP BY region ORDER BY region',
-        );
+        final t = await engine()
+            .execute(
+              'SELECT region, SUM(amt) AS s FROM t GROUP BY region ORDER BY region',
+            )
+            .ok;
         final rows = {for (final r in t.toRows()) r['region']: r['s']};
         expect(
           rows['e'],
@@ -2012,12 +2467,12 @@ void main() {
 
     group('arithmetic edges', () {
       test('integer modulo by zero is NULL (no crash)', () async {
-        final t = await engine().execute('SELECT amt % 0 AS r FROM t');
+        final t = await engine().execute('SELECT amt % 0 AS r FROM t').ok;
         expect(t.toRows().every((row) => row['r'] == null), isTrue);
       });
 
       test('modulo takes the sign of the dividend (SQL semantics)', () async {
-        final e = SqlEngine();
+        final e = SqlEngine.open().ok;
         e.registerTable(
           'neg',
           Table(
@@ -2036,9 +2491,10 @@ void main() {
             ),
           ),
         );
-        final r = (await e.execute(
-          'SELECT v % 3 AS m FROM neg',
-        )).toRows().map((x) => x['m']).toList();
+        final r = (await e.execute('SELECT v % 3 AS m FROM neg').ok)
+            .toRows()
+            .map((x) => x['m'])
+            .toList();
         await e.dispose();
         // remainder (SQL): sign of the dividend, not Dart's Euclidean %.
         expect(r, [-1, 1, -2]);
@@ -2047,39 +2503,41 @@ void main() {
       test('numeric vs string ordered comparison fails loud', () async {
         await expectLater(
           engine().execute("SELECT region FROM t WHERE amt > 'x'"),
-          throwsA(isA<Object>()),
+          failsWith(Kind.invalid),
         );
       });
     });
 
     group('aggregate output column order + aliases', () {
       test('columns follow the SELECT list, not [keys, aggs]', () async {
-        final t = await engine().execute(
-          'SELECT COUNT(*) AS c, region FROM t GROUP BY region',
-        );
+        final t = await engine()
+            .execute('SELECT COUNT(*) AS c, region FROM t GROUP BY region')
+            .ok;
         expect(t.schema.fieldNames, ['c', 'region']);
       });
 
       test('a group-key alias is honored', () async {
-        final t = await engine().execute(
-          'SELECT region AS r, COUNT(*) AS c FROM t GROUP BY region',
-        );
+        final t = await engine()
+            .execute('SELECT region AS r, COUNT(*) AS c FROM t GROUP BY region')
+            .ok;
         expect(t.schema.fieldNames, ['r', 'c']);
       });
     });
 
     group('IS NULL / IS NOT NULL', () {
       test('IS NULL selects the null rows', () async {
-        final t = await engine().execute(
-          'SELECT region FROM t WHERE amt IS NULL',
-        );
+        final t = await engine()
+            .execute('SELECT region FROM t WHERE amt IS NULL')
+            .ok;
         expect(t.toRows().map((r) => r['region']), ['w']);
       });
 
       test('IS NOT NULL selects the non-null rows', () async {
-        final t = await engine().execute(
-          'SELECT region FROM t WHERE amt IS NOT NULL ORDER BY region',
-        );
+        final t = await engine()
+            .execute(
+              'SELECT region FROM t WHERE amt IS NOT NULL ORDER BY region',
+            )
+            .ok;
         expect(t.rowCount, 2);
       });
     });
@@ -2129,9 +2587,9 @@ void main() {
       String sql,
       List<String> keys,
     ) async {
-      final e = SqlEngine();
+      final e = SqlEngine.open().ok;
       e.registerTable('t', small());
-      final t = await e.execute(sql);
+      final t = await e.execute(sql).ok;
       return {
         for (final r in t.toRows())
           r['cat'].toString(): [for (final k in keys) r[k]],
@@ -2179,11 +2637,13 @@ void main() {
     );
 
     test('global (no GROUP BY) multi-distinct', () async {
-      final e = SqlEngine();
+      final e = SqlEngine.open().ok;
       e.registerTable('t', small());
-      final t = await e.execute(
-        'SELECT COUNT(DISTINCT x) AS dx, COUNT(DISTINCT y) AS dy FROM t',
-      );
+      final t = await e
+          .execute(
+            'SELECT COUNT(DISTINCT x) AS dx, COUNT(DISTINCT y) AS dy FROM t',
+          )
+          .ok;
       final row = t.toRows().single;
       expect(row['dx'], 3); // {1,2,5}
       expect(row['dy'], 5); // {10,20,30,40,50}
@@ -2192,11 +2652,13 @@ void main() {
     test('all-NULL distinct group yields COUNT 0, not NULL', () async {
       // Group A's distinct arg (xn) is entirely NULL; COUNT must be 0, and the
       // group must still be present (kept by the raw COUNT(*) lane).
-      final e = SqlEngine();
+      final e = SqlEngine.open().ok;
       e.registerTable('t', small());
-      final t = await e.execute(
-        'SELECT cat, COUNT(DISTINCT xn) AS dx, COUNT(*) AS n FROM t GROUP BY cat',
-      );
+      final t = await e
+          .execute(
+            'SELECT cat, COUNT(DISTINCT xn) AS dx, COUNT(*) AS n FROM t GROUP BY cat',
+          )
+          .ok;
       final r = {for (final row in t.toRows()) row['cat'].toString(): row};
       expect(r['A']!['dx'], 0); // all NULL → 0 distinct
       expect(r['A']!['n'], 3);
@@ -2255,12 +2717,17 @@ void main() {
       Future<void> matches(String sql) async {
         Future<List<String>> run(int budget) async {
           final e = budget == 0
-              ? SqlEngine(spillThresholdBytes: 0)
-              : SqlEngine(spillThresholdBytes: budget, spillDir: dir.path);
+              ? SqlEngine.open(spillThresholdBytes: 0).ok
+              : SqlEngine.open(
+                  spillThresholdBytes: budget,
+                  spillDir: dir.path,
+                ).ok;
           e.registerTable('t', big(6000));
-          return (await e.execute(
-            sql,
-          )).toRows().map((r) => r.toString()).toList()..sort();
+          return (await e.execute(sql).ok)
+              .toRows()
+              .map((r) => r.toString())
+              .toList()
+            ..sort();
         }
 
         expect(await run(4096), await run(0), reason: sql);
@@ -2304,29 +2771,26 @@ void main() {
 
     late SqlEngine engine;
     setUp(() {
-      engine = SqlEngine();
+      engine = SqlEngine.open().ok;
       engine.registerTable('t', t());
     });
 
     group('unknown columns fail loud', () {
       test('SELECT of an unknown column throws', () {
-        expect(
-          engine.execute('SELECT nope FROM t'),
-          throwsA(isA<FormatException>()),
-        );
+        expect(engine.execute('SELECT nope FROM t'), failsWith(Kind.invalid));
       });
 
       test('WHERE on an unknown column throws (not silently filter all)', () {
         expect(
           engine.execute('SELECT id FROM t WHERE nope = 1'),
-          throwsA(isA<FormatException>()),
+          failsWith(Kind.invalid),
         );
       });
 
       test('an unknown column inside an expression throws', () {
         expect(
           engine.execute('SELECT id + nope AS x FROM t'),
-          throwsA(isA<FormatException>()),
+          failsWith(Kind.invalid),
         );
       });
     });
@@ -2335,15 +2799,17 @@ void main() {
       test('ORDER BY a non-projected column sorts correctly', () async {
         // `amount` is not in the SELECT list; the engine must still sort by it
         // (previously it silently sorted by an all-null key).
-        final r = await engine.execute('SELECT id FROM t ORDER BY amount DESC');
+        final r = await engine
+            .execute('SELECT id FROM t ORDER BY amount DESC')
+            .ok;
         expect(r.column('id')!.toList(), [3, 2, 1]);
         expect(r.schema.fields.map((f) => f.name), ['id']); // amount trimmed
       });
 
       test('ORDER BY a projected column still works', () async {
-        final r = await engine.execute(
-          'SELECT id, amount FROM t ORDER BY id ASC',
-        );
+        final r = await engine
+            .execute('SELECT id, amount FROM t ORDER BY id ASC')
+            .ok;
         expect(r.column('id')!.toList(), [1, 2, 3]);
       });
     });
@@ -2376,12 +2842,14 @@ void main() {
               ],
             ),
           );
-          final e = SqlEngine();
+          final e = SqlEngine.open().ok;
           e.registerTable('l', left);
           e.registerTable('r', right);
-          final out = await e.execute(
-            'SELECT l.k, r.v FROM l LEFT JOIN r ON l.k = r.k ORDER BY l.k',
-          );
+          final out = await e
+              .execute(
+                'SELECT l.k, r.v FROM l LEFT JOIN r ON l.k = r.k ORDER BY l.k',
+              )
+              .ok;
           final rows = out.toRows();
           expect(rows.length, 2);
           expect(rows[1]['v'], isNull); // k=2 unmatched → null, not an error
@@ -2392,7 +2860,7 @@ void main() {
 
   group('unsupported features', () {
     SqlEngine engine() {
-      final e = SqlEngine();
+      final e = SqlEngine.open().ok;
       e.registerTable(
         't',
         Table(
@@ -2413,7 +2881,7 @@ void main() {
       // UnsupportedError, not an internal-defect UnimplementedError.
       expect(
         engine().execute('SELECT * FROM t a JOIN t b ON a.id > b.id'),
-        throwsA(isA<UnsupportedError>()),
+        failsWith(Kind.unsupported),
       );
     });
   });
@@ -2429,26 +2897,26 @@ void main() {
 
     group('SQL file-path sandbox (#3.3)', () {
       test('default-deny rejects an absolute path', () {
-        final engine = SqlEngine();
+        final engine = SqlEngine.open().ok;
         expect(
           engine.execute("SELECT * FROM '/etc/hosts'"),
-          throwsA(isA<ArgumentError>()),
+          failsWith(Kind.denied),
         );
       });
 
       test('default-deny rejects parent traversal', () {
-        final engine = SqlEngine();
+        final engine = SqlEngine.open().ok;
         expect(
           engine.execute("SELECT * FROM '../secret.parquet'"),
-          throwsA(isA<ArgumentError>()),
+          failsWith(Kind.denied),
         );
       });
 
       test('a relative path under the working dir is allowed', () async {
-        final engine = SqlEngine();
-        final t2 = await engine.execute(
-          "SELECT COUNT(*) AS n FROM 'test/fixtures/iris.parquet'",
-        );
+        final engine = SqlEngine.open().ok;
+        final t2 = await engine
+            .execute("SELECT COUNT(*) AS n FROM 'test/fixtures/iris.parquet'")
+            .ok;
         expect((t2.column('n')!.toList().first as int) > 0, isTrue);
       });
 
@@ -2456,9 +2924,11 @@ void main() {
         final dir = Directory.systemTemp.createTempSync('sec_');
         try {
           final path = '${dir.path}/x.parquet';
-          await ParquetWriter(path).write(t([1, 2, 3]));
-          final engine = SqlEngine(allowExternalPaths: true);
-          final t2 = await engine.execute("SELECT COUNT(*) AS n FROM '$path'");
+          await ParquetWriter(path).write(t([1, 2, 3])).ok;
+          final engine = SqlEngine.open(allowExternalPaths: true).ok;
+          final t2 = await engine
+              .execute("SELECT COUNT(*) AS n FROM '$path'")
+              .ok;
           expect(t2.column('n')!.toList().first, 3);
         } finally {
           dir.deleteSync(recursive: true);
@@ -2468,17 +2938,17 @@ void main() {
       test('sandboxRoot confines reads to the root', () async {
         final dir = Directory.systemTemp.createTempSync('sec_root_');
         try {
-          await ParquetWriter('${dir.path}/in.parquet').write(t([1, 2]));
-          final engine = SqlEngine(sandboxRoot: dir.path);
+          await ParquetWriter('${dir.path}/in.parquet').write(t([1, 2])).ok;
+          final engine = SqlEngine.open(sandboxRoot: dir.path).ok;
           // A path inside the root resolves and reads.
-          final t2 = await engine.execute(
-            "SELECT COUNT(*) AS n FROM 'in.parquet'",
-          );
+          final t2 = await engine
+              .execute("SELECT COUNT(*) AS n FROM 'in.parquet'")
+              .ok;
           expect(t2.column('n')!.toList().first, 2);
           // Escaping the root is denied.
           expect(
             engine.execute("SELECT * FROM '../outside.parquet'"),
-            throwsA(isA<ArgumentError>()),
+            failsWith(Kind.denied),
           );
         } finally {
           dir.deleteSync(recursive: true);
@@ -2502,34 +2972,77 @@ void main() {
     test('a symlink inside the sandbox pointing outside is denied', () async {
       File('${outside.path}/secret.csv').writeAsStringSync('id\n1\n');
       Link('${sandbox.path}/link.csv').createSync('${outside.path}/secret.csv');
-      final engine = SqlEngine(sandboxRoot: sandbox.path);
+      final engine = SqlEngine.open(sandboxRoot: sandbox.path).ok;
       await expectLater(
         engine.execute("SELECT * FROM 'link.csv'"),
-        throwsA(isA<ArgumentError>()),
+        failsWith(Kind.denied),
       );
     });
 
     test('a genuine in-sandbox file still reads', () async {
       File('${sandbox.path}/ok.csv').writeAsStringSync('id\n7\n');
-      final engine = SqlEngine(sandboxRoot: sandbox.path);
-      final t = await engine.execute("SELECT * FROM 'ok.csv'");
+      final engine = SqlEngine.open(sandboxRoot: sandbox.path).ok;
+      final t = await engine.execute("SELECT * FROM 'ok.csv'").ok;
       expect(t.toRows().single['id'], 7);
     });
 
     test('a not-yet-existing nested in-sandbox path is NOT a denial', () async {
-      // The canonical gate must follow a symlinked sandbox ROOT (e.g. macOS /tmp →
+      // The canonical check must follow a symlinked sandbox ROOT (e.g. macOS /tmp →
       // /private/tmp) and still permit a legitimate nested path whose leaf does not
-      // exist yet (the tail-walk). Such a path gets PAST the gate and fails only at
-      // read time — a read error, not an "Access denied" ArgumentError.
-      final engine = SqlEngine(sandboxRoot: sandbox.path);
+      // exist yet (the tail-walk). Such a path gets PAST the check and fails only at
+      // read time: a read error, not an "Access denied" ArgumentError.
+      final engine = SqlEngine.open(sandboxRoot: sandbox.path).ok;
       try {
-        await engine.execute("SELECT * FROM 'sub/missing.csv'");
+        await engine.execute("SELECT * FROM 'sub/missing.csv'").ok;
       } on ArgumentError catch (e) {
         fail('a legitimate nested in-sandbox path was falsely denied: $e');
       } catch (_) {
-        // A read error (file not found) is fine — it got PAST the sandbox gate,
+        // A read error (file not found) is fine; it got PAST the sandbox check,
         // which is all this test asserts.
       }
+    });
+
+    group('without a sandbox root', () {
+      // The working directory is the boundary; a scratch dir under it holds
+      // the links (relative paths are the only ones allowed here).
+      late Directory local;
+      late String relative;
+      setUp(() {
+        local = Directory('.dart_tool').createTempSync('sbx_cwd_');
+        relative = p.relative(local.path);
+      });
+      tearDown(() => local.deleteSync(recursive: true));
+
+      test('a working-dir symlink pointing outside is denied', () async {
+        File('${outside.path}/secret.csv').writeAsStringSync('id\n1\n');
+        Link('${local.path}/link.csv').createSync('${outside.path}/secret.csv');
+        final engine = SqlEngine.open(spillDir: sandbox.path).ok;
+        addTearDown(engine.dispose);
+        await expectLater(
+          engine.execute("SELECT * FROM '$relative/link.csv'"),
+          failsWith(Kind.denied),
+        );
+      });
+
+      test('a symlink to a directory outside is denied', () async {
+        File('${outside.path}/secret.csv').writeAsStringSync('id\n1\n');
+        Link('${local.path}/dir').createSync(outside.path);
+        final engine = SqlEngine.open(spillDir: sandbox.path).ok;
+        addTearDown(engine.dispose);
+        await expectLater(
+          engine.execute("SELECT * FROM '$relative/dir/secret.csv'"),
+          failsWith(Kind.denied),
+        );
+      });
+
+      test('a symlink that stays under the working dir still reads', () async {
+        File('${local.path}/real.csv').writeAsStringSync('id\n7\n');
+        Link('${local.path}/link.csv').createSync('real.csv');
+        final engine = SqlEngine.open(spillDir: sandbox.path).ok;
+        addTearDown(engine.dispose);
+        final t = await engine.execute("SELECT * FROM '$relative/link.csv'").ok;
+        expect(t.toRows().single['id'], 7);
+      });
     });
   });
 
@@ -2549,48 +3062,48 @@ void main() {
     );
 
     test('CROSS JOIN past maxOutputRows throws', () async {
-      final engine = SqlEngine(maxOutputRows: 50);
+      final engine = SqlEngine.open(maxOutputRows: 50).ok;
       engine.registerTable('a', nums('a', 20));
       engine.registerTable('b', nums('b', 20)); // 400 > 50
       await expectLater(
         engine.execute('SELECT a.v FROM a, b'),
-        throwsA(isA<StateError>()),
+        failsWith(Kind.limit),
       );
     });
 
     test('CROSS JOIN under maxOutputRows succeeds', () async {
-      final engine = SqlEngine(maxOutputRows: 1000);
+      final engine = SqlEngine.open(maxOutputRows: 1000).ok;
       engine.registerTable('a', nums('a', 20));
       engine.registerTable('b', nums('b', 20)); // 400 <= 1000
-      final t = await engine.execute('SELECT a.v FROM a, b');
+      final t = await engine.execute('SELECT a.v FROM a, b').ok;
       expect(t.rowCount, 400);
     });
 
     test('a product under the fail-closed default succeeds', () async {
       // The default now bounds output at defaultMaxMaterializedRows (10M); a 900-
       // row product is far below it, so it runs unaffected.
-      final engine = SqlEngine();
+      final engine = SqlEngine.open().ok;
       engine.registerTable('a', nums('a', 30));
       engine.registerTable('b', nums('b', 30));
-      final t = await engine.execute('SELECT a.v FROM a, b');
+      final t = await engine.execute('SELECT a.v FROM a, b').ok;
       expect(t.rowCount, 900);
     });
 
     test('unbounded: true opts out of the output-row cap', () async {
-      final engine = SqlEngine(unbounded: true);
+      final engine = SqlEngine.open(unbounded: true).ok;
       engine.registerTable('a', nums('a', 30));
       engine.registerTable('b', nums('b', 30));
-      final t = await engine.execute('SELECT a.v FROM a, b');
+      final t = await engine.execute('SELECT a.v FROM a, b').ok;
       expect(t.rowCount, 900);
     });
 
     test('set operation past maxOutputRows throws', () async {
-      final engine = SqlEngine(maxOutputRows: 10);
+      final engine = SqlEngine.open(maxOutputRows: 10).ok;
       engine.registerTable('a', nums('a', 20));
       engine.registerTable('b', nums('b', 20)); // 40 buffered > 10
       await expectLater(
         engine.execute('SELECT v FROM a UNION ALL SELECT v FROM b'),
-        throwsA(isA<StateError>()),
+        failsWith(Kind.limit),
       );
     });
   });
@@ -2620,17 +3133,19 @@ void main() {
     );
 
     test('concurrent CTE queries on one engine stay consistent', () async {
-      final engine = SqlEngine(spillThresholdBytes: 0);
+      final engine = SqlEngine.open(spillThresholdBytes: 0).ok;
       engine.registerTable('a', fact(0, 3000));
 
-      // Each query materializes a CTE named `t` (shared-name temp table) — the
-      // classic interleaving hazard — plus a GROUP BY. Fire them all at once.
+      // Each query materializes a CTE named `t` (shared-name temp table): the
+      // classic interleaving hazard, plus a GROUP BY. Fire them all at once.
       final futures = [
         for (int i = 0; i < 24; i++)
-          engine.execute(
-            'WITH t AS (SELECT id, cat FROM a WHERE id >= ${i * 10}) '
-            'SELECT cat, COUNT(*) AS n FROM t GROUP BY cat',
-          ),
+          engine
+              .execute(
+                'WITH t AS (SELECT id, cat FROM a WHERE id >= ${i * 10}) '
+                'SELECT cat, COUNT(*) AS n FROM t GROUP BY cat',
+              )
+              .ok,
       ];
       final results = await Future.wait(futures);
 
@@ -2643,21 +3158,24 @@ void main() {
         expect(total, 3000 - i * 10, reason: 'query $i row total');
       }
 
-      // The shared CTE temp table is cleaned up — `t` isn't left registered.
-      expect(() => engine.execute('SELECT * FROM t'), throwsA(anything));
+      // The shared CTE temp table is cleaned up: `t` isn't left registered.
+      await expectLater(
+        engine.execute('SELECT * FROM t'),
+        failsWith(Kind.missing),
+      );
     });
 
     test(
       'concurrent CREATE VIEW + SELECT do not corrupt the catalog',
       () async {
-        final engine = SqlEngine(spillThresholdBytes: 0);
+        final engine = SqlEngine.open(spillThresholdBytes: 0).ok;
         engine.registerTable('a', fact(0, 1000));
-        await engine.execute(
-          'CREATE VIEW v AS (SELECT id FROM a WHERE id < 500)',
-        );
+        await engine
+            .execute('CREATE VIEW v AS (SELECT id FROM a WHERE id < 500)')
+            .ok;
         final futures = [
           for (int i = 0; i < 16; i++)
-            engine.execute('SELECT COUNT(*) AS n FROM v'),
+            engine.execute('SELECT COUNT(*) AS n FROM v').ok,
         ];
         final results = await Future.wait(futures);
         for (final r in results) {
@@ -2692,10 +3210,12 @@ void main() {
       }
 
       test('CSV scan with WHERE + projection returns correct rows', () async {
-        final e = SqlEngine(allowExternalPaths: true);
-        final t = await e.execute(
-          "SELECT id, v FROM '${csv(2500)}' WHERE id >= 2498 ORDER BY id",
-        );
+        final e = SqlEngine.open(allowExternalPaths: true).ok;
+        final t = await e
+            .execute(
+              "SELECT id, v FROM '${csv(2500)}' WHERE id >= 2498 ORDER BY id",
+            )
+            .ok;
         expect(t.schema.fieldNames, ['id', 'v']);
         expect(t.toRows(), [
           {'id': 2498, 'v': 4996},
@@ -2704,10 +3224,10 @@ void main() {
       });
 
       test('JSON-Lines aggregate over a lazy scan is correct', () async {
-        final e = SqlEngine(allowExternalPaths: true);
-        final t = await e.execute(
-          "SELECT COUNT(*) AS n, SUM(v) AS s FROM '${jsonl(2500)}'",
-        );
+        final e = SqlEngine.open(allowExternalPaths: true).ok;
+        final t = await e
+            .execute("SELECT COUNT(*) AS n, SUM(v) AS s FROM '${jsonl(2500)}'")
+            .ok;
         expect(t.toRows().single, {
           'n': 2500,
           's': Decimal(BigInt.from(6247500), 0),
@@ -2717,11 +3237,10 @@ void main() {
       test(
         'executeStream over CSV yields multiple batches (bounded input)',
         () async {
-          final e = SqlEngine(allowExternalPaths: true);
+          final e = SqlEngine.open(allowExternalPaths: true).ok;
           var batches = 0, rows = 0;
-          await for (final b in e.executeStream(
-            "SELECT id FROM '${csv(2500)}'",
-          )) {
+          await for (final b
+              in e.executeStream("SELECT id FROM '${csv(2500)}'").ok) {
             batches++;
             rows += b.rowCount;
           }
@@ -2745,15 +3264,16 @@ void main() {
       }
 
       test('an undrained executeStream does NOT block a later query', () async {
-        final engine = SqlEngine(allowExternalPaths: true);
-        // Pull ONE batch then stop (never drain) — the old code held the lock here.
+        final engine = SqlEngine.open(allowExternalPaths: true).ok;
+        // Pull ONE batch then stop (never drain): the old code held the lock here.
         final it = StreamIterator(
-          engine.executeStream("SELECT id FROM '${csv('big', 3000)}'"),
+          engine.executeStream("SELECT id FROM '${csv('big', 3000)}'").ok,
         );
         expect(await it.moveNext(), isTrue);
         // A different query must still run promptly rather than deadlocking.
         final t = await engine
             .execute("SELECT COUNT(*) AS n FROM '${csv('small', 10)}'")
+            .ok
             .timeout(const Duration(seconds: 5));
         expect(t.toRows().single['n'], 10);
         await it.cancel();
@@ -2762,12 +3282,12 @@ void main() {
       test(
         'two concurrent stream consumers interleave to full counts',
         () async {
-          final engine = SqlEngine(allowExternalPaths: true);
+          final engine = SqlEngine.open(allowExternalPaths: true).ok;
           final a = StreamIterator(
-            engine.executeStream("SELECT id FROM '${csv('a', 1500)}'"),
+            engine.executeStream("SELECT id FROM '${csv('a', 1500)}'").ok,
           );
           final b = StreamIterator(
-            engine.executeStream("SELECT id FROM '${csv('b', 1700)}'"),
+            engine.executeStream("SELECT id FROM '${csv('b', 1700)}'").ok,
           );
           var ca = 0, cb = 0;
           var more = true;
@@ -2791,15 +3311,15 @@ void main() {
 
       test('cancel mid-stream leaves no spill files', () async {
         final spill = Directory('${dir.path}/spill')..createSync();
-        final engine = SqlEngine(
+        final engine = SqlEngine.open(
           allowExternalPaths: true,
           spillThresholdBytes: 64 << 10, // force ORDER BY to spill
           spillDir: spill.path,
-        );
+        ).ok;
         final it = StreamIterator(
-          engine.executeStream(
-            "SELECT id FROM '${csv('s', 60000)}' ORDER BY id",
-          ),
+          engine
+              .executeStream("SELECT id FROM '${csv('s', 60000)}' ORDER BY id")
+              .ok,
         );
         expect(await it.moveNext(), isTrue); // sort completed (spilled+merged)
         await it.cancel(); // close() must reclaim spill files
@@ -2840,7 +3360,7 @@ void main() {
       await ParquetWriter(
         path,
         options: ParquetWriterOptions(rowGroupSize: rowGroupSize),
-      ).write(t);
+      ).write(t).ok;
       return path;
     }
 
@@ -2848,7 +3368,7 @@ void main() {
     late SqlEngine engine;
     setUp(() {
       dir = Directory.systemTemp.createTempSync('sql_lazy_');
-      engine = SqlEngine(allowExternalPaths: true);
+      engine = SqlEngine.open(allowExternalPaths: true).ok;
     });
     tearDown(() => dir.deleteSync(recursive: true));
 
@@ -2856,9 +3376,9 @@ void main() {
       'SELECT over a parquet file (lazy scan) returns correct rows',
       () async {
         final p = await writeParquet('${dir.path}/d.parquet', 1000, 200);
-        final t = await engine.execute(
-          "SELECT id, name FROM '$p' WHERE id < 3 ORDER BY id",
-        );
+        final t = await engine
+            .execute("SELECT id, name FROM '$p' WHERE id < 3 ORDER BY id")
+            .ok;
         expect(t.column('id')!.toList(), [0, 1, 2]);
         expect(t.column('name')!.toList(), ['n0', 'n1', 'n2']);
       },
@@ -2866,7 +3386,10 @@ void main() {
 
     test('executeStream yields multiple batches (one per row group)', () async {
       final p = await writeParquet('${dir.path}/s.parquet', 1000, 200);
-      final batches = await engine.executeStream("SELECT * FROM '$p'").toList();
+      final batches = await engine
+          .executeStream("SELECT * FROM '$p'")
+          .ok
+          .toList();
       expect(
         batches.length,
         greaterThan(1),
@@ -2883,7 +3406,7 @@ void main() {
     test('WHERE pushdown prunes row groups from SQL', () async {
       final p = await writeParquet('${dir.path}/f.parquet', 1000, 200);
       ParquetReader.rowGroupsPruned = 0;
-      final t = await engine.execute("SELECT id FROM '$p' WHERE id >= 800");
+      final t = await engine.execute("SELECT id FROM '$p' WHERE id >= 800").ok;
       expect(t.rowCount, 200); // 800..999
       expect(
         ParquetReader.rowGroupsPruned,
@@ -2896,9 +3419,9 @@ void main() {
       'aggregate over a lazy parquet scan is correct (blocking op)',
       () async {
         final p = await writeParquet('${dir.path}/a.parquet', 1000, 200);
-        final t = await engine.execute(
-          "SELECT count(*) AS c FROM '$p' WHERE id < 500",
-        );
+        final t = await engine
+            .execute("SELECT count(*) AS c FROM '$p' WHERE id < 500")
+            .ok;
         expect(t.column('c')!.toList().first, 500);
       },
     );
@@ -2911,12 +3434,12 @@ void main() {
       ); // 5 groups, 2 cols
 
       ParquetReader.columnsRead = 0;
-      final one = await engine.execute("SELECT id FROM '$p'");
+      final one = await engine.execute("SELECT id FROM '$p'").ok;
       final readForOne = ParquetReader.columnsRead; // 5 groups x 1 col = 5
       expect(one.schema.fieldNames, ['id']);
 
       ParquetReader.columnsRead = 0;
-      await engine.execute("SELECT * FROM '$p'");
+      await engine.execute("SELECT * FROM '$p'").ok;
       final readForStar = ParquetReader.columnsRead; // 5 groups x 2 cols = 10
 
       expect(
@@ -2933,7 +3456,7 @@ void main() {
       () async {
         final p = await writeParquet('${dir.path}/pw.parquet', 100, 50);
         // name is selected, id only used in WHERE -> scan must still read id.
-        final t = await engine.execute("SELECT name FROM '$p' WHERE id = 7");
+        final t = await engine.execute("SELECT name FROM '$p' WHERE id = 7").ok;
         expect(t.column('name')!.toList(), ['n7']);
       },
     );
@@ -2941,35 +3464,44 @@ void main() {
 
   group('parquet queries', () {
     test('SQL engine queries a registered Parquet file', () async {
-      final engine = SqlEngine();
-      await engine.registerFile('flights', 'test/fixtures/flights-1m.parquet');
+      final engine = SqlEngine.open().ok;
+      await engine
+          .registerFile('flights', 'test/fixtures/flights-1m.parquet')
+          .ok;
 
-      final count = await engine.execute('SELECT COUNT(*) AS n FROM flights');
+      final count = await engine
+          .execute('SELECT COUNT(*) AS n FROM flights')
+          .ok;
       expect(count.toRows().first['n'], 1000000);
     });
 
     test(
       'a registered file persists across queries (not a per-query temp)',
       () async {
-        final engine = SqlEngine();
-        await engine.registerFile(
-          'flights',
-          'test/fixtures/flights-1m.parquet',
-        );
+        final engine = SqlEngine.open().ok;
+        await engine
+            .registerFile('flights', 'test/fixtures/flights-1m.parquet')
+            .ok;
         // The lazy registration must survive the first query's _cleanup and remain
         // usable for the next query (regression: _clearTemporaryFileTables drop).
-        await engine.execute('SELECT DISTANCE FROM flights LIMIT 1');
-        final again = await engine.execute('SELECT COUNT(*) AS n FROM flights');
+        await engine.execute('SELECT DISTANCE FROM flights LIMIT 1').ok;
+        final again = await engine
+            .execute('SELECT COUNT(*) AS n FROM flights')
+            .ok;
         expect(again.toRows().first['n'], 1000000);
         expect(engine.listTables(), contains('flights'));
       },
     );
 
     test('SQL engine reports unsupported file types clearly', () async {
-      final engine = SqlEngine();
-      expect(
-        () => engine.registerFile('x', 'data.xlsx'),
-        throwsA(isA<ArgumentError>()),
+      final dir = Directory.systemTemp.createTempSync('xlsx_');
+      addTearDown(() => dir.deleteSync(recursive: true));
+      final file = File('${dir.path}/data.xlsx')..writeAsStringSync('x');
+      final engine = SqlEngine.open(allowExternalPaths: true).ok;
+      addTearDown(engine.dispose);
+      await expectLater(
+        engine.registerFile('x', file.path),
+        failsWith(Kind.invalid, contains('xlsx')),
       );
     });
   });
@@ -3024,10 +3556,13 @@ void main() {
 
     Future<List<Map<String, dynamic>>> run(int budget, String sql) async {
       final engine = budget == 0
-          ? SqlEngine(spillThresholdBytes: 0)
-          : SqlEngine(spillThresholdBytes: budget, spillDir: spillDir.path);
+          ? SqlEngine.open(spillThresholdBytes: 0).ok
+          : SqlEngine.open(
+              spillThresholdBytes: budget,
+              spillDir: spillDir.path,
+            ).ok;
       engine.registerTable('t', data(rows));
-      return (await engine.execute(sql)).toRows();
+      return (await engine.execute(sql).ok).toRows();
     }
 
     // Tiny budget => many runs/partitions.
@@ -3102,7 +3637,7 @@ void main() {
       test(
         'high-cardinality COUNT(DISTINCT) spills (few groups, many distinct)',
         () => expectSpillMatchesMemory(
-          // Few group keys (cat ~11) but many distinct ids — the case where the
+          // Few group keys (cat ~11) but many distinct ids: the case where the
           // old per-group `seen` set grew unbounded; the two-level rewrite spills.
           'SELECT cat, COUNT(DISTINCT id) AS d FROM t GROUP BY cat',
           ordered: false,
@@ -3121,6 +3656,60 @@ void main() {
           ordered: false,
         ),
       );
+
+      test('few groups fold as rows stream in and never spill', () async {
+        // 300k rows in 2 groups at a 64 KiB threshold: buffering the rows
+        // would pass the threshold many times over, but the group table holds
+        // two entries. A 1-byte spill cap fails the query if anything spills.
+        const n = 300000;
+        final engine = SqlEngine.open(
+          spillThresholdBytes: 64 << 10,
+          spillDir: spillDir.path,
+          maxSpillBytes: 1,
+        ).ok;
+        addTearDown(engine.dispose);
+        engine.registerTable(
+          't',
+          Table(
+            name: 't',
+            columns: [
+              NumericColumn.int64(
+                name: 'g',
+                values: [for (var i = 0; i < n; i++) i % 2],
+                nullable: false,
+              ),
+              NumericColumn.int64(
+                name: 'v',
+                values: [for (var i = 0; i < n; i++) i],
+                nullable: false,
+              ),
+            ],
+            schema: Schema(
+              fields: [
+                Field(name: 'g', dataType: DataType.int64, nullable: false),
+                Field(name: 'v', dataType: DataType.int64, nullable: false),
+              ],
+            ),
+          ),
+        );
+        final rows =
+            (await engine
+                    .execute(
+                      'SELECT g, COUNT(*) AS c, SUM(v) AS s FROM t '
+                      'GROUP BY g ORDER BY g',
+                    )
+                    .ok)
+                .toRows();
+        expect(
+          [
+            for (final r in rows) [r['g'], r['c'], '${r['s']}'],
+          ],
+          [
+            [0, n ~/ 2, '22499850000'],
+            [1, n ~/ 2, '22500000000'],
+          ],
+        );
+      });
 
       test('skewed key + high cardinality (recursive repartition)', () async {
         // 90% of rows share one HOT key (a skewed partition that must not be
@@ -3153,12 +3742,18 @@ void main() {
         );
         Future<List<Map<String, dynamic>>> g(int budget) async {
           final engine = budget == 0
-              ? SqlEngine(spillThresholdBytes: 0)
-              : SqlEngine(spillThresholdBytes: budget, spillDir: spillDir.path);
+              ? SqlEngine.open(spillThresholdBytes: 0).ok
+              : SqlEngine.open(
+                  spillThresholdBytes: budget,
+                  spillDir: spillDir.path,
+                ).ok;
           engine.registerTable('t', skew);
-          return (await engine.execute(
-            'SELECT k, COUNT(*) AS c, SUM(v) AS s FROM t GROUP BY k',
-          )).toRows();
+          return (await engine
+                  .execute(
+                    'SELECT k, COUNT(*) AS c, SUM(v) AS s FROM t GROUP BY k',
+                  )
+                  .ok)
+              .toRows();
         }
 
         final memory = await g(0);
@@ -3186,13 +3781,15 @@ void main() {
     });
 
     test('spill files are cleaned up after the query', () async {
-      final engine = SqlEngine(
+      final engine = SqlEngine.open(
         spillThresholdBytes: 4096,
         spillDir: spillDir.path,
-      );
+      ).ok;
       engine.registerTable('t', data(rows));
-      await engine.execute('SELECT id FROM t ORDER BY amount, id');
-      await engine.execute('SELECT cat, SUM(amount) AS s FROM t GROUP BY cat');
+      await engine.execute('SELECT id FROM t ORDER BY amount, id').ok;
+      await engine
+          .execute('SELECT cat, SUM(amount) AS s FROM t GROUP BY cat')
+          .ok;
       final leftover = spillDir
           .listSync()
           .where((f) => f.path.contains('spill-'))
@@ -3213,15 +3810,16 @@ void main() {
           spillDir.listSync().where((f) => f.path.contains('spill-')).length;
 
       test('cancelled GROUP BY stream leaves no spill files', () async {
-        final engine = SqlEngine(
+        final engine = SqlEngine.open(
           spillThresholdBytes: 4096,
           spillDir: spillDir.path,
-        );
+        ).ok;
         engine.registerTable('t', data(rows));
         // Consume one batch then abandon the subscription mid-drain.
         await for (final _
             in engine
                 .executeStream('SELECT cat, COUNT(*) AS n FROM t GROUP BY cat')
+                .ok
                 .take(1)) {
           break;
         }
@@ -3229,15 +3827,16 @@ void main() {
       });
 
       test('cancelled JOIN stream leaves no spill files', () async {
-        final engine = SqlEngine(
+        final engine = SqlEngine.open(
           spillThresholdBytes: 4096,
           spillDir: spillDir.path,
-        );
+        ).ok;
         engine.registerTable('a', data(rows));
         engine.registerTable('b', data(rows));
         await for (final _
             in engine
                 .executeStream('SELECT a.id FROM a JOIN b ON a.id = b.id')
+                .ok
                 .take(1)) {
           break;
         }
@@ -3245,20 +3844,52 @@ void main() {
       });
 
       test('cancelled ORDER BY stream leaves no spill files', () async {
-        final engine = SqlEngine(
+        final engine = SqlEngine.open(
           spillThresholdBytes: 4096,
           spillDir: spillDir.path,
-        );
+        ).ok;
         engine.registerTable('t', data(rows));
         await for (final _
             in engine
                 .executeStream('SELECT id, amount FROM t ORDER BY amount, id')
+                .ok
                 .take(1)) {
           break;
         }
         expect(spillFiles(), 0);
       });
     });
+
+    test(
+      'a finalized run larger than its budget is deleted and refunded',
+      () async {
+        final batch = RecordBatch(
+          columns: [
+            NumericColumn.int64(name: 'k', values: [1], nullable: false),
+          ],
+          schema: Schema(
+            fields: [
+              Field(name: 'k', dataType: DataType.int64, nullable: false),
+            ],
+          ),
+          rowCount: 1,
+        );
+        // A one-row Parquet file is mostly footer, so it finalizes larger than
+        // its in-memory estimate; the budget leaves no room for the difference.
+        final budget = SpillBudget(
+          Table(
+            name: 'spill',
+            schema: batch.schema,
+            columns: batch.columns,
+          ).memoryUsage,
+        );
+        final w = SpillWriter(spillDir.path, batch.schema, budget: budget);
+        await w.add(batch);
+        await expectLater(w.finish(), throwsFailure(Kind.limit));
+        expect(File(w.path).existsSync(), isFalse);
+        expect(budget.used, 0);
+      },
+    );
 
     group('Arrow spill format', () {
       test('supported types write a .arrow file and round-trip', () async {
@@ -3299,7 +3930,7 @@ void main() {
       });
 
       test('an Arrow-unsupported type selects the Parquet backend', () {
-        // The type gate decides the backend (and file extension) at construction.
+        // The type check decides the backend (and file extension) at construction.
         // Nested types are not yet Arrow-encodable -> Parquet fallback.
         final schema = Schema(
           fields: [Field(name: 'l', dataType: DataType.list, nullable: false)],
@@ -3315,15 +3946,15 @@ void main() {
 
     group('maxSpillBytes cap', () {
       test('a tiny cap fails a spilling query fast', () async {
-        final engine = SqlEngine(
+        final engine = SqlEngine.open(
           spillThresholdBytes: 4096,
           spillDir: spillDir.path,
           maxSpillBytes: 4096, // smaller than the total that must spill
-        );
+        ).ok;
         engine.registerTable('t', data(rows));
         await expectLater(
           engine.execute('SELECT id FROM t ORDER BY amount, id'),
-          throwsA(isA<StateError>()),
+          failsWith(Kind.limit),
         );
         // Partial spill files are cleaned up by operator close on the failure.
         final leftover = spillDir
@@ -3334,14 +3965,14 @@ void main() {
       });
 
       test('null (default) leaves spilling unbounded', () async {
-        final engine = SqlEngine(
+        final engine = SqlEngine.open(
           spillThresholdBytes: 4096,
           spillDir: spillDir.path,
-        );
+        ).ok;
         engine.registerTable('t', data(rows));
-        final out = await engine.execute(
-          'SELECT id FROM t ORDER BY amount, id',
-        );
+        final out = await engine
+            .execute('SELECT id FROM t ORDER BY amount, id')
+            .ok;
         expect(out.rowCount, rows);
       });
 
@@ -3349,7 +3980,7 @@ void main() {
         final b = SpillBudget(100);
         b.charge(60);
         expect(b.used, 60);
-        expect(() => b.charge(50), throwsA(isA<StateError>())); // 60+50 > 100
+        expect(() => b.charge(50), throwsFailure(Kind.limit)); // 60+50 > 100
         expect(b.used, 60, reason: 'a rejected charge counts nothing');
         b.release(60);
         expect(b.used, 0);
@@ -3365,7 +3996,7 @@ void main() {
     late Directory dir;
     setUp(() {
       dir = Directory.systemTemp.createTempSync('phaseB_');
-      engine = SqlEngine(spillDir: dir.path);
+      engine = SqlEngine.open(spillDir: dir.path).ok;
     });
     tearDown(() async {
       await engine.dispose();
@@ -3414,7 +4045,9 @@ void main() {
 
       // The shared Kernels.disambiguate (used by both SqlEngine._display and
       // DataFrame.execute) turns the two collided `v` fields into a.v / b.v.
-      final sql = await engine.execute('SELECT * FROM a JOIN b ON a.k = b.k');
+      final sql = await engine
+          .execute('SELECT * FROM a JOIN b ON a.k = b.k')
+          .ok;
       final names = sql.schema.fields.map((f) => f.name).toSet();
       expect(names.contains('a.v'), isTrue);
       expect(names.contains('b.v'), isTrue);
@@ -3430,10 +4063,10 @@ void main() {
         {'k': 2, 'y': 200},
       ]);
       // The coalesced key plus distinct payload columns collide on nothing, so
-      // the shared disambiguate is a no-op — names stay bare.
+      // the shared disambiguate is a no-op: names stay bare.
       final df = await DataFrame.fromTable(
         a,
-      ).join(DataFrame.fromTable(b), 'k').execute();
+      ).join(DataFrame.fromTable(b), 'k').execute().ok;
       expect(df.schema.fields.map((f) => f.name).toList(), ['k', 'x', 'y']);
     });
   });
@@ -3447,7 +4080,7 @@ void main() {
     group('#3 SQL set-operation schema binding', () {
       late SqlEngine engine;
       setUp(() {
-        engine = SqlEngine(spillDir: dir.path);
+        engine = SqlEngine.open(spillDir: dir.path).ok;
         Table one(String col, DataType t, List<int> v) => Table(
           name: 'x',
           columns: [
@@ -3484,25 +4117,25 @@ void main() {
       test('mismatched arity throws (was: b silently discarded)', () async {
         await expectLater(
           engine.execute('SELECT a FROM one UNION ALL SELECT a, b FROM two'),
-          throwsA(isA<ArgumentError>()),
+          failsWith(Kind.schema),
         );
       });
 
       test(
         'valid positional union with different names uses left names',
         () async {
-          final t = await engine.execute(
-            'SELECT a FROM one UNION ALL SELECT x FROM diff',
-          );
+          final t = await engine
+              .execute('SELECT a FROM one UNION ALL SELECT x FROM diff')
+              .ok;
           expect(t.schema.fields.single.name, 'a'); // left name stamped
           expect(t.column('a')!.toList()..sort(), [1, 2, 3]);
         },
       );
 
       test('same-type positional union works', () async {
-        final t = await engine.execute(
-          'SELECT a FROM one UNION ALL SELECT x FROM diff',
-        );
+        final t = await engine
+            .execute('SELECT a FROM one UNION ALL SELECT x FROM diff')
+            .ok;
         expect(t.column('a')!.toList()..sort(), [1, 2, 3]);
       });
 
@@ -3512,9 +4145,9 @@ void main() {
           // int32 ∪ int64: the physical set-op now reconciles real branch types and
           // coerces to the common type (int64), so this succeeds with promotion
           // instead of crashing at concat/validate.
-          final t = await engine.execute(
-            'SELECT a FROM wide UNION ALL SELECT a FROM one',
-          );
+          final t = await engine
+              .execute('SELECT a FROM wide UNION ALL SELECT a FROM one')
+              .ok;
           expect(t.schema.fields.single.dataType, DataType.int64);
           expect(t.column('a')!.toList()..sort(), [1, 2, 7]);
         },
@@ -3530,7 +4163,7 @@ void main() {
 
     group('#A1 set-operation type promotion (was a crash)', () {
       late SqlEngine engine;
-      setUp(() => engine = SqlEngine(spillDir: dir.path));
+      setUp(() => engine = SqlEngine.open(spillDir: dir.path).ok);
       tearDown(() => engine.dispose());
 
       Table col(String name, DataType t, List<num> v) => Table(
@@ -3562,9 +4195,9 @@ void main() {
       test('int32 UNION ALL int64 promotes to int64', () async {
         engine.registerTable('a', col('n', DataType.int32, [1, 2]));
         engine.registerTable('b', col('n', DataType.int64, [1 << 40]));
-        final t = await engine.execute(
-          'SELECT n FROM a UNION ALL SELECT n FROM b',
-        );
+        final t = await engine
+            .execute('SELECT n FROM a UNION ALL SELECT n FROM b')
+            .ok;
         expect(t.column('n')!.toList()..sort(), [1, 2, 1 << 40]);
         expect(t.schema.fields.single.dataType, DataType.int64);
       });
@@ -3572,7 +4205,9 @@ void main() {
       test('int UNION float promotes to float64', () async {
         engine.registerTable('a', col('n', DataType.int64, [1, 2]));
         engine.registerTable('b', col('n', DataType.float64, [2.5]));
-        final t = await engine.execute('SELECT n FROM a UNION SELECT n FROM b');
+        final t = await engine
+            .execute('SELECT n FROM a UNION SELECT n FROM b')
+            .ok;
         expect((t.column('n')!.toList().cast<num>()..sort()), [1.0, 2.0, 2.5]);
         expect(t.schema.fields.single.dataType, DataType.float64);
       });
@@ -3580,7 +4215,7 @@ void main() {
       // Unifying int64 with float64 is float64 (standard SQL), but float64
       // cannot hold every int64: 2^53+1 rounds DOWN to 2^53. A 64-bit id or
       // counter would be silently rewritten, so the cast refuses rather than
-      // round. The alternative — decimal — needs a scale that only the DATA can
+      // round. The alternative (decimal) needs a scale that only the DATA can
       // supply, and a set-op's schema is fixed before any data is read.
       test('an int64 too large for float64 fails loud, not rounds', () async {
         engine.registerTable(
@@ -3590,7 +4225,7 @@ void main() {
         engine.registerTable('b', col('n', DataType.float64, [0.5]));
         await expectLater(
           engine.execute('SELECT n FROM a UNION ALL SELECT n FROM b'),
-          throwsA(isA<ArgumentError>()),
+          failsWith(Kind.invalid),
         );
       });
 
@@ -3599,26 +4234,23 @@ void main() {
         engine.registerTable('b', col('n', DataType.float64, [0.5]));
         await expectLater(
           engine.execute('SELECT n FROM a UNION ALL SELECT n FROM b'),
-          throwsA(
-            isA<ArgumentError>().having(
-              (e) => e.message.toString(),
-              'message',
-              allOf(contains('n'), contains('9007199254740993')),
-            ),
+          failsWith(
+            Kind.invalid,
+            allOf(contains('n'), contains('9007199254740993')),
           ),
         );
       });
 
       test('an int64 ABOVE 2^53 that is exact still promotes', () async {
-        // 2^54 is exactly representable — reject only genuine loss, not size.
+        // 2^54 is exactly representable: reject only genuine loss, not size.
         engine.registerTable(
           'a',
           col('n', DataType.int64, [18014398509481984]),
         );
         engine.registerTable('b', col('n', DataType.float64, [0.5]));
-        final t = await engine.execute(
-          'SELECT n FROM a UNION ALL SELECT n FROM b',
-        );
+        final t = await engine
+            .execute('SELECT n FROM a UNION ALL SELECT n FROM b')
+            .ok;
         expect((t.column('n')!.toList().cast<num>()..sort()), [
           0.5,
           18014398509481984.0,
@@ -3628,16 +4260,16 @@ void main() {
       test('2^53 itself promotes (the boundary is inclusive)', () async {
         engine.registerTable('a', col('n', DataType.int64, [9007199254740992]));
         engine.registerTable('b', col('n', DataType.float64, [0.5]));
-        final t = await engine.execute(
-          'SELECT n FROM a UNION ALL SELECT n FROM b',
-        );
+        final t = await engine
+            .execute('SELECT n FROM a UNION ALL SELECT n FROM b')
+            .ok;
         expect(t.column('n')!.toList().contains(9007199254740992.0), isTrue);
       });
     });
 
     group('#A3/A4/A5 SQL correctness', () {
       late SqlEngine engine;
-      setUp(() => engine = SqlEngine(spillDir: dir.path));
+      setUp(() => engine = SqlEngine.open(spillDir: dir.path).ok);
       tearDown(() => engine.dispose());
 
       Table ints(String name, List<int> v) => Table(
@@ -3656,14 +4288,14 @@ void main() {
           engine.registerTable('t', ints('a', [1 << 40]));
           await expectLater(
             engine.execute('SELECT a * a AS p FROM t'),
-            throwsA(isA<StateError>()),
+            failsWith(Kind.invalid),
           );
         },
       );
 
       test('A4: non-overflowing int64 arithmetic stays int64', () async {
         engine.registerTable('t', ints('a', [3, 4]));
-        final r = await engine.execute('SELECT a * 2 AS p FROM t');
+        final r = await engine.execute('SELECT a * 2 AS p FROM t').ok;
         expect(r.column('p')!.toList()..sort(), [6, 8]);
         expect(r.schema.fields.single.dataType, DataType.int64);
       });
@@ -3696,7 +4328,7 @@ void main() {
             ),
           ),
         );
-        final r = await engine.execute('SELECT d + d AS s FROM t');
+        final r = await engine.execute('SELECT d + d AS s FROM t').ok;
         expect(r.column('s')!.toList()..sort(), [
           BigInt.from(6),
           BigInt.from(8),
@@ -3706,15 +4338,17 @@ void main() {
       test('A3: AVG of large ints uses an exact numerator', () async {
         const big = 9007199254740993; // 2^53+1
         engine.registerTable('t', ints('a', [big, big]));
-        final r = await engine.execute('SELECT AVG(a) AS m FROM t');
+        final r = await engine.execute('SELECT AVG(a) AS m FROM t').ok;
         expect(r.column('m')!.toList().single, closeTo(big.toDouble(), 2.0));
       });
 
       test('A5: CASE with a true-OR-null condition matches (3VL)', () async {
         engine.registerTable('t', ints('a', [1]));
-        final r = await engine.execute(
-          "SELECT CASE WHEN (a = 1 OR NULL) THEN 'y' ELSE 'n' END AS c FROM t",
-        );
+        final r = await engine
+            .execute(
+              "SELECT CASE WHEN (a = 1 OR NULL) THEN 'y' ELSE 'n' END AS c FROM t",
+            )
+            .ok;
         expect(r.column('c')!.toList().single, 'y');
       });
     });
@@ -3752,12 +4386,12 @@ void main() {
       );
 
       late SqlEngine engine;
-      setUp(() => engine = SqlEngine(spillDir: dir.path));
+      setUp(() => engine = SqlEngine.open(spillDir: dir.path).ok);
       tearDown(() => engine.dispose());
 
       test('add keeps scale 2 (unscaled add, result scale 2)', () async {
         engine.registerTable('t', dec('a', [BigInt.from(150)]));
-        final r = await engine.execute('SELECT a + a AS s FROM t');
+        final r = await engine.execute('SELECT a + a AS s FROM t').ok;
         expect(r.schema.fields.single.scale, 2);
         expect(r.column('s')!.toList().single, BigInt.from(300)); // 3.00
       });
@@ -3797,14 +4431,14 @@ void main() {
           ),
         );
         engine.registerTable('t', t);
-        final r = await engine.execute('SELECT a * b AS p FROM t');
+        final r = await engine.execute('SELECT a * b AS p FROM t').ok;
         expect(r.schema.fields.single.scale, 4);
         expect(r.column('p')!.toList().single, BigInt.from(34500)); // 3.4500
       });
 
       test('decimal + int literal aligns scale', () async {
         engine.registerTable('t', dec('a', [BigInt.from(150)])); // 1.50
-        final r = await engine.execute('SELECT a + 3 AS s FROM t');
+        final r = await engine.execute('SELECT a + 3 AS s FROM t').ok;
         expect(r.schema.fields.single.scale, 2);
         expect(r.column('s')!.toList().single, BigInt.from(450)); // 4.50
       });
@@ -3814,7 +4448,7 @@ void main() {
       test(
         'int column UNION a decimal (SUM) promotes to decimal BigInt',
         () async {
-          final engine = SqlEngine(spillDir: dir.path);
+          final engine = SqlEngine.open(spillDir: dir.path).ok;
           addTearDown(engine.dispose);
           engine.registerTable(
             't',
@@ -3832,9 +4466,9 @@ void main() {
           );
           // SUM(n) is decimal(38,0); UNION with the int column n → decimal common
           // type. Previously: castTo(int→decimal) threw ArgumentError mid-query.
-          final r = await engine.execute(
-            'SELECT n FROM t UNION ALL SELECT SUM(n) FROM t',
-          );
+          final r = await engine
+              .execute('SELECT n FROM t UNION ALL SELECT SUM(n) FROM t')
+              .ok;
           expect(r.schema.fields.single.dataType, DataType.decimal);
           // All values are BigInt (no double-in-decimal corruption).
           expect(r.column('n')!.toList().every((v) => v is BigInt), isTrue);
@@ -3860,7 +4494,7 @@ void main() {
     group('#4 function value types match their declared type', () {
       late SqlEngine engine;
       setUp(() {
-        engine = SqlEngine();
+        engine = SqlEngine.open().ok;
         engine.registerTable(
           't',
           Table(
@@ -3889,9 +4523,11 @@ void main() {
 
       test('ABS(int)->int64, MOD(int,int)->int64, COALESCE(int,double)->float64,'
           ' all Parquet-writable', () async {
-        final r = await engine.execute(
-          'SELECT ABS(i) AS a, MOD(i, 2) AS m, COALESCE(i, d) AS c FROM t',
-        );
+        final r = await engine
+            .execute(
+              'SELECT ABS(i) AS a, MOD(i, 2) AS m, COALESCE(i, d) AS c FROM t',
+            )
+            .ok;
         expect(typeOf(r, 'a'), DataType.int64);
         expect(typeOf(r, 'm'), DataType.int64);
         expect(typeOf(r, 'c'), DataType.float64);
@@ -3900,14 +4536,14 @@ void main() {
         // Round-trip through Parquet (previously threw 'int is not a subtype of
         // double').
         final path = '${dir.path}/fn.parquet';
-        await ParquetWriter(path).write(r);
-        final back = await ParquetReader(path).read();
+        await ParquetWriter(path).write(r).ok;
+        final back = await ParquetReader(path).read().ok;
         expect(back.rowCount, 3);
       });
     });
 
     test('#8 a CASE SQL statement parses and executes', () async {
-      final engine = SqlEngine();
+      final engine = SqlEngine.open().ok;
       engine.registerTable(
         't',
         Table(
@@ -3920,9 +4556,11 @@ void main() {
           ],
         ),
       );
-      final r = await engine.execute(
-        "SELECT CASE WHEN id > 1 THEN 'big' ELSE 'small' END AS c FROM t",
-      );
+      final r = await engine
+          .execute(
+            "SELECT CASE WHEN id > 1 THEN 'big' ELSE 'small' END AS c FROM t",
+          )
+          .ok;
       expect(r.column('c')!.toList(), ['small', 'big', 'big']);
     });
   });
@@ -3934,7 +4572,7 @@ void main() {
     tearDown(() => dir.deleteSync(recursive: true));
 
     test('SQL DISTINCT over a binary column dedups equal values', () async {
-      final engine = SqlEngine(spillDir: dir.path);
+      final engine = SqlEngine.open(spillDir: dir.path).ok;
       engine.registerTable(
         't',
         Table(
@@ -3956,7 +4594,7 @@ void main() {
           ),
         ),
       );
-      final r = await engine.execute('SELECT DISTINCT k FROM t');
+      final r = await engine.execute('SELECT DISTINCT k FROM t').ok;
       expect(r.rowCount, 2); // identity equality would have kept 3
       await engine.dispose();
     });
@@ -3999,15 +4637,15 @@ void main() {
     }
 
     setUp(() {
-      engine = SqlEngine();
+      engine = SqlEngine.open().ok;
       register('d', [100, 250, 1000]); // 1.00, 2.50, 10.00
     });
     tearDown(() => engine.dispose());
 
     Future<List<Object?>> truth(String sql) async =>
-        (await engine.execute(sql)).column('r')!.toList();
+        (await engine.execute(sql).ok).column('r')!.toList();
     Future<List<Object?>> kept(String sql) async =>
-        (await engine.execute(sql)).column('v')!.toList();
+        (await engine.execute(sql).ok).column('v')!.toList();
 
     test('= matches a float literal of the same value', () async {
       expect(await truth('SELECT v = 1.00 AS r FROM d'), [true, false, false]);
@@ -4016,7 +4654,7 @@ void main() {
     });
 
     test('= matches an int literal of the same value', () async {
-      // 1.00 == 1 and 10.00 == 10 — the int literal is scale 0.
+      // 1.00 == 1 and 10.00 == 10: the int literal is scale 0.
       expect(await truth('SELECT v = 1 AS r FROM d'), [true, false, false]);
       expect(await truth('SELECT v = 10 AS r FROM d'), [false, false, true]);
     });
@@ -4077,7 +4715,7 @@ void main() {
     });
 
     test('two decimal columns of different scales compare by value', () async {
-      // e holds 1.0000 and 2.5000 at scale 4 — the same values as d's first two.
+      // e holds 1.0000 and 2.5000 at scale 4: the same values as d's first two.
       register('e', [10000, 25000], scale: 4);
       expect(
         await truth('SELECT d.v = e.v AS r FROM d, e WHERE d.v = 1.00'),
@@ -4087,15 +4725,18 @@ void main() {
 
     test('arithmetic with a float literal yields a float', () async {
       // decimal OP float is float-typed (any float operand floats the result),
-      // so the decimal side must convert rather than crash.
-      final t = await engine.execute('SELECT v + 1.5 AS r FROM d');
+      // so the decimal side must convert rather than crash. (`1.5` alone is a
+      // DECIMAL literal, as in DuckDB.)
+      final t = await engine
+          .execute('SELECT v + CAST(1.5 AS DOUBLE) AS r FROM d')
+          .ok;
       expect(t.schema.field('r')!.dataType, DataType.float64);
       expect(t.column('r')!.toList(), [2.5, 4.0, 11.5]);
     });
 
     test('arithmetic with an int literal stays an exact decimal', () async {
       // Unchanged behaviour: int literals are scale 0 and align exactly.
-      final t = await engine.execute('SELECT v + 3 AS r FROM d');
+      final t = await engine.execute('SELECT v + 3 AS r FROM d').ok;
       expect(t.schema.field('r')!.dataType, DataType.decimal);
       expect(t.column('r')!.toList(), [
         BigInt.from(400),
@@ -4141,14 +4782,16 @@ void main() {
   // truncates it silently.
   group('integer literal width', () {
     late SqlEngine engine;
-    setUp(() => engine = SqlEngine());
+    setUp(() => engine = SqlEngine.open().ok);
     tearDown(() => engine.dispose());
 
     Future<Field> field(String literal) async =>
-        (await engine.execute('SELECT $literal AS v')).schema.field('v')!;
-    Future<Object?> value(String literal) async => (await engine.execute(
-      'SELECT $literal AS v',
-    )).column('v')!.toList().first;
+        (await engine.execute('SELECT $literal AS v').ok).schema.field('v')!;
+    Future<Object?> value(String literal) async =>
+        (await engine.execute('SELECT $literal AS v').ok)
+            .column('v')!
+            .toList()
+            .first;
 
     test('a literal is typed by its range, not always int32', () async {
       expect((await field('1')).dataType, DataType.int8);
@@ -4173,22 +4816,22 @@ void main() {
       // These diverged: VALUES range-checked and threw, SELECT silently
       // mislabelled the column int32.
       expect((await field('2147483648')).dataType, DataType.int64);
-      final t = await engine.execute(
-        'SELECT n FROM VALUES (2147483648) AS t(n)',
-      );
+      final t = await engine
+          .execute('SELECT n FROM VALUES (2147483648) AS t(n)')
+          .ok;
       expect(t.schema.field('n')!.dataType, DataType.int64);
       expect(t.column('n')!.toList(), [2147483648]);
     });
   });
 
   // A DISTINCT accumulator keys a Set on raw column values, and a
-  // Uint8List/List/Map hashes by IDENTITY in Dart — so every row's freshly
+  // Uint8List/List/Map hashes by IDENTITY in Dart, so every row's freshly
   // decoded blob looked distinct. `canonicalKey` exists for exactly this and is
   // used by the hash join and the grace router; the aggregate was the one site
   // that kept the raw value.
   group('DISTINCT aggregates over by-identity values', () {
     late SqlEngine engine;
-    setUp(() => engine = SqlEngine());
+    setUp(() => engine = SqlEngine.open().ok);
     tearDown(() => engine.dispose());
 
     /// 100 rows in one group whose `v` is the SAME 4 bytes each time, decoded
@@ -4228,10 +4871,12 @@ void main() {
     // DISTINCT rewrites, so this reaches the raw accumulator.
     test('COUNT(DISTINCT binary) counts by content, not identity', () async {
       registerBinary();
-      final t = await engine.execute(
-        'SELECT LOWER(g) AS k, COUNT(DISTINCT v) AS n, COUNT(*) AS c '
-        'FROM b GROUP BY LOWER(g)',
-      );
+      final t = await engine
+          .execute(
+            'SELECT LOWER(g) AS k, COUNT(DISTINCT v) AS n, COUNT(*) AS c '
+            'FROM b GROUP BY LOWER(g)',
+          )
+          .ok;
       final row = t.toRows().single;
       expect(row['c'], 100);
       expect(row['n'], 1, reason: '100 identical blobs are ONE distinct value');
@@ -4266,15 +4911,17 @@ void main() {
           ),
         ),
       );
-      final t = await engine.execute(
-        'SELECT LOWER(g) AS k, COUNT(DISTINCT v) AS n FROM b2 GROUP BY LOWER(g)',
-      );
+      final t = await engine
+          .execute(
+            'SELECT LOWER(g) AS k, COUNT(DISTINCT v) AS n FROM b2 GROUP BY LOWER(g)',
+          )
+          .ok;
       expect(t.toRows().single['n'], 3);
     });
 
     // Found while writing the tests above. The all-DISTINCT rewrite stacks two
     // aggregates and reads the inner's OUTPUT, but it remapped only the distinct
-    // ARGUMENT to the inner's emitted column — the group keys still referenced
+    // ARGUMENT to the inner's emitted column: the group keys still referenced
     // base columns the inner no longer emits. A mixed aggregate bails out of the
     // rewrite and silently worked, which hid it.
     test('GROUP BY an expression with an all-DISTINCT aggregate works', () async {
@@ -4303,9 +4950,11 @@ void main() {
           ),
         ),
       );
-      final t = await engine.execute(
-        'SELECT LOWER(g) AS k, COUNT(DISTINCT v) AS n FROM e GROUP BY LOWER(g)',
-      );
+      final t = await engine
+          .execute(
+            'SELECT LOWER(g) AS k, COUNT(DISTINCT v) AS n FROM e GROUP BY LOWER(g)',
+          )
+          .ok;
       final byKey = {for (final r in t.toRows()) r['k']: r['n']};
       expect(byKey, {'a': 1, 'b': 2});
     });
@@ -4332,9 +4981,11 @@ void main() {
           ),
         ),
       );
-      final t = await engine.execute(
-        'SELECT LOWER(g) AS k, SUM(DISTINCT v) AS s FROM e2 GROUP BY LOWER(g)',
-      );
+      final t = await engine
+          .execute(
+            'SELECT LOWER(g) AS k, SUM(DISTINCT v) AS s FROM e2 GROUP BY LOWER(g)',
+          )
+          .ok;
       final byKey = {for (final r in t.toRows()) r['k']: r['s'].toString()};
       expect(byKey, {'a': '5', 'b': '7'});
     });
@@ -4361,9 +5012,9 @@ void main() {
           ),
         ),
       );
-      final t = await engine.execute(
-        'SELECT g, COUNT(DISTINCT v) AS n FROM e3 GROUP BY g',
-      );
+      final t = await engine
+          .execute('SELECT g, COUNT(DISTINCT v) AS n FROM e3 GROUP BY g')
+          .ok;
       expect({for (final r in t.toRows()) r['g']: r['n']}, {'a': 1, 'b': 1});
     });
 
@@ -4394,16 +5045,18 @@ void main() {
           ),
         ),
       );
-      final t = await engine.execute(
-        'SELECT LOWER(g) AS k, SUM(DISTINCT v) AS s FROM n GROUP BY LOWER(g)',
-      );
+      final t = await engine
+          .execute(
+            'SELECT LOWER(g) AS k, SUM(DISTINCT v) AS s FROM n GROUP BY LOWER(g)',
+          )
+          .ok;
       expect(t.toRows().single['s'], Decimal(BigInt.from(12), 0)); // 5 + 7
     });
   });
 
   // An expression's column must actually HOLD values of its declared dtype.
   // CASE widened its branches' types but never coerced their values, so a
-  // float64-declared column held Dart ints — a lie that a Parquet write rejects
+  // float64-declared column held Dart ints: a lie that a Parquet write rejects
   // and that splits one decimal value into two DISTINCT groups (BigInt.from(0)
   // != 0). Coercion belongs in `evaluate`, which both the vectorized and the
   // per-row paths go through, so they cannot drift apart.
@@ -4412,7 +5065,7 @@ void main() {
     late Directory dir;
     setUp(() {
       dir = Directory.systemTemp.createTempSync('coerce_');
-      engine = SqlEngine(spillDir: dir.path);
+      engine = SqlEngine.open(spillDir: dir.path).ok;
       engine.registerTable(
         't',
         Table(
@@ -4447,9 +5100,12 @@ void main() {
     });
 
     test('a mixed int/float CASE holds doubles, not ints', () async {
-      final t = await engine.execute(
-        'SELECT CASE WHEN id > 1 THEN 1 ELSE 2.5 END AS c FROM t',
-      );
+      final t = await engine
+          .execute(
+            'SELECT CASE WHEN id > 1 THEN 1 ELSE CAST(2.5 AS DOUBLE) END AS c '
+            'FROM t',
+          )
+          .ok;
       expect(t.schema.field('c')!.dataType, DataType.float64);
       expect(
         t.column('c')!.toList().map((v) => v.runtimeType).toSet(),
@@ -4461,12 +5117,15 @@ void main() {
 
     test('a mixed int/float CASE survives a Parquet write', () async {
       // The dtype lie surfaced here as "int is not a subtype of double".
-      final t = await engine.execute(
-        'SELECT CASE WHEN id > 1 THEN 1 ELSE 2.5 END AS c FROM t',
-      );
+      final t = await engine
+          .execute(
+            'SELECT CASE WHEN id > 1 THEN 1 ELSE CAST(2.5 AS DOUBLE) END AS c '
+            'FROM t',
+          )
+          .ok;
       final path = '${dir.path}/case.parquet';
-      await ParquetWriter(path).write(t);
-      expect((await ParquetReader(path).read()).column('c')!.toList(), [
+      await ParquetWriter(path).write(t).ok;
+      expect((await ParquetReader(path).read().ok).column('c')!.toList(), [
         2.5,
         1.0,
         1.0,
@@ -4474,9 +5133,9 @@ void main() {
     });
 
     test('a decimal CASE keeps its scale', () async {
-      final t = await engine.execute(
-        'SELECT CASE WHEN id > 0 THEN d ELSE d END AS c FROM t',
-      );
+      final t = await engine
+          .execute('SELECT CASE WHEN id > 0 THEN d ELSE d END AS c FROM t')
+          .ok;
       expect(t.schema.field('c')!.dataType, DataType.decimal);
       expect(t.schema.field('c')!.scale, 2, reason: 'else it reads as scale 0');
       expect(t.toRows().first['c'].toString(), '1.50'); // was 150
@@ -4485,9 +5144,9 @@ void main() {
     test('a decimal CASE with an int branch holds BigInt', () async {
       // `ELSE 0` put a raw int in a decimal column; BigInt.from(0) != 0, so a
       // later DISTINCT saw two different values.
-      final t = await engine.execute(
-        'SELECT CASE WHEN id > 2 THEN d ELSE 0 END AS c FROM t',
-      );
+      final t = await engine
+          .execute('SELECT CASE WHEN id > 2 THEN d ELSE 0 END AS c FROM t')
+          .ok;
       expect(t.schema.field('c')!.dataType, DataType.decimal);
       expect(t.column('c')!.toList().map((v) => v.runtimeType).toSet(), {
         BigInt.zero.runtimeType,
@@ -4500,18 +5159,23 @@ void main() {
     });
 
     test('DISTINCT over a decimal CASE does not split one value', () async {
-      final t = await engine.execute(
-        'SELECT DISTINCT CASE WHEN id > 2 THEN d ELSE 0 END AS c FROM t',
-      );
+      final t = await engine
+          .execute(
+            'SELECT DISTINCT CASE WHEN id > 2 THEN d ELSE 0 END AS c FROM t',
+          )
+          .ok;
       expect(t.rowCount, 2); // {0.00, 3.50}, not 3
     });
 
     test('COALESCE coerces per-row too, not just vectorized', () async {
       // The float fix lived only in evalColumn, so the per-row path (a filter
       // predicate) still compared an uncoerced value.
-      final t = await engine.execute(
-        'SELECT COALESCE(id, 2.5) AS c FROM t WHERE COALESCE(id, 2.5) > 1',
-      );
+      final t = await engine
+          .execute(
+            'SELECT COALESCE(id, CAST(2.5 AS DOUBLE)) AS c FROM t '
+            'WHERE COALESCE(id, CAST(2.5 AS DOUBLE)) > 1',
+          )
+          .ok;
       expect(t.column('c')!.toList().map((v) => v.runtimeType).toSet(), {
         double,
       });
@@ -4521,7 +5185,7 @@ void main() {
     test('COALESCE over a decimal keeps its scale and holds BigInt', () async {
       // Same defect as CASE: the widened type without the widened VALUES, so a
       // decimal column held a raw int and rendered 1.50 as 150.
-      final t = await engine.execute('SELECT COALESCE(d, 0) AS c FROM t');
+      final t = await engine.execute('SELECT COALESCE(d, 0) AS c FROM t').ok;
       expect(t.schema.field('c')!.dataType, DataType.decimal);
       expect(t.schema.field('c')!.scale, 2);
       expect(t.column('c')!.toList().map((v) => v.runtimeType).toSet(), {
@@ -4531,21 +5195,26 @@ void main() {
     });
 
     test('a plain CASE with one type is unaffected', () async {
-      final t = await engine.execute(
-        "SELECT CASE WHEN id > 1 THEN 'hi' ELSE 'lo' END AS c FROM t",
-      );
+      final t = await engine
+          .execute(
+            "SELECT CASE WHEN id > 1 THEN 'hi' ELSE 'lo' END AS c FROM t",
+          )
+          .ok;
       expect(t.column('c')!.toList(), ['lo', 'hi', 'hi']);
     });
 
     test('a CASE with no ELSE still yields NULL', () async {
-      final t = await engine.execute(
-        'SELECT CASE WHEN id > 2 THEN 1.5 END AS c FROM t',
+      final t = await engine
+          .execute('SELECT CASE WHEN id > 2 THEN 1.5 END AS c FROM t')
+          .ok;
+      expect(
+        [for (final row in t.toRows()) row['c']?.toString()],
+        [null, null, '1.5'],
       );
-      expect(t.column('c')!.toList(), [null, null, 1.5]);
     });
   });
 
-  // A decimal column holds unscaled BigInt, which is not a `num` — so the SUM
+  // A decimal column holds unscaled BigInt, which is not a `num`, so the SUM
   // and AVG accumulators dropped every value and returned NULL. MIN/MAX worked
   // (BigInt is Comparable), which is what marked this as an oversight.
   group('aggregates over a decimal column', () {
@@ -4581,15 +5250,15 @@ void main() {
       );
     }
 
-    setUp(() => engine = SqlEngine());
+    setUp(() => engine = SqlEngine.open().ok);
     tearDown(() => engine.dispose());
 
     Future<Object?> one(String sql) async =>
-        (await engine.execute(sql)).toRows().single['r'];
+        (await engine.execute(sql).ok).toRows().single['r'];
 
     test('SUM keeps the value and the scale', () async {
       register([150, 250]); // 1.50 + 2.50 = 4.00
-      final t = await engine.execute('SELECT SUM(v) AS r FROM d');
+      final t = await engine.execute('SELECT SUM(v) AS r FROM d').ok;
       expect(t.schema.field('r')!.dataType, DataType.decimal);
       expect(
         t.schema.field('r')!.scale,
@@ -4666,7 +5335,7 @@ void main() {
       );
       await expectLater(
         engine.execute('SELECT SUM(v) AS r FROM s'),
-        throwsA(isA<ArgumentError>()),
+        failsWith(Kind.invalid),
       );
     });
 
@@ -4684,9 +5353,9 @@ void main() {
         ),
       );
       expect(
-        (await engine.execute(
-          'SELECT SUM(v) AS r FROM i',
-        )).toRows().single['r'],
+        (await engine.execute('SELECT SUM(v) AS r FROM i').ok)
+            .toRows()
+            .single['r'],
         Decimal(BigInt.from(6), 0),
       );
     });
@@ -4698,30 +5367,40 @@ void main() {
   // such site.
   // An outer join manufactures NULLs on the null-producing side, so that side's
   // fields must become nullable. They were copied verbatim, which only shows up
-  // when a source declares a column non-nullable — as Parquet does for any
+  // when a source declares a column non-nullable, as Parquet does for any
   // column that happens to hold no nulls.
   group('outer join widens nullability', () {
     late Directory dir;
     late SqlEngine engine;
     setUp(() async {
       dir = Directory.systemTemp.createTempSync('sqljoin_');
-      engine = SqlEngine();
+      engine = SqlEngine.open().ok;
     });
     tearDown(() async {
       await engine.dispose();
       dir.deleteSync(recursive: true);
     });
 
-    /// Register [name] from a Parquet round trip, which is what declares a
-    /// no-null column REQUIRED (the writer marks a leaf required when the column
-    /// holds no nulls, and the reader reads it back non-nullable).
+    /// Register [name] from a Parquet round trip of [rows] with every field
+    /// declared non-nullable, so each column is written REQUIRED and read
+    /// back non-nullable.
     Future<void> parquet(String name, List<Map<String, Object?>> rows) async {
       final path = '${dir.path}/$name.parquet';
-      await ParquetWriter(path).write(Table.fromRows(name, rows));
-      final table = await ParquetReader(path).read();
+      final inferred = Table.fromRows(name, rows);
+      final required = Table(
+        name: name,
+        columns: inferred.columns,
+        schema: Schema(
+          fields: [
+            for (final field in inferred.schema.fields)
+              field.copyWith(nullable: false),
+          ],
+        ),
+      );
+      await ParquetWriter(path).write(required).ok;
+      final table = await ParquetReader(path).read().ok;
       // The `${name}n` string column must come back REQUIRED or this fixture
-      // proves nothing. (The int key does NOT — NumericColumn.hasNulls reports
-      // "is nullable", so the writer marks it optional. See audit #3.)
+      // proves nothing.
       expect(
         table.schema.field('${name}n')!.nullable,
         isFalse,
@@ -4740,11 +5419,11 @@ void main() {
         await parquet('b', [
           {'k': 1, 'bn': 'p'},
         ]);
-        // k=2 has no match, so `bn` — declared required — is null.
-        final r = await engine.execute(
-          'SELECT * FROM a LEFT JOIN b ON a.k = b.k',
-        );
-        // Both keys survive, qualified — the unmatched left row keeps its own.
+        // k=2 has no match, so `bn` (declared required) is null.
+        final r = await engine
+            .execute('SELECT * FROM a LEFT JOIN b ON a.k = b.k')
+            .ok;
+        // Both keys survive, qualified: the unmatched left row keeps its own.
         final byKey = {
           for (final row in r.toRows()) row['a.k'] as int: row['bn'],
         };
@@ -4761,9 +5440,9 @@ void main() {
         {'k': 1, 'bn': 'p'},
         {'k': 2, 'bn': 'q'},
       ]);
-      final r = await engine.execute(
-        'SELECT * FROM a RIGHT JOIN b ON a.k = b.k',
-      );
+      final r = await engine
+          .execute('SELECT * FROM a RIGHT JOIN b ON a.k = b.k')
+          .ok;
       expect(r.rowCount, 2);
       expect(r.schema.field('an')!.nullable, isTrue);
     });
@@ -4777,38 +5456,38 @@ void main() {
         {'k': 1, 'bn': 'p'},
         {'k': 2, 'bn': 'q'},
       ]);
-      final r = await engine.execute(
-        'SELECT * FROM a FULL JOIN b ON a.k = b.k',
-      );
+      final r = await engine
+          .execute('SELECT * FROM a FULL JOIN b ON a.k = b.k')
+          .ok;
       expect(r.rowCount, 3);
       expect(r.schema.field('an')!.nullable, isTrue);
       expect(r.schema.field('bn')!.nullable, isTrue);
     });
 
-    test('INNER JOIN does NOT widen — nothing is null-padded', () async {
+    test('INNER JOIN does NOT widen; nothing is null-padded', () async {
       await parquet('a', [
         {'k': 1, 'an': 'x'},
       ]);
       await parquet('b', [
         {'k': 1, 'bn': 'p'},
       ]);
-      final r = await engine.execute(
-        'SELECT * FROM a INNER JOIN b ON a.k = b.k',
-      );
+      final r = await engine
+          .execute('SELECT * FROM a INNER JOIN b ON a.k = b.k')
+          .ok;
       expect(r.rowCount, 1);
       expect(r.schema.field('bn')!.nullable, isFalse);
       expect(r.schema.field('an')!.nullable, isFalse);
     });
   });
 
-  // SQL's `%` matches ANY sequence of characters and `_` any single one — a
+  // SQL's `%` matches ANY sequence of characters and `_` any single one: a
   // newline is not special. The LIKE regex is built without dotAll, where `.`
   // excludes line terminators and `$` anchors at end-of-input, so every pattern
   // silently failed against a value containing one.
   group('LIKE spans line terminators', () {
     late SqlEngine engine;
     setUp(() {
-      engine = SqlEngine();
+      engine = SqlEngine.open().ok;
       engine.registerTable(
         't',
         Table.fromRows('t', [
@@ -4822,7 +5501,7 @@ void main() {
     tearDown(() => engine.dispose());
 
     Future<List<int>> ids(String predicate) async {
-      final r = await engine.execute('SELECT id FROM t WHERE $predicate');
+      final r = await engine.execute('SELECT id FROM t WHERE $predicate').ok;
       return r.column('id')!.toList().cast<int>();
     }
 
@@ -4851,6 +5530,93 @@ void main() {
     });
   });
 
+  // LIKE on untrusted patterns must run in linear-ish time. A regex
+  // translation of `%a%a%a%a%b` backtracks exponentially on a long run of `a`.
+  group('LIKE runs without backtracking blowup', () {
+    late SqlEngine engine;
+    setUp(() {
+      engine = SqlEngine.open().ok;
+      engine.registerTable(
+        't',
+        Table.fromRows('t', [
+          {'id': 1, 's': 'a' * 200},
+          {'id': 2, 's': '${'a' * 200}b'},
+          {'id': 3, 's': ''},
+          {'id': 4, 's': 'abcabc'},
+        ]),
+      );
+    });
+    tearDown(() => engine.dispose());
+
+    Future<List<int>> ids(String predicate) async {
+      final r = await engine.execute('SELECT id FROM t WHERE $predicate').ok;
+      return r.column('id')!.toList().cast<int>();
+    }
+
+    // The match is synchronous, so a test timeout cannot interrupt it; time
+    // it instead.
+    test('a pathological pattern finishes quickly', () async {
+      final watch = Stopwatch()..start();
+      expect(await ids("s LIKE '%a%a%a%a%a%a%b'"), [2]);
+      expect(watch.elapsed, lessThan(const Duration(seconds: 2)));
+    });
+
+    test('empty pattern matches only the empty string', () async {
+      expect(await ids("s LIKE ''"), [3]);
+    });
+
+    test('% alone matches the empty string', () async {
+      expect(await ids("s LIKE '%'"), [1, 2, 3, 4]);
+    });
+
+    test('a later % retries after a failed partial match', () async {
+      expect(await ids("s LIKE '%bc'"), [4]);
+      expect(await ids("s LIKE 'a%c%c'"), [4]);
+      expect(await ids("s LIKE '%cab%'"), [4]);
+    });
+
+    test('_ must consume exactly one character', () async {
+      expect(await ids("s LIKE 'abcab_'"), [4]);
+      expect(await ids("s LIKE 'abcabc_'"), isEmpty);
+    });
+  });
+
+  // `_` is one character, so a code point outside the Basic Multilingual
+  // Plane (two UTF-16 code units) matches a single `_`.
+  group('LIKE matches code points', () {
+    late SqlEngine engine;
+    setUp(() {
+      engine = SqlEngine.open().ok;
+      engine.registerTable(
+        't',
+        Table.fromRows('t', [
+          {'id': 1, 's': '😀'},
+          {'id': 2, 's': 'a😀b'},
+          {'id': 3, 's': 'ab'},
+        ]),
+      );
+    });
+    tearDown(() => engine.dispose());
+
+    Future<List<int>> ids(String predicate) async {
+      final r = await engine.execute('SELECT id FROM t WHERE $predicate').ok;
+      return r.column('id')!.toList().cast<int>();
+    }
+
+    test('_ matches an emoji', () async {
+      expect(await ids("s LIKE '_'"), [1]);
+      expect(await ids("s LIKE 'a_b'"), [2]);
+    });
+
+    test('__ does not match a single emoji', () async {
+      expect(await ids("s LIKE '__'"), [3]);
+    });
+
+    test('a literal emoji in the pattern matches itself', () async {
+      expect(await ids("s LIKE '%😀%'"), [1, 2]);
+    });
+  });
+
   group('decimal scale threading', () {
     // Mixed int/float infers decimal(2,1): unscaled 15, 35, 20.
     Table source() => Table.fromRows('t', [
@@ -4861,12 +5627,12 @@ void main() {
 
     late SqlEngine engine;
     setUp(() {
-      engine = SqlEngine();
+      engine = SqlEngine.open().ok;
       engine.registerTable('t', source());
     });
     tearDown(() => engine.dispose());
 
-    Future<Table> run(String sql) => engine.execute(sql);
+    Future<Table> run(String sql) => engine.execute(sql).ok;
 
     test('HAVING over a decimal group key agrees with WHERE', () async {
       // The same predicate must not depend on which operator binds it.
@@ -4903,7 +5669,7 @@ void main() {
       );
       final row = result.toRows().single;
       expect(row['c'], closeTo(1.5, 1e-9));
-      expect(row['i'], 1);
+      expect(row['i'], 2); // rounds half away from zero, as DuckDB does
       expect(row['s'], '1.5');
     });
 
@@ -4931,7 +5697,7 @@ void main() {
 
     test('a name-colliding join keeps the decimal scale', () async {
       // disambiguate() only fires when a name collides, and then rewrites EVERY
-      // field — so an untouched decimal column loses its scale too.
+      // field, so an untouched decimal column loses its scale too.
       engine.registerTable(
         'b',
         Table.fromRows('b', [
@@ -4955,7 +5721,7 @@ void main() {
 
     test('DataFrame.distinct keeps the decimal scale', () async {
       final frame = DataFrame.fromTable(source()).distinct();
-      final result = await frame.execute();
+      final result = await frame.execute().ok;
       expect(result.schema.field('d')!.scale, 1);
       expect(
         {for (final r in result.toRows()) r['d'].toString()},
@@ -4966,10 +5732,10 @@ void main() {
 
   group('VALUES', () {
     late SqlEngine engine;
-    setUp(() => engine = SqlEngine());
+    setUp(() => engine = SqlEngine.open().ok);
     tearDown(() => engine.dispose());
 
-    Future<Table> run(String sql) => engine.execute(sql);
+    Future<Table> run(String sql) => engine.execute(sql).ok;
     Future<List<Object?>> column(String sql, String name) async =>
         (await run(sql)).column(name)!.toList();
 
@@ -5001,10 +5767,10 @@ void main() {
 
     test('a column is typed over ALL rows, not just the first', () async {
       // Typing from row 0 alone would make this int and then feed 2.5 into an
-      // int buffer.
+      // int buffer. (`2.5` is a DECIMAL literal, as in DuckDB.)
       final t = await run('SELECT n FROM VALUES (1), (2.5) AS t(n)');
-      expect(t.schema.field('n')!.dataType, DataType.float64);
-      expect(t.column('n')!.toList(), [1.0, 2.5]);
+      expect(t.schema.field('n')!.dataType, DataType.decimal);
+      expect([for (final row in t.toRows()) '${row['n']}'], ['1.0', '2.5']);
     });
 
     test('a NULL anywhere in a column makes it nullable', () async {
@@ -5048,31 +5814,31 @@ void main() {
 
     test('ragged rows fail loud', () async {
       await expectLater(
-        run('SELECT n FROM VALUES (1), (2, 3) AS t(n)'),
-        throwsA(isA<ArgumentError>()),
+        engine.execute('SELECT n FROM VALUES (1), (2, 3) AS t(n)'),
+        failsWith(Kind.invalid),
       );
     });
 
     test('an alias list of the wrong arity fails loud', () async {
       await expectLater(
-        run('SELECT n FROM VALUES (1) AS t(n, extra)'),
-        throwsA(isA<ArgumentError>()),
+        engine.execute('SELECT n FROM VALUES (1) AS t(n, extra)'),
+        failsWith(Kind.invalid),
       );
     });
 
     test('a cell referencing a column fails loud', () async {
-      // VALUES has no input rows, so a column reference cannot resolve — it
+      // VALUES has no input rows, so a column reference cannot resolve; it
       // must throw rather than quietly produce NULL.
       await expectLater(
-        run('SELECT n FROM VALUES (x) AS t(n)'),
-        throwsA(isA<StateError>()),
+        engine.execute('SELECT n FROM VALUES (x) AS t(n)'),
+        failsWith(Kind.invalid),
       );
     });
   });
 
   // SQL three-valued logic for IN/NOT IN. These pin BEHAVIOUR, not the tree
   // shape, so they survive IN becoming a native node: a NULL in the list makes a
-  // non-match NULL (not false), which WHERE then excludes — the two are only
+  // non-match NULL (not false), which WHERE then excludes: the two are only
   // distinguishable by selecting the expression, which is what these do.
   group('IN / NOT IN three-valued logic', () {
     late SqlEngine engine;
@@ -5093,15 +5859,15 @@ void main() {
     );
 
     setUp(() {
-      engine = SqlEngine();
+      engine = SqlEngine.open().ok;
       engine.registerTable('t', ints('t', [1, 3]));
       engine.registerTable('u', ints('u', [1, null]));
     });
     tearDown(() => engine.dispose());
 
-    /// The IN expression's value per row — `true` / `false` / `null` (UNKNOWN).
+    /// The IN expression's value per row: `true` / `false` / `null` (UNKNOWN).
     Future<List<Object?>> truth(String sql) async =>
-        (await engine.execute(sql)).column('r')!.toList();
+        (await engine.execute(sql).ok).column('r')!.toList();
 
     test('a NULL in the list makes a non-match UNKNOWN, not false', () async {
       // 1 matches -> TRUE; 3 matches nothing but the list holds NULL -> UNKNOWN.
@@ -5115,7 +5881,7 @@ void main() {
 
     test('NOT IN: a match is FALSE even when the list holds NULL', () async {
       // 1 NOT IN (1, NULL) is FALSE (a definite match dominates), but
-      // 3 NOT IN (1, NULL) is UNKNOWN — this asymmetry is the classic trap.
+      // 3 NOT IN (1, NULL) is UNKNOWN; this asymmetry is the classic trap.
       expect(await truth('SELECT n NOT IN (1, NULL) AS r FROM t'), [
         false,
         null,
@@ -5127,15 +5893,15 @@ void main() {
       expect(await truth('SELECT n NOT IN (1, 2) AS r FROM u'), [false, null]);
     });
 
-    test('WHERE keeps only TRUE — UNKNOWN is excluded like false', () async {
-      final kept = await engine.execute(
-        'SELECT n FROM t WHERE n IN (1, 2, NULL)',
-      );
+    test('WHERE keeps only TRUE: UNKNOWN is excluded like false', () async {
+      final kept = await engine
+          .execute('SELECT n FROM t WHERE n IN (1, 2, NULL)')
+          .ok;
       expect(kept.toRows().map((r) => r['n']), [1]);
       // Every row is either FALSE or UNKNOWN, so NOT IN keeps nothing.
-      final none = await engine.execute(
-        'SELECT n FROM t WHERE n NOT IN (1, NULL)',
-      );
+      final none = await engine
+          .execute('SELECT n FROM t WHERE n NOT IN (1, NULL)')
+          .ok;
       expect(none.rowCount, 0);
     });
 
@@ -5181,21 +5947,21 @@ void main() {
           ),
         ),
       );
-      // 1 vs 1.0 must match — a hash-set probe relies on Dart's int/double
+      // 1 vs 1.0 must match: a hash-set probe relies on Dart's int/double
       // hashCode agreeing here, so this pins the fast path's key assumption.
       expect(await truth('SELECT n IN (1) AS r FROM f'), [true, false]);
       expect(await truth('SELECT n IN (2.5) AS r FROM f'), [false, true]);
     });
 
     test('a non-literal list element still evaluates', () async {
-      // `n IN (n, 2)` is trivially TRUE — pins that the list is not restricted
+      // `n IN (n, 2)` is trivially TRUE: pins that the list is not restricted
       // to constants (a hash-set fast path must fall back here).
       expect(await truth('SELECT n IN (n, 2) AS r FROM t'), [true, true]);
     });
 
     test('IN matches a decimal column, and agrees with =', () async {
       // The hash-set fast path deliberately skips decimal (BigInt.from(1) != 1),
-      // so IN falls back to comparisons — pin that it lands on the same answer
+      // so IN falls back to comparisons: pin that it lands on the same answer
       // as plain equality and cannot silently diverge from it.
       engine.registerTable(
         'd',
@@ -5242,16 +6008,16 @@ void main() {
     test('an empty IN list is a parse error', () async {
       await expectLater(
         engine.execute('SELECT n FROM t WHERE n IN ()'),
-        throwsA(isA<FormatException>()),
+        failsWith(Kind.invalid),
       );
     });
 
     test('IN (SELECT ...) is a semi-join', () async {
       // u = {1, null}; t's 1 matches, 3 does not. A null in the build matches
       // nothing (so it neither adds nor removes a semi match).
-      final r = await engine.execute(
-        'SELECT n FROM t WHERE n IN (SELECT n FROM u)',
-      );
+      final r = await engine
+          .execute('SELECT n FROM t WHERE n IN (SELECT n FROM u)')
+          .ok;
       expect(r.toRows(), [
         {'n': 1},
       ]);
@@ -5261,9 +6027,9 @@ void main() {
       'NOT IN (SELECT ...) with a NULL in the result yields nothing',
       () async {
         // u contains a null → `x NOT IN (S)` is UNKNOWN for EVERY row.
-        final r = await engine.execute(
-          'SELECT n FROM t WHERE n NOT IN (SELECT n FROM u)',
-        );
+        final r = await engine
+            .execute('SELECT n FROM t WHERE n NOT IN (SELECT n FROM u)')
+            .ok;
         expect(r.rowCount, 0);
       },
     );
@@ -5272,9 +6038,11 @@ void main() {
       'NOT IN (SELECT ...) over a null-free result is a plain anti-join',
       () async {
         // The subquery filters the null away, leaving {1}; t's 3 is not in it.
-        final r = await engine.execute(
-          'SELECT n FROM t WHERE n NOT IN (SELECT n FROM u WHERE n = 1)',
-        );
+        final r = await engine
+            .execute(
+              'SELECT n FROM t WHERE n NOT IN (SELECT n FROM u WHERE n = 1)',
+            )
+            .ok;
         expect(r.toRows(), [
           {'n': 3},
         ]);
@@ -5282,9 +6050,9 @@ void main() {
     );
 
     test('IN (SELECT ...) alongside another conjunct', () async {
-      final r = await engine.execute(
-        'SELECT n FROM t WHERE n IN (SELECT n FROM u) AND n < 2',
-      );
+      final r = await engine
+          .execute('SELECT n FROM t WHERE n IN (SELECT n FROM u) AND n < 2')
+          .ok;
       expect(r.toRows(), [
         {'n': 1},
       ]);
@@ -5294,9 +6062,11 @@ void main() {
       // t = {1,3}, u = {1, null}. Per t-row: u where u.n = t.n. For 1 → {1} so
       // 1 IN {1}; for 3 → {} so 3 not in. (Correlated coverage lives in its own
       // group; this pins the fixture behaviour through the semi-join path.)
-      final r = await engine.execute(
-        'SELECT n FROM t WHERE n IN (SELECT n FROM u WHERE u.n = t.n)',
-      );
+      final r = await engine
+          .execute(
+            'SELECT n FROM t WHERE n IN (SELECT n FROM u WHERE u.n = t.n)',
+          )
+          .ok;
       expect(r.toRows(), [
         {'n': 1},
       ]);
@@ -5305,7 +6075,7 @@ void main() {
     test('a multi-column IN subquery fails loud', () async {
       await expectLater(
         engine.execute('SELECT n FROM t WHERE n IN (SELECT n, n FROM u)'),
-        throwsA(isA<ArgumentError>()),
+        failsWith(Kind.invalid),
       );
     });
   });
@@ -5314,7 +6084,7 @@ void main() {
     late SqlEngine engine;
 
     setUp(() {
-      engine = SqlEngine();
+      engine = SqlEngine.open().ok;
       // orders (cust, region); customers (cust, region, tier).
       engine.registerTable(
         'o',
@@ -5340,11 +6110,13 @@ void main() {
     test('decorrelates to a multi-key semi-join', () async {
       // A cust that is a gold customer IN THE SAME REGION. The same cust in a
       // different region (1/W is silver) must NOT match on cust alone.
-      final r = await engine.execute(
-        "SELECT cust, region FROM o WHERE cust IN "
-        "(SELECT cust FROM c WHERE c.region = o.region AND c.tier = 'gold') "
-        "ORDER BY cust, region",
-      );
+      final r = await engine
+          .execute(
+            "SELECT cust, region FROM o WHERE cust IN "
+            "(SELECT cust FROM c WHERE c.region = o.region AND c.tier = 'gold') "
+            "ORDER BY cust, region",
+          )
+          .ok;
       expect(r.toRows(), [
         {'cust': 1, 'region': 'E'},
         {'cust': 3, 'region': 'E'},
@@ -5352,16 +6124,20 @@ void main() {
     });
 
     test('equals the explicit JOIN + DISTINCT it decorrelates to', () async {
-      final correlated = await engine.execute(
-        "SELECT cust, region FROM o WHERE cust IN "
-        "(SELECT cust FROM c WHERE c.region = o.region AND c.tier = 'gold') "
-        "ORDER BY cust, region",
-      );
-      final join = await engine.execute(
-        "SELECT DISTINCT o.cust, o.region FROM o "
-        "JOIN c ON o.cust = c.cust AND o.region = c.region "
-        "WHERE c.tier = 'gold' ORDER BY o.cust, o.region",
-      );
+      final correlated = await engine
+          .execute(
+            "SELECT cust, region FROM o WHERE cust IN "
+            "(SELECT cust FROM c WHERE c.region = o.region AND c.tier = 'gold') "
+            "ORDER BY cust, region",
+          )
+          .ok;
+      final join = await engine
+          .execute(
+            "SELECT DISTINCT o.cust, o.region FROM o "
+            "JOIN c ON o.cust = c.cust AND o.region = c.region "
+            "WHERE c.tier = 'gold' ORDER BY o.cust, o.region",
+          )
+          .ok;
       expect(correlated.toRows(), join.toRows());
     });
 
@@ -5371,7 +6147,7 @@ void main() {
           'SELECT cust FROM o WHERE cust NOT IN '
           '(SELECT cust FROM c WHERE c.region = o.region)',
         ),
-        throwsA(isA<UnsupportedError>()),
+        failsWith(Kind.unsupported),
       );
     });
 
@@ -5381,7 +6157,7 @@ void main() {
           'SELECT cust FROM o WHERE cust IN '
           '(SELECT cust FROM c WHERE c.cust > o.cust)',
         ),
-        throwsA(isA<UnsupportedError>()),
+        failsWith(Kind.unsupported),
       );
     });
 
@@ -5391,7 +6167,7 @@ void main() {
           'SELECT cust FROM o WHERE cust IN '
           '(SELECT MAX(cust) FROM c WHERE c.region = o.region)',
         ),
-        throwsA(isA<UnsupportedError>()),
+        failsWith(Kind.unsupported),
       );
     });
   });
@@ -5400,7 +6176,7 @@ void main() {
     late SqlEngine engine;
 
     setUp(() {
-      engine = SqlEngine();
+      engine = SqlEngine.open().ok;
       engine.registerTable(
         'o',
         Table.fromRows('o', [
@@ -5421,10 +6197,12 @@ void main() {
     tearDown(() => engine.dispose());
 
     test('correlated EXISTS is a semi-join', () async {
-      final r = await engine.execute(
-        'SELECT cust FROM o WHERE EXISTS '
-        '(SELECT 1 FROM c WHERE c.cust = o.cust) ORDER BY cust',
-      );
+      final r = await engine
+          .execute(
+            'SELECT cust FROM o WHERE EXISTS '
+            '(SELECT 1 FROM c WHERE c.cust = o.cust) ORDER BY cust',
+          )
+          .ok;
       expect(r.toRows(), [
         {'cust': 1},
         {'cust': 3},
@@ -5432,21 +6210,25 @@ void main() {
     });
 
     test('correlated NOT EXISTS is a plain anti-join', () async {
-      final r = await engine.execute(
-        'SELECT cust FROM o WHERE NOT EXISTS '
-        '(SELECT 1 FROM c WHERE c.cust = o.cust)',
-      );
+      final r = await engine
+          .execute(
+            'SELECT cust FROM o WHERE NOT EXISTS '
+            '(SELECT 1 FROM c WHERE c.cust = o.cust)',
+          )
+          .ok;
       expect(r.toRows(), [
         {'cust': 2},
       ]);
     });
 
     test('EXISTS with a local filter and two correlation keys', () async {
-      final r = await engine.execute(
-        "SELECT cust FROM o WHERE EXISTS "
-        "(SELECT 1 FROM c WHERE c.cust = o.cust AND c.region = o.region "
-        "AND c.tier = 'gold')",
-      );
+      final r = await engine
+          .execute(
+            "SELECT cust FROM o WHERE EXISTS "
+            "(SELECT 1 FROM c WHERE c.cust = o.cust AND c.region = o.region "
+            "AND c.tier = 'gold')",
+          )
+          .ok;
       expect(r.toRows(), [
         {'cust': 1},
       ]);
@@ -5455,7 +6237,7 @@ void main() {
     test('an uncorrelated EXISTS fails loud', () async {
       await expectLater(
         engine.execute('SELECT cust FROM o WHERE EXISTS (SELECT 1 FROM c)'),
-        throwsA(isA<UnsupportedError>()),
+        failsWith(Kind.unsupported),
       );
     });
   });
@@ -5464,7 +6246,7 @@ void main() {
   group('review fixes', () {
     late SqlEngine engine;
     setUp(() {
-      engine = SqlEngine();
+      engine = SqlEngine.open().ok;
       engine.registerTable(
         't',
         Table.fromRows('t', [
@@ -5511,10 +6293,12 @@ void main() {
     // (the decorrelation rebuild used to drop them, a silent wrong answer).
     test('F1: IN subquery preserves GROUP BY', () async {
       // per group max: a→2, b→4. t IN {2,4}.
-      final r = await engine.execute(
-        'SELECT n FROM t WHERE n IN (SELECT MAX(n) FROM g GROUP BY grp) '
-        'ORDER BY n',
-      );
+      final r = await engine
+          .execute(
+            'SELECT n FROM t WHERE n IN (SELECT MAX(n) FROM g GROUP BY grp) '
+            'ORDER BY n',
+          )
+          .ok;
       expect(r.toRows(), [
         {'n': 2},
         {'n': 4},
@@ -5523,19 +6307,21 @@ void main() {
 
     test('F1: IN subquery preserves LIMIT', () async {
       // u LIMIT 1 = {1}; only t.n = 1 matches (not all four rows).
-      final r = await engine.execute(
-        'SELECT n FROM t WHERE n IN (SELECT n FROM u LIMIT 1)',
-      );
+      final r = await engine
+          .execute('SELECT n FROM t WHERE n IN (SELECT n FROM u LIMIT 1)')
+          .ok;
       expect(r.toRows(), [
         {'n': 1},
       ]);
     });
 
     test('F1: IN subquery preserves a set operation', () async {
-      final r = await engine.execute(
-        'SELECT n FROM t WHERE n IN (SELECT n FROM a UNION SELECT n FROM b) '
-        'ORDER BY n',
-      );
+      final r = await engine
+          .execute(
+            'SELECT n FROM t WHERE n IN (SELECT n FROM a UNION SELECT n FROM b) '
+            'ORDER BY n',
+          )
+          .ok;
       expect(r.toRows(), [
         {'n': 1},
         {'n': 2},
@@ -5546,11 +6332,11 @@ void main() {
     test('F2: an unknown table qualifier fails loud', () async {
       await expectLater(
         engine.execute('SELECT typo.n FROM t'),
-        throwsA(isA<FormatException>()),
+        failsWith(Kind.invalid),
       );
       await expectLater(
         engine.execute('SELECT n FROM t WHERE typo.n = 1'),
-        throwsA(isA<FormatException>()),
+        failsWith(Kind.invalid),
       );
     });
 
@@ -5573,10 +6359,12 @@ void main() {
             {'cust': 2},
           ]),
         );
-        final r = await engine.execute(
-          'SELECT cust FROM o WHERE cust IN '
-          '(SELECT c.cust FROM c WHERE c.cust = o.cust) ORDER BY cust',
-        );
+        final r = await engine
+            .execute(
+              'SELECT cust FROM o WHERE cust IN '
+              '(SELECT c.cust FROM c WHERE c.cust = o.cust) ORDER BY cust',
+            )
+            .ok;
         expect(r.toRows(), [
           {'cust': 1},
           {'cust': 2},
@@ -5586,7 +6374,7 @@ void main() {
 
     // F7: an aggregate only in ORDER BY / HAVING makes it a global aggregate.
     test('F7: an aggregate only in ORDER BY is a global aggregate', () async {
-      final r = await engine.execute('SELECT 1 AS x FROM t ORDER BY SUM(n)');
+      final r = await engine.execute('SELECT 1 AS x FROM t ORDER BY SUM(n)').ok;
       expect(r.toRows(), [
         {'x': 1},
       ]);
@@ -5594,15 +6382,13 @@ void main() {
 
     test('F7: an aggregate only in HAVING is a global aggregate', () async {
       expect(
-        (await engine.execute(
-          'SELECT 1 AS x FROM t HAVING SUM(n) > 5',
-        )).rowCount,
+        (await engine.execute('SELECT 1 AS x FROM t HAVING SUM(n) > 5').ok)
+            .rowCount,
         1,
       );
       expect(
-        (await engine.execute(
-          'SELECT 1 AS x FROM t HAVING SUM(n) > 500',
-        )).rowCount,
+        (await engine.execute('SELECT 1 AS x FROM t HAVING SUM(n) > 500').ok)
+            .rowCount,
         0,
       );
     });
@@ -5610,7 +6396,7 @@ void main() {
     test('F7: SELECT * with a global aggregate fails loud', () async {
       await expectLater(
         engine.execute('SELECT * FROM t ORDER BY SUM(n)'),
-        throwsA(isA<UnsupportedError>()),
+        failsWith(Kind.unsupported),
       );
     });
   });
@@ -5618,12 +6404,12 @@ void main() {
   // The grammar folds `a - b - c` from a separated list of operands and
   // separators. Every operator here is non-commutative or precedence-sensitive,
   // so a fold that groups right instead of left changes the ANSWER rather than
-  // just the tree — 10 - 3 - 2 would be 9, not 5. Values verified against the
+  // just the tree: 10 - 3 - 2 would be 9, not 5. Values verified against the
   // engine before any of this was touched.
   group('arithmetic associativity and precedence', () {
     late SqlEngine engine;
     setUp(() {
-      engine = SqlEngine();
+      engine = SqlEngine.open().ok;
       engine.registerTable(
         't',
         Table(
@@ -5641,9 +6427,11 @@ void main() {
     });
     tearDown(() => engine.dispose());
 
-    Future<Object?> value(String expression) async => (await engine.execute(
-      'SELECT $expression AS v FROM t',
-    )).column('v')!.toList().first;
+    Future<Object?> value(String expression) async =>
+        (await engine.execute('SELECT $expression AS v FROM t').ok)
+            .column('v')!
+            .toList()
+            .first;
 
     test('chained subtraction groups left', () async {
       expect(await value('10 - 3 - 2'), 5); // right-assoc would give 9
@@ -5704,13 +6492,13 @@ void main() {
     ]);
 
     SqlEngine engine() {
-      final e = SqlEngine();
+      final e = SqlEngine.open().ok;
       e.registerTable('t', rows());
       return e;
     }
 
     Future<List<Map<String, dynamic>>> run(String sql) async =>
-        (await engine().execute(sql)).toRows();
+        (await engine().execute(sql).ok).toRows();
 
     Future<dynamic> value(String select) async =>
         (await run('SELECT $select FROM t')).single.values.first;
@@ -5827,7 +6615,7 @@ void main() {
 
     group('HAVING', () {
       test('an aggregate absent from the SELECT list resolves', () async {
-        // Was "Unknown column: x" — HAVING's aggregate was never collected.
+        // Was "Unknown column: x": HAVING's aggregate was never collected.
         expect(await run('SELECT k FROM t GROUP BY k HAVING SUM(x) > 5'), [
           {'k': 'b'},
         ]);
@@ -5879,11 +6667,11 @@ void main() {
 
       test('an aggregate under SELECT * does not leak its column', () async {
         // `SELECT *` under GROUP BY means the group keys, and skips the
-        // projection that otherwise hides the hoisted `__agg$i` columns — so
+        // projection that otherwise hides the hoisted `__agg$i` columns, so
         // the aggregate HAVING needs must be trimmed back off explicitly.
-        final t = await engine().execute(
-          'SELECT * FROM t GROUP BY k HAVING SUM(x) > 5',
-        );
+        final t = await engine()
+            .execute('SELECT * FROM t GROUP BY k HAVING SUM(x) > 5')
+            .ok;
         expect(t.schema.fieldNames, ['k']);
         expect(t.toRows(), [
           {'k': 'b'},
@@ -5894,16 +6682,16 @@ void main() {
     group('unchanged behaviour', () {
       test('a bare aggregate is still named for its function', () async {
         expect(
-          (await engine().execute('SELECT SUM(x) FROM t')).schema.fieldNames,
+          (await engine().execute('SELECT SUM(x) FROM t').ok).schema.fieldNames,
           ['SUM'],
         );
       });
 
       test('an explicit alias still wins', () async {
         expect(
-          (await engine().execute(
-            'SELECT SUM(x) AS total FROM t',
-          )).schema.fieldNames,
+          (await engine().execute('SELECT SUM(x) AS total FROM t').ok)
+              .schema
+              .fieldNames,
           ['total'],
         );
       });
@@ -5931,9 +6719,9 @@ void main() {
       test('ORDER BY an aggregate that is not selected', () async {
         // The aggregate is computed and sorted on, then trimmed back out: it
         // must not leak its internal `__agg$i` column into the output.
-        final t = await engine().execute(
-          'SELECT k FROM t GROUP BY k ORDER BY SUM(x) DESC',
-        );
+        final t = await engine()
+            .execute('SELECT k FROM t GROUP BY k ORDER BY SUM(x) DESC')
+            .ok;
         expect(t.schema.fieldNames, ['k']);
         expect(t.toRows(), [
           {'k': 'b'},
@@ -5942,9 +6730,9 @@ void main() {
       });
 
       test('ORDER BY an aggregate under SELECT * does not leak it', () async {
-        final t = await engine().execute(
-          'SELECT * FROM t GROUP BY k ORDER BY SUM(x) DESC',
-        );
+        final t = await engine()
+            .execute('SELECT * FROM t GROUP BY k ORDER BY SUM(x) DESC')
+            .ok;
         expect(t.schema.fieldNames, ['k']);
         expect(t.toRows(), [
           {'k': 'b'},
@@ -5973,13 +6761,7 @@ void main() {
           engine().execute(
             'SELECT DISTINCT k FROM t GROUP BY k ORDER BY SUM(x)',
           ),
-          throwsA(
-            isA<UnsupportedError>().having(
-              (e) => e.message,
-              'message',
-              contains('ORDER BY s'),
-            ),
-          ),
+          failsWith(Kind.unsupported, contains('ORDER BY s')),
         );
       });
     });
@@ -5987,7 +6769,7 @@ void main() {
 
   group('nested columns under memory pressure (external review)', () {
     // The spill schema was rebuilt from bare columns (name+dtype+nullable),
-    // losing nested children — the Parquet spill writer then crashed on
+    // losing nested children: the Parquet spill writer then crashed on
     // `children.first`, but only once a query crossed the spill threshold.
     // These force spilling with a tiny budget.
     Table nested(String name, String prefix, int n) => Table(
@@ -6022,14 +6804,14 @@ void main() {
 
     late SqlEngine engine;
     setUp(() {
-      engine = SqlEngine(spillThresholdBytes: 256);
+      engine = SqlEngine.open(spillThresholdBytes: 256).ok;
       engine.registerTable('a', nested('a', 'a', 400));
       engine.registerTable('b', nested('b', 'b', 400));
     });
     tearDown(() => engine.dispose());
 
     test('ORDER BY spills a list payload and round-trips it', () async {
-      final r = await engine.execute('SELECT * FROM a ORDER BY ak');
+      final r = await engine.execute('SELECT * FROM a ORDER BY ak').ok;
       expect(r.rowCount, 400);
       final first = r.toRows().first;
       expect(first['ak'], 1);
@@ -6037,17 +6819,17 @@ void main() {
     });
 
     test('UNION dedup spills a list payload and round-trips it', () async {
-      final r = await engine.execute(
-        'SELECT apayload FROM a UNION SELECT bpayload FROM b',
-      );
+      final r = await engine
+          .execute('SELECT apayload FROM a UNION SELECT bpayload FROM b')
+          .ok;
       expect(r.rowCount, 400); // identical payloads dedup across branches
       expect(r.toRows().first['apayload'], isA<List<dynamic>>());
     });
 
     test('a grace join carries a build-side list payload', () async {
-      final r = await engine.execute(
-        'SELECT ak, bpayload FROM a JOIN b ON a.ak = b.bk',
-      );
+      final r = await engine
+          .execute('SELECT ak, bpayload FROM a JOIN b ON a.ak = b.bk')
+          .ok;
       expect(r.rowCount, 400);
       expect(
         r.toRows().every((row) => row['bpayload'] is List),
@@ -6072,7 +6854,7 @@ void main() {
 
     late SqlEngine engine;
     setUp(() {
-      engine = SqlEngine();
+      engine = SqlEngine.open().ok;
       engine.registerTable('a', ints('a', 'id', [1, 2, 3, 4]));
       engine.registerTable('b', ints('b', 'bid', [2, 3, 5]));
       engine.registerTable('c', ints('c', 'cid', [3, 9]));
@@ -6080,12 +6862,12 @@ void main() {
     tearDown(() => engine.dispose());
 
     test('comma join matches the explicit JOIN result', () async {
-      final comma = await engine.execute(
-        'SELECT a.id FROM a, b WHERE a.id = b.bid',
-      );
-      final join = await engine.execute(
-        'SELECT a.id FROM a JOIN b ON a.id = b.bid',
-      );
+      final comma = await engine
+          .execute('SELECT a.id FROM a, b WHERE a.id = b.bid')
+          .ok;
+      final join = await engine
+          .execute('SELECT a.id FROM a JOIN b ON a.id = b.bid')
+          .ok;
       expect(
         comma.column('id')!.toList()..sort(),
         join.column('id')!.toList()..sort(),
@@ -6094,21 +6876,23 @@ void main() {
     });
 
     test('residual conjuncts still filter', () async {
-      final r = await engine.execute(
-        'SELECT a.id FROM a, b WHERE a.id = b.bid AND a.id > 2',
-      );
+      final r = await engine
+          .execute('SELECT a.id FROM a, b WHERE a.id = b.bid AND a.id > 2')
+          .ok;
       expect(r.column('id')!.toList(), [3]);
     });
 
     test('a three-table comma chain joins each step', () async {
-      final r = await engine.execute(
-        'SELECT a.id FROM a, b, c WHERE a.id = b.bid AND b.bid = c.cid',
-      );
+      final r = await engine
+          .execute(
+            'SELECT a.id FROM a, b, c WHERE a.id = b.bid AND b.bid = c.cid',
+          )
+          .ok;
       expect(r.column('id')!.toList(), [3]);
     });
 
     test('unqualified unambiguous columns extract too', () async {
-      final r = await engine.execute('SELECT id FROM a, b WHERE id = bid');
+      final r = await engine.execute('SELECT id FROM a, b WHERE id = bid').ok;
       expect(r.column('id')!.toList().toSet(), {2, 3});
     });
 
@@ -6122,12 +6906,12 @@ void main() {
         'big2',
         ints('big2', 'y', [for (int i = 0; i < n; i++) i]),
       );
-      // As a cartesian product this is 400M pairs — it would time out (or trip
+      // As a cartesian product this is 400M pairs; it would time out (or trip
       // caps) long before finishing; as a hash join it is instant.
       final sw = Stopwatch()..start();
-      final r = await engine.execute(
-        'SELECT x FROM big1, big2 WHERE x = y AND x < 3',
-      );
+      final r = await engine
+          .execute('SELECT x FROM big1, big2 WHERE x = y AND x < 3')
+          .ok;
       sw.stop();
       expect(r.column('x')!.toList()..sort(), [0, 1, 2]);
       expect(
@@ -6138,9 +6922,9 @@ void main() {
     });
 
     test('no extractable equality keeps cross-join semantics', () async {
-      final r = await engine.execute(
-        'SELECT a.id FROM a, b WHERE a.id < b.bid',
-      );
+      final r = await engine
+          .execute('SELECT a.id FROM a, b WHERE a.id < b.bid')
+          .ok;
       // Plain cross + filter: pairs where id < bid.
       expect(r.rowCount, 7); // (1,2)(1,3)(1,5)(2,3)(2,5)(3,5)(4,5)
     });
@@ -6149,7 +6933,7 @@ void main() {
   group('decimal per-row evaluation (audit 7)', () {
     // The per-row `evaluate` path (CASE branches, COALESCE, scalar functions)
     // only scale-aligned decimals for COMPARISONS; arithmetic fell through to
-    // raw operators — unaligned unscaled adds (wrong magnitude), `BigInt + int`
+    // raw operators: unaligned unscaled adds (wrong magnitude), `BigInt + int`
     // TypeErrors, and `BigInt as num` crashes in math functions. It now
     // delegates to Kernels.arithScalar, the vectorized kernel's per-pair twin.
     Table decimals(Map<String, (List<int>, int)> columns) => Table(
@@ -6179,7 +6963,7 @@ void main() {
 
     late SqlEngine engine;
     setUp(() {
-      engine = SqlEngine();
+      engine = SqlEngine.open().ok;
       // a = 1.50 (150@2), b = 0.0025 (25@4), price = 1.50 (150@2)
       engine.registerTable(
         't',
@@ -6195,11 +6979,11 @@ void main() {
     test(
       'cross-scale addition inside CASE matches the vectorized path',
       () async {
-        final vectorized = await engine.execute('SELECT a + b AS v FROM t');
-        final perRow = await engine.execute(
-          'SELECT CASE WHEN price > 0 THEN a + b END AS v FROM t',
-        );
-        // 1.50 + 0.0025 = 1.5025 (unscaled 15025 at scale 4) — NOT 0.0175, the
+        final vectorized = await engine.execute('SELECT a + b AS v FROM t').ok;
+        final perRow = await engine
+            .execute('SELECT CASE WHEN price > 0 THEN a + b END AS v FROM t')
+            .ok;
+        // 1.50 + 0.0025 = 1.5025 (unscaled 15025 at scale 4), NOT 0.0175, the
         // unaligned 150 + 25 the raw fall-through produced.
         expect(vectorized.column('v')!.toList().single, BigInt.from(15025));
         expect(vectorized.schema.fields.single.scale, 4);
@@ -6212,28 +6996,32 @@ void main() {
     );
 
     test('decimal + int inside COALESCE evaluates (was a TypeError)', () async {
-      final r = await engine.execute(
-        'SELECT COALESCE(price * 2, 0) AS v FROM t',
-      );
+      final r = await engine
+          .execute('SELECT COALESCE(price * 2, 0) AS v FROM t')
+          .ok;
       expect(r.column('v')!.toList().single, BigInt.from(300)); // 3.00
       expect(r.schema.fields.single.scale, 2);
     });
 
     test('decimal + int inside CASE evaluates (was a TypeError)', () async {
-      final r = await engine.execute(
-        'SELECT CASE WHEN price > 0 THEN price + 1 END AS v FROM t',
-      );
+      final r = await engine
+          .execute('SELECT CASE WHEN price > 0 THEN price + 1 END AS v FROM t')
+          .ok;
       expect(r.column('v')!.toList().single, BigInt.from(250)); // 2.50
     });
 
     test(
       'math functions accept a decimal argument (was a TypeError)',
       () async {
-        final abs = await engine.execute('SELECT ABS(a) AS v FROM t');
+        final abs = await engine.execute('SELECT ABS(a) AS v FROM t').ok;
         expect(abs.column('v')!.toList().single, 1.5);
-        final round = await engine.execute('SELECT ROUND(price) AS v FROM t');
+        final round = await engine
+            .execute('SELECT ROUND(price) AS v FROM t')
+            .ok;
         expect(round.column('v')!.toList().single, 2.0);
-        final floor = await engine.execute('SELECT FLOOR(price) AS v FROM t');
+        final floor = await engine
+            .execute('SELECT FLOOR(price) AS v FROM t')
+            .ok;
         expect(floor.column('v')!.toList().single, 1.0);
       },
     );
@@ -6249,15 +7037,2100 @@ void main() {
         ),
       );
       engine.registerTable('n', ints);
-      final r = await engine.execute('SELECT ABS(SUM(x)) AS v FROM n');
+      final r = await engine.execute('SELECT ABS(SUM(x)) AS v FROM n').ok;
       expect(r.column('v')!.toList().single, 7.0);
     });
 
     test('MOD over decimals stays exact decimal at the wider scale', () async {
       // 1.50 % 0.0025 = 0 exactly (unscaled: 15000 % 25 at scale 4).
-      final r = await engine.execute('SELECT MOD(a, b) AS v FROM t');
+      final r = await engine.execute('SELECT MOD(a, b) AS v FROM t').ok;
       expect(r.schema.fields.single.dataType, DataType.decimal);
       expect(r.column('v')!.toList().single, BigInt.zero);
+    });
+  });
+
+  group('query deadline', () {
+    late Directory dir;
+    setUp(() => dir = Directory.systemTemp.createTempSync('deadline_'));
+    tearDown(() => dir.deleteSync(recursive: true));
+
+    Table ints(String name, int rows) => Table(
+      name: name,
+      schema: Schema(
+        fields: [Field(name: 'v', dataType: DataType.int64)],
+      ),
+      columns: [
+        NumericColumn.int64(
+          name: 'v',
+          values: [for (var i = 0; i < rows; i++) (i * 7919) % 2000003],
+          nullable: false,
+        ),
+      ],
+    );
+
+    // A 10^9-row product: tens of seconds without a deadline.
+    const product = 'SELECT COUNT(*) AS n FROM a x, a y, a z';
+
+    test('a per-call timeout stops a long cross join', () async {
+      final engine = SqlEngine.open(spillDir: dir.path, unbounded: true).ok;
+      addTearDown(engine.dispose);
+      engine.registerTable('a', ints('a', 1000));
+      final watch = Stopwatch()..start();
+      await expectLater(
+        engine.execute(product, timeout: const Duration(milliseconds: 500)),
+        failsWith(Kind.timeout),
+      );
+      expect(watch.elapsedMilliseconds, lessThan(1500));
+      // The engine takes the next query.
+      final next = await engine.execute('SELECT COUNT(*) AS n FROM a').ok;
+      expect(next.toRows().single['n'], 1000);
+    });
+
+    test('a long query lets timers run', () async {
+      // The pipeline runs in microtasks; without a turn of the event loop a
+      // timer (a server's I/O, another query's lock wait) waits for the whole
+      // query.
+      final engine = SqlEngine.open(spillDir: dir.path, unbounded: true).ok;
+      addTearDown(engine.dispose);
+      engine.registerTable('a', ints('a', 1000));
+      final watch = Stopwatch()..start();
+      int? fired;
+      Timer(const Duration(milliseconds: 100), () {
+        fired = watch.elapsedMilliseconds;
+      });
+      await expectLater(
+        engine.execute(product, timeout: const Duration(seconds: 2)),
+        failsWith(Kind.timeout),
+      );
+      expect(fired, isNotNull);
+      expect(fired, lessThan(400));
+    });
+
+    group('a query queued behind another', () {
+      // Holds the engine lock for about 3 s: a CTE is materialized under it.
+      const slow =
+          'WITH c AS (SELECT COUNT(*) AS n FROM a x, a y, a z) SELECT n FROM c';
+      const short = Duration(milliseconds: 200);
+
+      late SqlEngine engine;
+      setUp(() {
+        engine = SqlEngine.open(spillDir: dir.path, unbounded: true).ok;
+        engine.registerTable('a', ints('a', 1000));
+      });
+      tearDown(() => engine.dispose());
+
+      Future<Result<Table, ErrorDetails>> hold() =>
+          engine.execute(slow, timeout: const Duration(seconds: 3));
+
+      test('execute times out while waiting', () async {
+        final first = hold();
+        final watch = Stopwatch()..start();
+        await expectLater(
+          engine.execute('SELECT COUNT(*) AS n FROM a', timeout: short),
+          failsWith(Kind.timeout, contains('waiting')),
+        );
+        expect(watch.elapsedMilliseconds, lessThan(1000));
+        await first;
+      });
+
+      test('executeStream times out while waiting', () async {
+        final first = hold();
+        final watch = Stopwatch()..start();
+        await expectLater(
+          engine.executeStream('SELECT v FROM a', timeout: short).last,
+          failsWith(Kind.timeout, contains('waiting')),
+        );
+        expect(watch.elapsedMilliseconds, lessThan(1000));
+        await first;
+      });
+
+      test('a later query still runs after the first', () async {
+        var done = false;
+        final first = hold().whenComplete(() => done = true);
+        final skipped = engine.execute('SELECT 1 AS one', timeout: short);
+        final later = engine.execute('SELECT COUNT(*) AS n FROM a').then((r) {
+          expect(done, isTrue, reason: 'ran alongside the first query');
+          return r;
+        });
+        await expectLater(skipped, failsWith(Kind.timeout));
+        expect((await later.ok).toRows().single['n'], 1000);
+        await first;
+      });
+    });
+
+    group('setup waiting on a slow read', () {
+      // Reading a named pipe waits, off the event loop, until it is written:
+      // a stand-in for a slow file system.
+      late String pipe;
+      late SqlEngine engine;
+      var written = false;
+      var disposed = false;
+
+      void release() {
+        written = true;
+        File(pipe).writeAsStringSync('v\n1\n2\n');
+      }
+
+      setUp(() {
+        pipe = '${dir.path}/slow.csv';
+        expect(Process.runSync('mkfifo', [pipe]).exitCode, 0);
+        written = false;
+        disposed = false;
+        engine = SqlEngine.open(
+          spillDir: dir.path,
+          allowExternalPaths: true,
+        ).ok;
+        engine.registerTable('a', ints('a', 1000));
+      });
+      tearDown(() async {
+        if (!written) release();
+        if (!disposed) await engine.dispose();
+      });
+
+      const short = Duration(milliseconds: 300);
+
+      test('execute times out on time', () async {
+        final watch = Stopwatch()..start();
+        await expectLater(
+          engine.execute("SELECT COUNT(*) AS n FROM '$pipe'", timeout: short),
+          failsWith(Kind.timeout),
+        );
+        expect(watch.elapsedMilliseconds, lessThan(1000));
+      });
+
+      test('executeStream times out on time', () async {
+        final watch = Stopwatch()..start();
+        await expectLater(
+          engine.executeStream("SELECT v FROM '$pipe'", timeout: short).last,
+          failsWith(Kind.timeout),
+        );
+        expect(watch.elapsedMilliseconds, lessThan(1000));
+      });
+
+      test('the next query and dispose wait for the abandoned setup', () async {
+        await expectLater(
+          engine.execute("SELECT COUNT(*) AS n FROM '$pipe'", timeout: short),
+          failsWith(Kind.timeout),
+        );
+        final next = engine.execute('SELECT COUNT(*) AS n FROM a').then((r) {
+          expect(written, isTrue, reason: 'ran alongside the abandoned setup');
+          return r;
+        });
+        Timer(const Duration(milliseconds: 500), release);
+        expect((await next.ok).toRows().single['n'], 1000);
+        expect(_leakedSpills(dir), isEmpty);
+      });
+
+      test('dispose waits for the abandoned setup', () async {
+        await expectLater(
+          engine.execute("SELECT COUNT(*) AS n FROM '$pipe'", timeout: short),
+          failsWith(Kind.timeout),
+        );
+        Timer(const Duration(milliseconds: 500), release);
+        disposed = true;
+        expect(await engine.dispose(), isA<Ok<void, ErrorDetails>>());
+        expect(written, isTrue, reason: 'disposed while setup still ran');
+      });
+    });
+
+    test(
+      'the engine default applies and a per-call value overrides it',
+      () async {
+        final engine = SqlEngine.open(
+          spillDir: dir.path,
+          unbounded: true,
+          timeout: const Duration(milliseconds: 300),
+        ).ok;
+        addTearDown(engine.dispose);
+        engine.registerTable('a', ints('a', 1000));
+        await expectLater(engine.execute(product), failsWith(Kind.timeout));
+        final small = await engine
+            .execute(
+              'SELECT COUNT(*) AS n FROM a x, a y',
+              timeout: const Duration(minutes: 1),
+            )
+            .ok;
+        expect(small.toRows().single['n'], 1000000);
+      },
+    );
+
+    test('executeStream stops at the deadline', () async {
+      final engine = SqlEngine.open(spillDir: dir.path, unbounded: true).ok;
+      addTearDown(engine.dispose);
+      engine.registerTable('a', ints('a', 1000));
+      final watch = Stopwatch()..start();
+      await expectLater(
+        engine
+            .executeStream(
+              'SELECT x.v FROM a x, a y, a z',
+              timeout: const Duration(milliseconds: 500),
+            )
+            .last,
+        failsWith(Kind.timeout),
+      );
+      expect(watch.elapsedMilliseconds, lessThan(1500));
+    });
+
+    test('a timed-out spilling sort leaves no spill files', () async {
+      final engine = SqlEngine.open(
+        spillDir: dir.path,
+        unbounded: true,
+        spillThresholdBytes: 1 << 16,
+      ).ok;
+      addTearDown(engine.dispose);
+      engine.registerTable('b', ints('b', 2000000));
+      await expectLater(
+        engine.execute(
+          'SELECT v FROM b ORDER BY v',
+          maxRows: null,
+          timeout: const Duration(milliseconds: 300),
+        ),
+        failsWith(Kind.timeout),
+      );
+      // The caller is answered at the deadline; the sort may still be
+      // unwinding. The next query waits for it.
+      await engine.execute('SELECT 1 AS one').ok;
+      expect(_leakedSpills(dir), isEmpty);
+    });
+  });
+
+  group('spilling a join with a shared column name', () {
+    late Directory dir;
+    setUp(() => dir = Directory.systemTemp.createTempSync('spill_names_'));
+    tearDown(() => dir.deleteSync(recursive: true));
+
+    Future<List<Map<String, dynamic>>> run(String sql, {int? threshold}) async {
+      final engine = threshold == null
+          ? SqlEngine.open(spillDir: dir.path).ok
+          : SqlEngine.open(
+              spillDir: dir.path,
+              spillThresholdBytes: threshold,
+            ).ok;
+      addTearDown(engine.dispose);
+      engine.registerTable(
+        't',
+        Table.fromRows('t', [
+          for (var i = 0; i < 5000; i++) {'id': i, 'v': i % 7},
+        ]),
+      );
+      engine.registerTable(
+        'u',
+        Table.fromRows('u', [
+          for (var i = 0; i < 5000; i++) {'id': i, 'w': i % 11},
+        ]),
+      );
+      return (await engine.execute(sql, maxRows: null).ok).toRows();
+    }
+
+    for (final sql in [
+      'SELECT * FROM t JOIN u ON t.id = u.id ORDER BY u.w, t.id DESC',
+      'SELECT DISTINCT * FROM t JOIN u ON t.id = u.id',
+      'SELECT t.id, COUNT(*) AS n FROM t JOIN u ON t.id = u.id GROUP BY t.id',
+    ]) {
+      test(sql, () async {
+        final memory = await run(sql);
+        final spilled = await run(sql, threshold: 4096);
+        String key(Map<String, dynamic> row) => '$row';
+        expect(
+          (spilled.map(key).toList()..sort()),
+          (memory.map(key).toList()..sort()),
+        );
+        expect(spilled, hasLength(5000));
+      });
+    }
+  });
+
+  group('stopping early closes spill files', () {
+    // Open spill files held by this process, from lsof.
+    List<String> held() => [
+      for (final line
+          in (Process.runSync('lsof', ['-p', '$pid']).stdout as String).split(
+            '\n',
+          ))
+        if (line.contains('spill-')) line,
+    ];
+
+    late Directory dir;
+    late SqlEngine engine;
+    setUp(() {
+      dir = Directory.systemTemp.createTempSync('early_');
+      engine = SqlEngine.open(spillDir: dir.path, spillThresholdBytes: 4096).ok;
+      engine.registerTable(
+        't',
+        Table.fromRows('t', [
+          for (var i = 0; i < 20000; i++) {'id': i},
+        ]),
+      );
+      engine.registerTable(
+        'u',
+        Table.fromRows('u', [
+          for (var i = 0; i < 20000; i++) {'id': i + 5},
+        ]),
+      );
+    });
+    tearDown(() async {
+      await engine.dispose();
+      dir.deleteSync(recursive: true);
+    });
+
+    for (final sql in [
+      'SELECT id FROM t UNION SELECT id FROM u LIMIT 1',
+      'SELECT id FROM t INTERSECT SELECT id FROM u LIMIT 1',
+      'SELECT id FROM t WHERE id IN (SELECT id FROM u) LIMIT 1',
+      'SELECT t.id FROM t JOIN u ON t.id = u.id LIMIT 1',
+    ]) {
+      test(sql, () async {
+        final before = held().length;
+        expect((await engine.execute(sql).ok).rowCount, 1);
+        expect(held().length, before);
+      }, skip: Platform.isWindows ? 'lsof is not available' : false);
+    }
+  });
+
+  test(
+    'a sort with more runs than file descriptors completes',
+    () async {
+      // About 293 sorted runs under a 128-descriptor limit: the merge must not
+      // open them all at once.
+      final dir = Directory.systemTemp.createTempSync('fanin_');
+      addTearDown(() => dir.deleteSync(recursive: true));
+      final script = File('${dir.path}/sort.dart')
+        ..writeAsStringSync('''
+import 'package:libbigdata/libbigdata.dart';
+
+Future<void> main(List<String> args) async {
+  final engine = switch (SqlEngine.open(
+    spillDir: args[0],
+    spillThresholdBytes: 1,
+  )) {
+    Ok(:final value) => value,
+    Err(:final error) => throw error,
+  };
+  engine.registerTable('t', Table.fromRows('t', [
+    for (var i = 0; i < 300000; i++) {'x': (i * 7919) % 300000},
+  ]));
+  final result = await engine.execute(
+    'SELECT x FROM t ORDER BY x',
+    maxRows: null,
+  );
+  switch (result) {
+    case Ok(:final value):
+      final x = value.column('x')!;
+      print('sorted \${value.rowCount} \${x[0]} \${x[value.rowCount - 1]}');
+    case Err(:final error):
+      print('failed \$error');
+  }
+  await engine.dispose();
+}
+''');
+      final packages = File('.dart_tool/package_config.json').absolute.path;
+      final result = await Process.run('sh', [
+        '-c',
+        'ulimit -n 128 && exec "\$0" --packages="\$1" "\$2" "\$3"',
+        Platform.resolvedExecutable,
+        packages,
+        script.path,
+        dir.path,
+      ]);
+      expect(
+        result.stdout,
+        contains('sorted 300000 0 299999'),
+        reason: '${result.stdout}${result.stderr}',
+      );
+    },
+    timeout: const Timeout(Duration(minutes: 3)),
+    skip: Platform.isWindows ? 'needs ulimit' : false,
+  );
+
+  group('matches DuckDB on qualified ORDER BY, USING keys and IN', () {
+    late SqlEngine engine;
+    setUp(() {
+      engine = SqlEngine.open().ok;
+      engine.registerTable(
+        't',
+        Table.fromRows('t', [
+          {'a': 1, 'b': 10},
+          {'a': 2, 'b': null},
+          {'a': 3, 'b': 30},
+          {'a': null, 'b': 40},
+        ]),
+      );
+      engine.registerTable(
+        'u',
+        Table.fromRows('u', [
+          {'a': 1, 'c': 100},
+          {'a': 3, 'c': 300},
+          {'a': 5, 'c': 500},
+        ]),
+      );
+    });
+    tearDown(() => engine.dispose());
+
+    Future<List<Object?>> column(String sql, String name) async => [
+      for (final row in (await engine.execute(sql).ok).toRows()) row[name],
+    ];
+
+    test('ORDER BY u.a sorts by u.a when t.a is also output as a', () async {
+      expect(
+        await column(
+          'SELECT t.a, u.c FROM t FULL JOIN u ON t.a = u.a ORDER BY u.a',
+          'c',
+        ),
+        [100, 300, 500, null, null],
+      );
+    });
+
+    test('ORDER BY t.a sorts by t.a when b is output as a', () async {
+      expect(await column('SELECT b AS a FROM t ORDER BY t.a', 'a'), [
+        10,
+        null,
+        30,
+        40,
+      ]);
+    });
+
+    test(
+      'RIGHT JOIN USING returns the right key for right-only rows',
+      () async {
+        expect(
+          await column(
+            'SELECT a, c FROM t RIGHT JOIN u USING (a) ORDER BY c',
+            'a',
+          ),
+          [1, 3, 5],
+        );
+      },
+    );
+
+    test('FULL JOIN USING coalesces the key', () async {
+      final rows =
+          (await engine
+                  .execute('SELECT a, b, c FROM t FULL JOIN u USING (a)')
+                  .ok)
+              .toRows();
+      expect(rows.map((row) => '${row['a']},${row['b']},${row['c']}').toSet(), {
+        '1,10,100',
+        '2,null,null',
+        '3,30,300',
+        '5,null,500',
+        'null,40,null',
+      });
+    });
+
+    test('a date column IN a list of date strings', () async {
+      final dates = SqlEngine.open().ok;
+      addTearDown(dates.dispose);
+      dates.registerTable(
+        'd',
+        Table.fromRows('d', [
+          for (var day = 1; day <= 9; day++) {'dt': DateTime.utc(2024, 1, day)},
+        ]),
+      );
+      final sql =
+          "SELECT COUNT(*) AS n FROM d WHERE CAST(dt AS DATE) IN "
+          "('2024-01-05', '2024-01-06')";
+      expect((await dates.execute(sql).ok).toRows().single['n'], 2);
+      final ts =
+          "SELECT COUNT(*) AS n FROM d WHERE dt IN "
+          "('2024-01-05 00:00:00', '2024-01-07')";
+      expect((await dates.execute(ts).ok).toRows().single['n'], 2);
+    });
+  });
+
+  group('VALUES decimals and column alias lists', () {
+    late SqlEngine engine;
+    setUp(() {
+      engine = SqlEngine.open().ok;
+      engine.registerTable(
+        't',
+        Table.fromRows('t', [
+          {'a': 1, 'b': 10},
+          {'a': 2, 'b': 20},
+        ]),
+      );
+    });
+    tearDown(() => engine.dispose());
+
+    Future<List<String>> text(String sql, String column) async => [
+      for (final row in (await engine.execute(sql).ok).toRows())
+        '${row[column]}',
+    ];
+
+    test('a VALUES decimal keeps its scale', () async {
+      expect(
+        await text(
+          'SELECT * FROM VALUES (CAST(1.5 AS DECIMAL(5,2)))',
+          'column1',
+        ),
+        ['1.50'],
+      );
+      expect(
+        await text(
+          'SELECT column1 + 1 AS x FROM VALUES (CAST(1.5 AS DECIMAL(5,2)))',
+          'x',
+        ),
+        ['2.50'],
+      );
+    });
+
+    test('VALUES rows at different scales share the widest', () async {
+      expect(
+        await text(
+          'SELECT * FROM VALUES (CAST(1.5 AS DECIMAL(5,1))), '
+              '(CAST(1.25 AS DECIMAL(5,2)))',
+          'column1',
+        ),
+        ['1.50', '1.25'],
+      );
+    });
+
+    test('a VALUES decimal matches an IN list', () async {
+      expect(
+        await text(
+          'SELECT column1 IN (1, 2) AS hit FROM VALUES (CAST(1 AS DECIMAL(5,2)))',
+          'hit',
+        ),
+        ['true'],
+      );
+    });
+
+    test('a derived table renames its columns', () async {
+      final rows =
+          (await engine
+                  .execute(
+                    'SELECT * FROM (SELECT a, b FROM t) v(b, a) ORDER BY b',
+                  )
+                  .ok)
+              .toRows();
+      expect(rows.first, {'b': 1, 'a': 10});
+    });
+
+    test('a table renames its columns, leading ones only', () async {
+      expect(await text('SELECT p FROM t x(p) ORDER BY p', 'p'), ['1', '2']);
+      expect(await text('SELECT x.p, x.b FROM t x(p) ORDER BY p', 'b'), [
+        '10',
+        '20',
+      ]);
+    });
+
+    test('more column aliases than columns is an error', () async {
+      await expectLater(
+        engine.execute('SELECT * FROM t x(p, q, r)'),
+        failsWith(Kind.invalid),
+      );
+    });
+  });
+
+  group('casts and ROUND match DuckDB', () {
+    late SqlEngine engine;
+    setUp(() => engine = SqlEngine.open().ok);
+    tearDown(() => engine.dispose());
+
+    Future<Map<String, dynamic>> row(String sql) async =>
+        (await engine.execute(sql).ok).toRows().single;
+
+    test('ROUND does not clamp large values', () async {
+      final r = await row(
+        'SELECT ROUND(100000000000000000.0, 2) AS a, ROUND(1e300, 2) AS b, '
+        'ROUND(2.345, 2) AS c, ROUND(-2.5) AS d',
+      );
+      expect(r['a'], 1e17);
+      expect(r['b'], 1e300);
+      expect(r['c'], closeTo(2.35, 1e-9));
+      expect(r['d'], -3.0);
+    });
+
+    test('CAST to an integer rounds half away from zero', () async {
+      expect(
+        await row(
+          'SELECT CAST(2.7 AS INTEGER) AS a, CAST(-2.5 AS INTEGER) AS b, '
+          'CAST(2.5 AS INTEGER) AS c, CAST(-0.5 AS INTEGER) AS d, '
+          'CAST(CAST(2.5 AS DECIMAL(5,1)) AS BIGINT) AS e, '
+          'CAST(CAST(-2.45 AS DECIMAL(5,2)) AS BIGINT) AS f',
+        ),
+        {'a': 3, 'b': -3, 'c': 3, 'd': -1, 'e': 3, 'f': -2},
+      );
+    });
+
+    test('CAST to a narrow integer checks its range', () async {
+      final r = await engine.execute('SELECT CAST(100 AS SMALLINT) AS s').ok;
+      expect(r.schema.field('s')!.dataType, DataType.int16);
+      for (final sql in [
+        'SELECT CAST(100000 AS SMALLINT) AS s',
+        'SELECT CAST(300 AS TINYINT) AS s',
+        'SELECT CAST(3000000000 AS INTEGER) AS s',
+      ]) {
+        await expectLater(
+          engine.execute(sql),
+          failsWith(Kind.invalid, contains('out of range')),
+          reason: sql,
+        );
+      }
+    });
+
+    test('CAST to BOOLEAN', () async {
+      expect(
+        await row(
+          "SELECT CAST(2 AS BOOLEAN) AS a, CAST(0 AS BOOLEAN) AS b, "
+          "CAST('t' AS BOOLEAN) AS c, CAST('YES' AS BOOLEAN) AS d, "
+          "CAST('y' AS BOOLEAN) AS e, CAST('n' AS BOOLEAN) AS f, "
+          "CAST('no' AS BOOLEAN) AS g, CAST(0.5 AS BOOLEAN) AS h, "
+          "CAST('abc' AS BOOLEAN) AS i, CAST('on' AS BOOLEAN) AS j",
+        ),
+        {
+          'a': true,
+          'b': false,
+          'c': true,
+          'd': true,
+          'e': true,
+          'f': false,
+          'g': false,
+          'h': true,
+          // DuckDB raises here; this library's rule is that unparsable text
+          // casts to NULL.
+          'i': null,
+          'j': null,
+        },
+      );
+    });
+  });
+
+  group('typing of keys, NULL literals and mixed comparisons', () {
+    late SqlEngine engine;
+    setUp(() async {
+      engine = SqlEngine.open().ok;
+      engine.registerTable(
+        't',
+        Table.fromRows('t', [
+          {'a': 1, 's': 'x', 'x': 12.34},
+          {'a': 2, 's': 'y', 'x': 5.0},
+        ]),
+      );
+      engine.registerTable(
+        'p',
+        await engine
+            .execute('SELECT a, CAST(x AS DECIMAL(9,2)) AS d FROM t')
+            .ok,
+      );
+    });
+    tearDown(() => engine.dispose());
+
+    Future<List<Map<String, dynamic>>> rows(String sql) async =>
+        (await engine.execute(sql).ok).toRows();
+
+    test('a decimal key matches a double key', () async {
+      expect(await rows('SELECT a FROM p WHERE d IN (SELECT 12.34 AS v)'), [
+        {'a': 1},
+      ]);
+      expect(
+        await rows('SELECT p.a FROM p JOIN (SELECT 12.34 AS v) x ON p.d = x.v'),
+        [
+          {'a': 1},
+        ],
+      );
+    });
+
+    test('a NULL literal takes the type of the other branches', () async {
+      final r = await engine
+          .execute('SELECT CASE WHEN a > 1 THEN NULL ELSE a END AS c FROM t')
+          .ok;
+      expect(r.schema.field('c')!.dataType.isInteger, isTrue);
+      expect(r.column('c')!.toList(), [1, null]);
+      expect(await rows('SELECT COALESCE(NULL, 1) + 1 AS v'), [
+        {'v': 2},
+      ]);
+      expect(
+        (await rows(
+          'SELECT a FROM t UNION ALL SELECT NULL',
+        )).map((row) => row['a']),
+        [1, 2, null],
+      );
+    });
+
+    test('a string column compared with a number is an error', () async {
+      for (final sql in [
+        'SELECT s FROM t WHERE s = 1',
+        'SELECT s FROM t WHERE s IN (1, 2)',
+        'SELECT a FROM t WHERE a IN (SELECT s FROM t)',
+      ]) {
+        await expectLater(
+          engine.execute(sql),
+          failsWith(Kind.invalid),
+          reason: sql,
+        );
+      }
+    });
+
+    test(
+      'an aggregate with the wrong number of arguments is an error',
+      () async {
+        for (final sql in [
+          'SELECT COUNT(a, s) FROM t',
+          'SELECT SUM(a, a) FROM t',
+          'SELECT MIN() FROM t',
+        ]) {
+          await expectLater(
+            engine.execute(sql),
+            failsWith(Kind.invalid),
+            reason: sql,
+          );
+        }
+      },
+    );
+  });
+
+  group('binary columns', () {
+    late SqlEngine engine;
+    setUp(() {
+      engine = SqlEngine.open().ok;
+      engine.registerTable(
+        'b',
+        Table.fromRows('b', [
+          {
+            'x': Uint8List.fromList([2, 3]),
+          },
+          {
+            'x': Uint8List.fromList([1]),
+          },
+          {
+            'x': Uint8List.fromList([2]),
+          },
+          {'x': null},
+        ]),
+      );
+    });
+    tearDown(() => engine.dispose());
+
+    test('MIN and MAX compare bytes', () async {
+      final row =
+          (await engine.execute('SELECT MIN(x) AS lo, MAX(x) AS hi FROM b').ok)
+              .toRows()
+              .single;
+      expect(row['lo'], [1]);
+      expect(row['hi'], [2, 3]);
+    });
+
+    test('ORDER BY compares bytes', () async {
+      final rows = (await engine.execute('SELECT x FROM b ORDER BY x').ok)
+          .toRows();
+      expect(rows.map((row) => row['x']), [
+        [1],
+        [2],
+        [2, 3],
+        null,
+      ]);
+    });
+  });
+
+  group('pushdown is scoped to its scan', () {
+    late Directory dir;
+    late SqlEngine engine;
+    late String path;
+    setUp(() async {
+      dir = Directory.systemTemp.createTempSync('pushdown_scope_');
+      engine = SqlEngine.open(spillDir: dir.path, allowExternalPaths: true).ok;
+      // 4000 rows in groups of 500; every parent is some row's id.
+      const rows = 4000;
+      path = '${dir.path}/f.parquet';
+      await ParquetWriter(
+            path,
+            options: ParquetWriterOptions(rowGroupSize: 500),
+          )
+          .write(
+            Table(
+              name: 'f',
+              schema: Schema(
+                fields: [
+                  Field(name: 'id', dataType: DataType.int64, nullable: false),
+                  Field(name: 'a', dataType: DataType.int64, nullable: false),
+                  Field(
+                    name: 'parent',
+                    dataType: DataType.int64,
+                    nullable: false,
+                  ),
+                ],
+              ),
+              columns: [
+                NumericColumn.int64(
+                  name: 'id',
+                  values: [for (var i = 0; i < rows; i++) i],
+                  nullable: false,
+                ),
+                NumericColumn.int64(
+                  name: 'a',
+                  values: [for (var i = 0; i < rows; i++) i],
+                  nullable: false,
+                ),
+                NumericColumn.int64(
+                  name: 'parent',
+                  values: [
+                    for (var i = 0; i < rows; i++) (i * 7 + 3000) % rows,
+                  ],
+                  nullable: false,
+                ),
+              ],
+            ),
+          )
+          .ok;
+    });
+    tearDown(() async {
+      await engine.dispose();
+      dir.deleteSync(recursive: true);
+    });
+
+    test('a WHERE in one UNION ALL branch does not filter the other', () async {
+      final t = await engine
+          .execute(
+            "SELECT id FROM '$path' WHERE a < 1000 "
+            "UNION ALL SELECT id FROM '$path'",
+          )
+          .ok;
+      expect(t.rowCount, 5000);
+    });
+
+    test('a WHERE does not filter an IN subquery over the same file', () async {
+      final t = await engine
+          .execute(
+            "SELECT id FROM '$path' WHERE a < 1000 "
+            "AND parent IN (SELECT id FROM '$path')",
+          )
+          .ok;
+      expect(t.rowCount, 1000);
+    });
+
+    test('each UNION ALL branch prunes with its own WHERE', () async {
+      ParquetReader.rowGroupsPruned = 0;
+      final t = await engine
+          .execute(
+            "SELECT id FROM '$path' WHERE a >= 3500 "
+            "UNION ALL SELECT id FROM '$path' WHERE a < 500",
+          )
+          .ok;
+      expect(t.rowCount, 1000);
+      // Each branch reads one of its eight groups.
+      expect(ParquetReader.rowGroupsPruned, 14);
+    });
+
+    test('a single-scan WHERE still prunes row groups', () async {
+      ParquetReader.rowGroupsPruned = 0;
+      final t = await engine
+          .execute("SELECT id FROM '$path' WHERE a >= 3500")
+          .ok;
+      expect(t.rowCount, 500);
+      expect(ParquetReader.rowGroupsPruned, greaterThan(0));
+    });
+  });
+
+  group('ordinal positions', () {
+    late Directory dir;
+    late SqlEngine engine;
+    setUp(() {
+      dir = Directory.systemTemp.createTempSync('ordinal_');
+      engine = SqlEngine.open(spillDir: dir.path).ok;
+      engine.registerTable(
+        't',
+        Table(
+          name: 't',
+          schema: Schema(
+            fields: [
+              Field(name: 'k', dataType: DataType.string),
+              Field(name: 'v', dataType: DataType.int64),
+            ],
+          ),
+          columns: [
+            ListColumn<String>(
+              name: 'k',
+              dataType: DataType.string,
+              data: ['a', 'b', 'a', 'c'],
+            ),
+            NumericColumn.int64(
+              name: 'v',
+              values: [3, 1, 4, 2],
+              nullable: false,
+            ),
+          ],
+        ),
+      );
+    });
+    tearDown(() async {
+      await engine.dispose();
+      dir.deleteSync(recursive: true);
+    });
+
+    test('ORDER BY takes a name, not a position', () async {
+      for (final sql in [
+        'SELECT k, v FROM t ORDER BY 2 DESC',
+        'SELECT * FROM t ORDER BY 1, 2',
+        'SELECT k, v FROM t ORDER BY k, 2',
+      ]) {
+        await expectLater(
+          engine.execute(sql),
+          failsWith(Kind.invalid, contains('ORDER BY position')),
+          reason: sql,
+        );
+      }
+      final t = await engine.execute('SELECT k, v FROM t ORDER BY v DESC').ok;
+      expect(t.column('v')!.toList(), [4, 3, 2, 1]);
+    });
+
+    test('a join with a shared column name sorts by name', () async {
+      engine.registerTable(
+        'p',
+        Table.fromRows('p', [
+          {'id': 2, 'dept': 'eng', 'name': 'Bo'},
+          {'id': 1, 'dept': 'eng', 'name': 'Ann'},
+        ]),
+      );
+      engine.registerTable(
+        'd',
+        Table.fromRows('d', [
+          {'dept': 'eng', 'name': 'Eng'},
+        ]),
+      );
+      for (final join in ['USING (dept)', 'ON p.dept = d.dept']) {
+        // A position used to fail here with "Duplicate field name".
+        await expectLater(
+          engine.execute('SELECT * FROM p JOIN d $join ORDER BY 1'),
+          failsWith(Kind.invalid, contains('ORDER BY position')),
+          reason: join,
+        );
+        final t = await engine
+            .execute('SELECT * FROM p JOIN d $join ORDER BY id')
+            .ok;
+        expect(t.column('id')!.toList(), [1, 2], reason: join);
+      }
+    });
+
+    test('ORDER BY a select alias sorts by its expression', () async {
+      final t = await engine
+          .execute('SELECT k, v * 10 AS w FROM t ORDER BY w')
+          .ok;
+      expect(t.column('w')!.toList(), [10, 20, 30, 40]);
+    });
+
+    test('ORDER BY names under SELECT *', () async {
+      final t = await engine.execute('SELECT * FROM t ORDER BY k, v').ok;
+      expect(t.column('v')!.toList(), [3, 4, 1, 2]);
+    });
+
+    test('GROUP BY takes a name, not a position', () async {
+      for (final sql in [
+        'SELECT k, SUM(v) AS s FROM t GROUP BY 1',
+        'SELECT * FROM t GROUP BY 1, 2',
+        'SELECT k, SUM(v) FROM t GROUP BY 2',
+      ]) {
+        await expectLater(
+          engine.execute(sql),
+          failsWith(Kind.invalid, contains('GROUP BY position')),
+          reason: sql,
+        );
+      }
+    });
+
+    test('GROUP BY a column name groups by it', () async {
+      final t = await engine
+          .execute('SELECT k, SUM(v) AS s FROM t GROUP BY k ORDER BY k')
+          .ok;
+      expect(t.column('k')!.toList(), ['a', 'b', 'c']);
+      // SUM over integers is an exact BigInt.
+      expect(t.column('s')!.toList(), [7, 1, 2].map(BigInt.from));
+    });
+
+    test('ORDER BY a name after a set operation', () async {
+      final t = await engine
+          .execute(
+            'SELECT v FROM t UNION ALL SELECT v + 10 FROM t ORDER BY v DESC LIMIT 2',
+          )
+          .ok;
+      expect(t.column('v')!.toList(), [14, 13]);
+    });
+
+    test('any integer, in or out of range, is refused as a position', () async {
+      for (final sql in [
+        'SELECT k, v FROM t ORDER BY 9',
+        'SELECT k, v FROM t ORDER BY 0',
+        'SELECT k, SUM(v) FROM t GROUP BY 3',
+        'SELECT k, SUM(v) FROM t GROUP BY 0',
+      ]) {
+        await expectLater(
+          engine.execute(sql),
+          failsWith(Kind.invalid, contains('position')),
+          reason: sql,
+        );
+      }
+    });
+  });
+
+  group('boolean ordering', () {
+    late Directory dir;
+    late SqlEngine engine;
+    setUp(() {
+      dir = Directory.systemTemp.createTempSync('boolean_');
+      engine = SqlEngine.open(spillDir: dir.path).ok;
+      engine.registerTable(
+        't',
+        Table(
+          name: 't',
+          schema: Schema(
+            fields: [
+              Field(name: 'id', dataType: DataType.int64),
+              Field(name: 'flag', dataType: DataType.boolean, nullable: true),
+            ],
+          ),
+          columns: [
+            NumericColumn.int64(
+              name: 'id',
+              values: [1, 2, 3, 4],
+              nullable: false,
+            ),
+            ListColumn<bool>(
+              name: 'flag',
+              dataType: DataType.boolean,
+              data: [true, false, null, true],
+              nullable: true,
+            ),
+          ],
+        ),
+      );
+    });
+    tearDown(() async {
+      await engine.dispose();
+      dir.deleteSync(recursive: true);
+    });
+
+    test('a boolean comparison orders false before true', () async {
+      final above = await engine
+          .execute('SELECT id FROM t WHERE flag > false ORDER BY id')
+          .ok;
+      expect(above.column('id')!.toList(), [1, 4]);
+      final below = await engine
+          .execute('SELECT id FROM t WHERE flag < true')
+          .ok;
+      expect(below.column('id')!.toList(), [2]);
+    });
+
+    test('MIN and MAX of a boolean are false and true', () async {
+      final t = await engine
+          .execute('SELECT MIN(flag) AS lo, MAX(flag) AS hi FROM t')
+          .ok;
+      expect(t.toRows().single, {'lo': false, 'hi': true});
+    });
+
+    test('ORDER BY a boolean sorts false, true, then nulls', () async {
+      final t = await engine.execute('SELECT id FROM t ORDER BY flag, id').ok;
+      expect(t.column('id')!.toList(), [2, 1, 4, 3]);
+      final down = await engine
+          .execute(
+            'SELECT id FROM t WHERE flag IS NOT NULL ORDER BY flag DESC, id',
+          )
+          .ok;
+      expect(down.column('id')!.toList(), [1, 4, 2]);
+    });
+  });
+
+  group('cast to temporal types', () {
+    late Directory dir;
+    late SqlEngine engine;
+    setUp(() {
+      dir = Directory.systemTemp.createTempSync('cast_temporal_');
+      engine = SqlEngine.open(spillDir: dir.path).ok;
+    });
+    tearDown(() async {
+      await engine.dispose();
+      dir.deleteSync(recursive: true);
+    });
+
+    test("CAST('2024-01-01' AS DATE) is a date value", () async {
+      final t = await engine
+          .execute("SELECT CAST('2024-01-01' AS DATE) AS d")
+          .ok;
+      expect(t.schema.fields.single.dataType, DataType.date);
+      expect(t.column('d')![0], DateTime.utc(2024, 1, 1));
+    });
+
+    test('CAST of a timestamp string to DATE keeps the day', () async {
+      final t = await engine
+          .execute("SELECT CAST('2024-03-05T22:15:00' AS DATE) AS d")
+          .ok;
+      expect(t.column('d')![0], DateTime.utc(2024, 3, 5));
+    });
+
+    test('CAST to TIMESTAMP reads a zone-less string as UTC', () async {
+      final t = await engine
+          .execute(
+            "SELECT CAST('2024-01-01 10:30:00' AS TIMESTAMP) AS ts, "
+            "CAST('2024-01-01T10:30:00+02:00' AS TIMESTAMP) AS z",
+          )
+          .ok;
+      expect(t.schema.field('ts')!.dataType, DataType.timestamp);
+      expect(t.column('ts')![0], DateTime.utc(2024, 1, 1, 10, 30));
+      expect(t.column('z')![0], DateTime.utc(2024, 1, 1, 8, 30));
+    });
+
+    test('an unparseable string casts to NULL, like numeric casts', () async {
+      final t = await engine
+          .execute(
+            "SELECT CAST('nope' AS DATE) AS d, CAST('nope' AS TIMESTAMP) AS ts, "
+            "CAST('nope' AS INTEGER) AS n",
+          )
+          .ok;
+      expect(t.toRows().single, {'d': null, 'ts': null, 'n': null});
+    });
+
+    test('CAST to TIME is an explicit unsupported error', () async {
+      await expectLater(
+        engine.execute("SELECT CAST('10:30:00' AS TIME) AS t"),
+        failsWith(Kind.unsupported),
+      );
+    });
+  });
+
+  group('filter pushdown keeps results exact', () {
+    late Directory dir;
+    late SqlEngine engine;
+    late String path;
+    setUp(() async {
+      dir = Directory.systemTemp.createTempSync('pushdown_');
+      engine = SqlEngine.open(allowExternalPaths: true).ok;
+      // Ten row groups: `a` 0..999 with statistics that let a filter prune;
+      // `b` is 0 everywhere.
+      path = '${dir.path}/t.parquet';
+      await ParquetWriter(
+            path,
+            options: const ParquetWriterOptions(rowGroupSize: 100),
+          )
+          .write(
+            Table.fromRows('t', [
+              for (var i = 0; i < 1000; i++) {'a': i, 'b': 0},
+            ]),
+          )
+          .ok;
+    });
+    tearDown(() async {
+      await engine.dispose();
+      dir.deleteSync(recursive: true);
+    });
+
+    Future<Object?> count(String query) async =>
+        (await engine.execute(query).ok).toRows().single['n'];
+
+    test('a filter over a LIMIT sees only the limited rows', () async {
+      expect(
+        await count(
+          "SELECT COUNT(*) AS n FROM (SELECT a FROM '$path' LIMIT 100) s "
+          'WHERE a >= 900',
+        ),
+        0,
+      );
+    });
+
+    test(
+      'a filter on swapped column aliases does not prune the raw column',
+      () async {
+        // x.a is the file's b (all 0), so every row matches.
+        expect(
+          await count("SELECT COUNT(*) AS n FROM '$path' x(b, a) WHERE a < 1"),
+          1000,
+        );
+      },
+    );
+
+    test('a select over DISTINCT keeps the distinct columns', () async {
+      expect(
+        await count(
+          "SELECT COUNT(*) AS n FROM (SELECT DISTINCT a, b FROM '$path') s",
+        ),
+        1000,
+      );
+    });
+  });
+
+  group('temporal literals and string comparison', () {
+    late Directory dir;
+    late SqlEngine engine;
+    setUp(() {
+      dir = Directory.systemTemp.createTempSync('temporal_');
+      engine = SqlEngine.open(spillDir: dir.path).ok;
+      engine.registerTable(
+        't',
+        Table(
+          name: 't',
+          schema: Schema(
+            fields: [
+              Field(name: 'id', dataType: DataType.int64),
+              Field(name: 'ts', dataType: DataType.timestamp),
+              Field(name: 'd', dataType: DataType.date),
+            ],
+          ),
+          columns: [
+            NumericColumn.int64(name: 'id', values: [1, 2, 3], nullable: false),
+            ListColumn<DateTime>(
+              name: 'ts',
+              dataType: DataType.timestamp,
+              data: [
+                DateTime.utc(2024, 5, 31, 23),
+                DateTime.utc(2024, 6, 1, 12),
+                DateTime.utc(2024, 7, 1),
+              ],
+            ),
+            ListColumn<DateTime>(
+              name: 'd',
+              dataType: DataType.date,
+              data: [
+                DateTime.utc(2024, 5, 31),
+                DateTime.utc(2024, 6, 1),
+                DateTime.utc(2024, 7, 1),
+              ],
+            ),
+          ],
+        ),
+      );
+    });
+    tearDown(() async {
+      await engine.dispose();
+      dir.deleteSync(recursive: true);
+    });
+
+    Future<List<Object?>> ids(String where) async =>
+        (await engine.execute('SELECT id FROM t WHERE $where ORDER BY id').ok)
+            .column('id')!
+            .toList();
+
+    test('a TIMESTAMP literal and a string compare the same way', () async {
+      expect(await ids("ts > TIMESTAMP '2024-06-01'"), [2, 3]);
+      expect(await ids("ts > '2024-06-01'"), [2, 3]);
+      expect(await ids("'2024-06-01' < ts"), [2, 3]);
+    });
+
+    test('a DATE literal and a string compare with a date column', () async {
+      expect(await ids("d = DATE '2024-06-01'"), [2]);
+      expect(await ids("d >= '2024-06-01'"), [2, 3]);
+    });
+
+    test('a DATE literal selects as a date value', () async {
+      final t = await engine.execute("SELECT DATE '2024-02-29' AS x").ok;
+      expect(t.schema.fields.single.dataType, DataType.date);
+      expect(t.column('x')![0], DateTime.utc(2024, 2, 29));
+    });
+
+    test('an unparseable temporal literal or string throws', () async {
+      await expectLater(
+        engine.execute("SELECT DATE 'soon' AS x"),
+        failsWith(Kind.invalid),
+      );
+      await expectLater(
+        engine.execute("SELECT id FROM t WHERE ts > 'soon'"),
+        failsWith(Kind.invalid),
+      );
+    });
+
+    test(
+      'an out-of-range temporal literal is invalid, not rolled over',
+      () async {
+        for (final literal in [
+          "DATE '2024-13-45'",
+          "DATE '2023-02-29'",
+          "TIMESTAMP '2024-01-01 25:00:00'",
+        ]) {
+          await expectLater(
+            engine.execute('SELECT $literal AS x'),
+            failsWith(Kind.invalid),
+            reason: literal,
+          );
+        }
+        await expectLater(
+          engine.execute("SELECT id FROM t WHERE ts > '2024-13-01'"),
+          failsWith(Kind.invalid),
+        );
+        final cast = await engine
+            .execute("SELECT CAST('2024-02-30' AS DATE) AS x")
+            .ok;
+        expect(cast.column('x')![0], isNull);
+      },
+    );
+
+    test('a column named date still parses', () async {
+      final t = await engine.execute('SELECT d AS date FROM t ORDER BY id').ok;
+      expect(t.column('date')!.toList().length, 3);
+    });
+  });
+
+  group('no implicit coercion of string literals to numbers', () {
+    late Directory dir;
+    late SqlEngine engine;
+    setUp(() {
+      dir = Directory.systemTemp.createTempSync('coercion_');
+      engine = SqlEngine.open(spillDir: dir.path).ok;
+      engine.registerTable(
+        't',
+        Table(
+          name: 't',
+          schema: Schema(
+            fields: [
+              Field(name: 'n', dataType: DataType.int64),
+              Field(name: 's', dataType: DataType.string),
+            ],
+          ),
+          columns: [
+            NumericColumn.int64(name: 'n', values: [1, 2, 3], nullable: false),
+            ListColumn<String>(
+              name: 's',
+              dataType: DataType.string,
+              data: ['1', '2', '3'],
+            ),
+          ],
+        ),
+      );
+    });
+    tearDown(() async {
+      await engine.dispose();
+      dir.deleteSync(recursive: true);
+    });
+
+    final rejected = failsWith(
+      Kind.invalid,
+      allOf(contains('int64'), contains('string'), contains('CAST')),
+    );
+
+    for (final where in [
+      "n = '1'",
+      "n < '3'",
+      "'3' > n",
+      "n IN ('1', '2')",
+      "n + '1' = 2",
+    ]) {
+      test('WHERE $where is rejected before execution', () async {
+        await expectLater(
+          engine.execute('SELECT n FROM t WHERE $where'),
+          rejected,
+        );
+      });
+    }
+
+    test('an explicit CAST compares as a number', () async {
+      final t = await engine
+          .execute("SELECT n FROM t WHERE n = CAST('1' AS BIGINT)")
+          .ok;
+      expect(t.column('n')!.toList(), [1]);
+    });
+
+    test('strings still compare with strings', () async {
+      final t = await engine.execute("SELECT n FROM t WHERE s = '2'").ok;
+      expect(t.column('n')!.toList(), [2]);
+    });
+  });
+
+  group('group by same-named columns', () {
+    late Directory dir;
+    late SqlEngine engine;
+    setUp(() {
+      dir = Directory.systemTemp.createTempSync('group_qualified_');
+      engine = SqlEngine.open(spillDir: dir.path).ok;
+      Table ids(String name, List<int> values) => Table(
+        name: name,
+        schema: Schema(
+          fields: [Field(name: 'id', dataType: DataType.int64)],
+        ),
+        columns: [
+          NumericColumn.int64(name: 'id', values: values, nullable: false),
+        ],
+      );
+      engine.registerTable('t', ids('t', [1, 1, 2]));
+      engine.registerTable('u', ids('u', [10, 20]));
+    });
+    tearDown(() async {
+      await engine.dispose();
+      dir.deleteSync(recursive: true);
+    });
+
+    test('GROUP BY t.id, u.id keeps two distinct columns', () async {
+      final t = await engine
+          .execute(
+            'SELECT t.id, u.id, COUNT(*) AS n FROM t CROSS JOIN u '
+            'GROUP BY t.id, u.id ORDER BY t.id, u.id',
+          )
+          .ok;
+      expect(t.schema.fields.length, 3);
+      expect(t.toRows().map((r) => r.values.toList()), [
+        [1, 10, 2],
+        [1, 20, 2],
+        [2, 10, 1],
+        [2, 20, 1],
+      ]);
+    });
+
+    // Ordinal support (T17) once read the join's schema for every GROUP BY
+    // and ORDER BY, and a join's logical schema rejects two `id` columns.
+    test('GROUP BY one of two same-named columns still plans', () async {
+      final t = await engine
+          .execute(
+            'SELECT t.id, COUNT(*) AS n FROM t CROSS JOIN u GROUP BY t.id '
+            'ORDER BY t.id',
+          )
+          .ok;
+      expect(t.column('n')!.toList(), [4, 2]);
+    });
+
+    test('ORDER BY over SELECT * of same-named columns still plans', () async {
+      final t = await engine
+          .execute('SELECT * FROM t CROSS JOIN u ORDER BY t.id, u.id')
+          .ok;
+      expect(t.rowCount, 6);
+    });
+
+    test('GROUP BY t.id, u.id with SELECT * returns both keys', () async {
+      final t = await engine
+          .execute('SELECT * FROM t CROSS JOIN u GROUP BY t.id, u.id')
+          .ok;
+      expect(t.schema.fields.length, 2);
+      expect(t.rowCount, 4);
+    });
+  });
+
+  group('scalar function arguments', () {
+    late Directory dir;
+    late SqlEngine engine;
+    setUp(() {
+      dir = Directory.systemTemp.createTempSync('function_args_');
+      engine = SqlEngine.open(spillDir: dir.path).ok;
+      engine.registerTable(
+        't',
+        Table(
+          name: 't',
+          schema: Schema(
+            fields: [
+              Field(name: 's', dataType: DataType.string),
+              Field(name: 'n', dataType: DataType.int64),
+            ],
+          ),
+          columns: [
+            ListColumn<String>(
+              name: 's',
+              dataType: DataType.string,
+              data: ['abc'],
+            ),
+            NumericColumn.int64(
+              name: 'n',
+              values: [-9223372036854775807 - 1],
+              nullable: false,
+            ),
+          ],
+        ),
+      );
+    });
+    tearDown(() async {
+      await engine.dispose();
+      dir.deleteSync(recursive: true);
+    });
+
+    Future<Result<Table, ErrorDetails>> query(String expression) =>
+        engine.execute('SELECT $expression AS x FROM t');
+    Future<Object?> value(String expression) async =>
+        (await query(expression).ok).column('x')![0];
+
+    test('SUBSTR with a NULL start or length returns NULL', () async {
+      expect(await value('SUBSTR(s, NULL)'), isNull);
+      expect(await value('SUBSTR(s, 1, NULL)'), isNull);
+    });
+
+    test('SUBSTR positions follow Postgres', () async {
+      expect(await value('SUBSTR(s, 2)'), 'bc');
+      expect(await value('SUBSTR(s, 2, 1)'), 'b');
+      expect(await value('SUBSTR(s, 0, 2)'), 'a');
+      expect(await value('SUBSTR(s, -1, 3)'), 'a');
+      expect(await value('SUBSTR(s, -1)'), 'abc');
+      expect(await value('SUBSTR(s, 5)'), '');
+    });
+
+    test('LENGTH and SUBSTR count code points', () async {
+      expect(await value("LENGTH('a\u{1F600}b')"), 3);
+      expect(await value("CHAR_LENGTH('\u{1F600}')"), 1);
+      expect(await value("SUBSTR('a\u{1F600}b', 2, 1)"), '\u{1F600}');
+      expect(await value("SUBSTR('a\u{1F600}b', 3)"), 'b');
+      expect(await value("SUBSTR('\u{1F600}\u{1F600}', 0, 2)"), '\u{1F600}');
+    });
+
+    test('SUBSTR with a negative length is a clear error', () async {
+      await expectLater(
+        query('SUBSTR(s, 2, -1)'),
+        failsWith(Kind.invalid, contains('negative')),
+      );
+    });
+
+    test('ABS of the minimum int64 overflows like +', () async {
+      await expectLater(
+        query('ABS(n)'),
+        failsWith(Kind.invalid, contains('integer overflow')),
+      );
+    });
+
+    test('arithmetic on a string names the operator', () async {
+      for (final expression in ["'a' + 1", 's + 1', 'n * s']) {
+        await expectLater(
+          query(expression),
+          failsWith(
+            Kind.invalid,
+            allOf(contains('string'), matches(RegExp(r'[+*]'))),
+          ),
+          reason: expression,
+        );
+      }
+    });
+  });
+
+  group('text columns', () {
+    late SqlEngine engine;
+    // U+E000 sorts after a character past U+FFFF in UTF-16 order (String
+    // .compareTo) and before it in UTF-8 byte order; the engine uses UTF-16.
+    const values = ['b', '\ue000', null, '\u{1F600}', 'a', 'b', '\u00e9'];
+
+    setUp(() {
+      engine = SqlEngine.open().ok;
+      final table = Table.fromRows('t', [
+        for (final (i, s) in values.indexed) {'i': i, 's': s},
+      ]);
+      expect(table.column('s'), isA<StringColumn>());
+      engine.registerTable('t', table);
+    });
+
+    tearDown(() => engine.dispose());
+
+    Future<List<Object?>> column(String sql, String name) async => [
+      for (final row in (await engine.execute(sql).ok).toRows()) row[name],
+    ];
+
+    test('ORDER BY follows String.compareTo', () async {
+      final sorted = [for (final s in values) ?s]..sort();
+      expect(await column('SELECT s FROM t ORDER BY s', 's'), [
+        ...sorted,
+        null,
+      ]);
+      // DESC puts nulls last too by default, as in DuckDB.
+      expect(await column('SELECT s FROM t ORDER BY s DESC', 's'), [
+        ...sorted.reversed,
+        null,
+      ]);
+    });
+
+    test('computed results are typed columns', () async {
+      final result = await engine
+          .execute(
+            "SELECT UPPER(s) AS u, s LIKE 'b%' AS m, LENGTH(s) AS n FROM t",
+          )
+          .ok;
+      expect(result.column('u'), isA<StringColumn>());
+      expect(result.column('u')!.toList(), [
+        for (final s in values) s?.toUpperCase(),
+      ]);
+      expect(result.column('m'), isA<BoolColumn>());
+      expect(result.column('m')!.toList(), [
+        for (final s in values) s?.startsWith('b'),
+      ]);
+      expect(result.column('n'), isA<NumericColumn>());
+    });
+
+    test('comparisons with a literal and with a column', () async {
+      expect(await column("SELECT i FROM t WHERE s > 'b' ORDER BY i", 'i'), [
+        1,
+        3,
+        6,
+      ]);
+      expect(await column("SELECT i FROM t WHERE s = 'b' ORDER BY i", 'i'), [
+        0,
+        5,
+      ]);
+      expect(
+        await column("SELECT i FROM t WHERE s < '\u{1F600}' ORDER BY i", 'i'),
+        [0, 4, 5, 6],
+      );
+      expect(
+        await column(
+          'SELECT a.i FROM t a JOIN t b ON a.i = b.i '
+              'WHERE a.s <= b.s ORDER BY a.i',
+          'i',
+        ),
+        [0, 1, 3, 4, 5, 6],
+      );
+    });
+
+    test('IN and GROUP BY', () async {
+      expect(
+        await column(
+          "SELECT i FROM t WHERE s IN ('a', '\ue000') ORDER BY i",
+          'i',
+        ),
+        [1, 4],
+      );
+      final groups =
+          (await engine
+                  .execute(
+                    'SELECT s, COUNT(*) AS n FROM t GROUP BY s ORDER BY s',
+                  )
+                  .ok)
+              .toRows();
+      expect(groups, [
+        {'s': 'a', 'n': 1},
+        {'s': 'b', 'n': 2},
+        {'s': '\u00e9', 'n': 1},
+        {'s': '\u{1F600}', 'n': 1},
+        {'s': '\ue000', 'n': 1},
+        {'s': null, 'n': 1},
+      ]);
+    });
+
+    test('a join on a text key', () async {
+      expect(
+        await column(
+          'SELECT a.i FROM t a JOIN t b ON a.s = b.s ORDER BY a.i, b.i',
+          'i',
+        ),
+        [0, 0, 1, 3, 4, 5, 5, 6],
+      );
+    });
+  });
+
+  group('planner details', () {
+    late Directory dir;
+    late SqlEngine engine;
+    setUp(() {
+      dir = Directory.systemTemp.createTempSync('planner_details_');
+      engine = SqlEngine.open(sandboxRoot: dir.path, readOnly: false).ok;
+      engine.registerTable(
+        't',
+        Table.fromRows('t', [
+          {'a': 1, 'b': 2},
+          {'a': 1, 'b': 3},
+          {'a': 2, 'b': 4},
+        ]),
+      );
+      engine.registerTable(
+        's',
+        Table.fromRows('s', [
+          {'a': 1, 'c': 5},
+          {'a': 9, 'c': 6},
+        ]),
+      );
+    });
+    tearDown(() async {
+      await engine.dispose();
+      dir.deleteSync(recursive: true);
+    });
+
+    Future<List<Map<String, dynamic>>> rows(String sql) async =>
+        (await engine.execute(sql).ok).toRows();
+
+    test('a join condition with an unknown qualifier is invalid', () async {
+      await expectLater(
+        engine.execute('SELECT * FROM t JOIN s ON t.a = x.a'),
+        failsWith(Kind.invalid, contains('x')),
+      );
+    });
+
+    test('MERGE takes a registered table and differently named keys', () async {
+      await DeltaWriter('${dir.path}/target')
+          .write(
+            Table.fromRows('target', [
+              {'id': 1, 'v': 10},
+              {'id': 2, 'v': 20},
+            ]),
+          )
+          .ok;
+      engine.registerTable(
+        'updates',
+        Table.fromRows('updates', [
+          {'id': 2, 'v': 99},
+        ]),
+      );
+      await engine
+          .execute(
+            "MERGE INTO 'target' USING updates ON target.id = updates.id "
+            'WHEN MATCHED THEN UPDATE SET *',
+          )
+          .ok;
+      engine.registerTable(
+        'renamed',
+        Table.fromRows('renamed', [
+          {'key': 1, 'v': 77},
+        ]),
+      );
+      await engine
+          .execute(
+            "MERGE INTO 'target' AS t USING renamed AS r ON t.id = r.key "
+            'WHEN MATCHED THEN UPDATE SET *',
+          )
+          .ok;
+      final after = await rows("SELECT id, v FROM 'target' ORDER BY id");
+      expect(after, [
+        {'id': 1, 'v': 77},
+        {'id': 2, 'v': 99},
+      ]);
+    });
+
+    test('file tables correlate by their default qualifier', () async {
+      File('${dir.path}/a.csv').writeAsStringSync('id,v\n1,10\n2,20\n');
+      File('${dir.path}/b.csv').writeAsStringSync('id,w\n1,100\n3,300\n');
+      expect(
+        await rows(
+          "SELECT id FROM 'a.csv' WHERE EXISTS "
+          "(SELECT 1 FROM 'b.csv' WHERE b.id = a.id)",
+        ),
+        [
+          {'id': 1},
+        ],
+      );
+    });
+
+    test('HAVING without GROUP BY aggregates the whole input', () async {
+      expect(await rows('SELECT COUNT(*) AS n FROM t HAVING COUNT(*) > 1'), [
+        {'n': 3},
+      ]);
+      await expectLater(
+        engine.execute('SELECT a FROM t HAVING a > 1'),
+        failsWith(Kind.invalid, contains('GROUP BY')),
+      );
+    });
+
+    test('GROUP BY matches function case, qualifiers and aliases', () async {
+      final expected = [
+        {'k': '1', 'n': 2},
+        {'k': '2', 'n': 1},
+      ];
+      expect(
+        await rows(
+          'SELECT UPPER(CAST(a AS VARCHAR)) AS k, COUNT(*) AS n FROM t '
+          'GROUP BY upper(CAST(a AS VARCHAR)) ORDER BY k',
+        ),
+        expected,
+      );
+      expect(
+        await rows('SELECT t.a, COUNT(*) AS n FROM t GROUP BY a ORDER BY a'),
+        [
+          {'a': 1, 'n': 2},
+          {'a': 2, 'n': 1},
+        ],
+      );
+      expect(
+        await rows('SELECT a AS x, COUNT(*) AS n FROM t GROUP BY x ORDER BY x'),
+        [
+          {'x': 1, 'n': 2},
+          {'x': 2, 'n': 1},
+        ],
+      );
+    });
+
+    test('COUNT(DISTINCT key) under GROUP BY key', () async {
+      expect(
+        await rows(
+          'SELECT a, COUNT(DISTINCT a) AS n FROM t GROUP BY a ORDER BY a',
+        ),
+        [
+          {'a': 1, 'n': 1},
+          {'a': 2, 'n': 1},
+        ],
+      );
+    });
+
+    test('an unknown column is reported as unknown', () async {
+      for (final sql in [
+        'SELECT * FROM t WHERE nope IN (1, 2)',
+        'SELECT * FROM t WHERE nope = 1',
+        'SELECT * FROM t WHERE 1 IN (nope)',
+      ]) {
+        await expectLater(
+          engine.execute(sql),
+          failsWith(Kind.invalid, contains('Unknown column: nope')),
+          reason: sql,
+        );
+      }
+    });
+
+    test('an aggregate in WHERE points to HAVING', () async {
+      await expectLater(
+        engine.execute('SELECT * FROM t WHERE SUM(a) > 1'),
+        failsWith(Kind.invalid, contains('HAVING')),
+      );
+    });
+  });
+
+  group('DuckDB defaults', () {
+    late SqlEngine engine;
+    setUp(() {
+      engine = SqlEngine.open().ok;
+      engine.registerTable(
+        'm',
+        Table.fromRows('m', [
+          {'i': 2, 'f': 2.5},
+          {'i': 4, 'f': 0.5},
+        ]),
+      );
+    });
+    tearDown(() => engine.dispose());
+
+    Future<Table> run(String sql) => engine.execute(sql).ok;
+
+    test('NULLs sort last in both directions', () async {
+      engine.registerTable(
+        'n',
+        Table.fromRows('n', [
+          {'x': 1},
+          {'x': null},
+          {'x': 3},
+        ]),
+      );
+      for (final direction in ['ASC', 'DESC']) {
+        final t = await run('SELECT x FROM n ORDER BY x $direction');
+        expect(t.column('x')!.toList().last, isNull, reason: direction);
+      }
+      final first = await run('SELECT x FROM n ORDER BY x DESC NULLS FIRST');
+      expect(first.column('x')!.toList().first, isNull);
+    });
+
+    test('a literal with a point is an exact DECIMAL', () async {
+      final t = await run('SELECT 0.1 + 0.2 AS s, 1.50 AS d, 1e3 AS e');
+      expect(t.schema.field('s')!.dataType, DataType.decimal);
+      expect(t.schema.field('d')!.dataType, DataType.decimal);
+      expect(t.schema.field('d')!.scale, 2);
+      expect(t.schema.field('e')!.dataType, DataType.float64);
+      final row = t.toRows().single;
+      expect('${row['s']}', '0.3');
+      expect('${row['d']}', '1.50');
+      expect(row['e'], 1000.0);
+    });
+
+    test('a DECIMAL literal meets integer and double columns', () async {
+      final t = await run(
+        'SELECT i * 1.5 AS a, f * 1.5 AS b FROM m WHERE f > 0.75 ORDER BY i',
+      );
+      expect(t.schema.field('a')!.dataType, DataType.decimal);
+      expect(t.schema.field('b')!.dataType, DataType.float64);
+      final row = t.toRows().single;
+      expect('${row['a']}', '3.0');
+      expect(row['b'], 3.75);
+    });
+  });
+
+  group('registered DataFrames', () {
+    late Directory dir;
+    late String wide;
+    late SqlEngine engine;
+    final people = Table.fromRows('p', [
+      {'id': 1, 'name': 'Alice', 'dept': 'eng'},
+      {'id': 2, 'name': 'Bob', 'dept': 'eng'},
+      {'id': 3, 'name': 'Carol', 'dept': 'ops'},
+    ]);
+    final depts = Table.fromRows('d', [
+      {'dept': 'eng', 'name': 'Engineering'},
+      {'dept': 'ops', 'name': 'Operations'},
+    ]);
+
+    setUp(() async {
+      dir = Directory.systemTemp.createTempSync('sqlframe_');
+      wide = '${dir.path}/wide.parquet';
+      // 1000 rows in 10 row groups; `id` ascends, so `id >= 900` prunes 9.
+      await ParquetWriter(
+            wide,
+            options: const ParquetWriterOptions(rowGroupSize: 100),
+          )
+          .write(
+            Table.fromRows('wide', [
+              for (var i = 0; i < 1000; i++)
+                {'id': i, 'group': 'g${i % 7}', 'value': i * 0.5},
+            ]),
+          )
+          .ok;
+      engine = SqlEngine.open(allowExternalPaths: true).ok;
+    });
+    tearDown(() async {
+      await engine.dispose();
+      dir.deleteSync(recursive: true);
+    });
+
+    void reset() {
+      ParquetReader.rowGroupsPruned = 0;
+      ParquetReader.columnsRead = 0;
+    }
+
+    /// The rows of [query] over [frame] registered as `f`, and over the
+    /// frame's materialized result registered as `f` in another engine.
+    Future<void> agree(DataFrame frame, List<String> queries) async {
+      await engine.registerDataFrame('f', frame).ok;
+      final other = SqlEngine.open().ok;
+      try {
+        other.registerTable('f', await frame.execute().ok);
+        for (final query in queries) {
+          final actual = await engine.execute(query).ok;
+          final expected = await other.execute(query).ok;
+          expect(
+            actual.schema.fieldNames,
+            expected.schema.fieldNames,
+            reason: query,
+          );
+          expect(
+            [for (final field in actual.schema.fields) field.dataType],
+            [for (final field in expected.schema.fields) field.dataType],
+            reason: query,
+          );
+          expect(actual.toRows(), expected.toRows(), reason: query);
+        }
+      } finally {
+        await other.dispose();
+      }
+    }
+
+    test(
+      'a WHERE on a file-backed frame prunes row groups and columns',
+      () async {
+        reset();
+        final direct = await engine
+            .execute("SELECT id FROM '$wide' WHERE id >= 900")
+            .ok;
+        final read = ParquetReader.columnsRead;
+        expect(ParquetReader.rowGroupsPruned, 9);
+
+        final frame = await DataFrameIO.readParquet(wide).ok;
+        await engine.registerDataFrame('w', frame).ok;
+        reset();
+        final result = await engine
+            .execute('SELECT id FROM w WHERE id >= 900')
+            .ok;
+        expect(result.toRows(), direct.toRows());
+        expect(ParquetReader.rowGroupsPruned, 9, reason: 'row groups');
+        expect(ParquetReader.columnsRead, read, reason: 'columns read');
+      },
+    );
+
+    test('a frame\'s own filter prunes when a query reads it', () async {
+      final frame = (await DataFrameIO.readParquet(
+        wide,
+      ).ok).filter('id >= 900');
+      await engine.registerDataFrame('w', frame).ok;
+      reset();
+      final result = await engine.execute('SELECT id, value FROM w').ok;
+      expect(result.rowCount, 100);
+      expect(ParquetReader.rowGroupsPruned, 9);
+    });
+
+    test('df.sql over a file-backed frame prunes', () async {
+      final frame = await DataFrameIO.readParquet(wide).ok;
+      reset();
+      final result = await frame.sql('SELECT id FROM df WHERE id >= 900').ok;
+      expect(await result.count().ok, 100);
+      expect(ParquetReader.rowGroupsPruned, 9);
+    });
+
+    test('a frame queried twice reads its file twice', () async {
+      final frame = await DataFrameIO.readParquet(wide).ok;
+      await engine.registerDataFrame('w', frame).ok;
+      reset();
+      await engine.execute('SELECT COUNT(*) AS n FROM w').ok;
+      final once = ParquetReader.columnsRead;
+      expect(once, greaterThan(0));
+      await engine.execute('SELECT COUNT(*) AS n FROM w').ok;
+      expect(ParquetReader.columnsRead, 2 * once);
+    });
+
+    test('an in-memory frame answers as its materialized result', () async {
+      await agree(
+        DataFrame.fromTable(people).filter('id > 1').select(['id', 'name']),
+        [
+          'SELECT * FROM f ORDER BY id',
+          'SELECT x.name FROM f AS x WHERE x.id = 3',
+          'SELECT a.id, b.name FROM f a JOIN f b ON a.id = b.id ORDER BY a.id',
+          'SELECT COUNT(*) AS n FROM f',
+        ],
+      );
+    });
+
+    test('a file-backed frame answers as its materialized result', () async {
+      await agree(
+        (await DataFrameIO.readParquet(
+          wide,
+        ).ok).filter('id < 50').withColumn('twice', 'value * 2'),
+        [
+          'SELECT * FROM f ORDER BY id',
+          'SELECT "group", SUM(twice) AS s FROM f GROUP BY "group" '
+              'ORDER BY "group"',
+          'SELECT id FROM f WHERE id >= 45 ORDER BY id',
+        ],
+      );
+    });
+
+    test('a joined frame answers with its qualified names', () async {
+      final frame = DataFrame.fromTable(
+        people,
+      ).join(DataFrame.fromTable(depts), 'dept');
+      expect(frame.columns, ['id', 'p.name', 'dept', 'd.name']);
+      await agree(frame, [
+        'SELECT * FROM f ORDER BY id',
+        'SELECT "p.name", f."d.name" FROM f WHERE dept = \'ops\'',
+      ]);
+    });
+
+    test('an aggregated frame answers as its materialized result', () async {
+      await agree(
+        DataFrame.fromTable(
+          people,
+        ).groupBy(['dept']).agg({'id': 'sum'}).orderBy('dept'),
+        ['SELECT * FROM f', 'SELECT dept FROM f WHERE id > 3'],
+      );
+    });
+
+    test('a frame\'s sources do not take or shadow engine names', () async {
+      engine.registerTable(
+        'p',
+        Table.fromRows('p', [
+          {'other': 7},
+        ]),
+      );
+      await engine
+          .registerDataFrame('f', DataFrame.fromTable(people).select(['id']))
+          .ok;
+      expect((await engine.execute('SELECT * FROM p').ok).toRows(), [
+        {'other': 7},
+      ]);
+      expect(
+        (await engine.execute('SELECT id FROM f ORDER BY id').ok).toRows(),
+        [
+          {'id': 1},
+          {'id': 2},
+          {'id': 3},
+        ],
+      );
+      expect(engine.execute('SELECT * FROM p1'), failsWith(Kind.missing));
+    });
+
+    test('an invalid frame fails at registration', () async {
+      final frame = DataFrame.fromTable(people).filter('missing > 1');
+      await expectLater(
+        engine.registerDataFrame('f', frame),
+        failsWith(Kind.invalid),
+      );
+    });
+
+    test('a frame whose file goes away fails at the query', () async {
+      final frame = await DataFrameIO.readParquet(wide).ok;
+      await engine.registerDataFrame('w', frame).ok;
+      File(wide).deleteSync();
+      expect(
+        await engine.execute('SELECT COUNT(*) AS n FROM w'),
+        isA<Err<Table, ErrorDetails>>(),
+      );
+    });
+
+    test('an explicit cap bounds a result read from the frame', () async {
+      await engine
+          .registerDataFrame('r', DataFrame.fromTable(people), maxRows: 2)
+          .ok;
+      await expectLater(
+        engine.execute('SELECT * FROM r'),
+        failsWith(Kind.limit),
+      );
+      expect(
+        (await engine.execute('SELECT COUNT(*) AS n FROM r').ok).toRows(),
+        [
+          {'n': 3},
+        ],
+      );
     });
   });
 }

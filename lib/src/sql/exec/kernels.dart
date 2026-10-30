@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
@@ -44,18 +45,28 @@ class BoolMask {
     }
     return Int32List.fromList(out);
   }
-
-  /// How many values are TRUE.
-  int get trueCount {
-    int c = 0;
-    for (int i = 0; i < length; i++) {
-      if (isTrue(i)) c++;
-    }
-    return c;
-  }
 }
 
 class Kernels {
+  /// Order two non-null values of the same kind: booleans as false < true
+  /// (Dart's `bool` is not [Comparable]), binary as unsigned bytes with a
+  /// shorter prefix first (as DuckDB orders BLOBs), anything else by
+  /// [Comparable.compareTo]. Shared by comparisons, MIN/MAX and sorting.
+  static int compare(Object a, Object b) {
+    if (a is bool && b is bool) return a == b ? 0 : (a ? 1 : -1);
+    if (a is Uint8List && b is Uint8List) return _bytes(a, b);
+    return (a as Comparable).compareTo(b);
+  }
+
+  static int _bytes(Uint8List a, Uint8List b) {
+    final shared = math.min(a.length, b.length);
+    for (var i = 0; i < shared; i++) {
+      final c = a[i] - b[i];
+      if (c != 0) return c;
+    }
+    return a.length - b.length;
+  }
+
   /// `column [NOT] IN (values)` -> mask, in one pass over the column instead of
   /// one pass per value.
   ///
@@ -64,7 +75,7 @@ class Kernels {
   /// row might have matched it), else FALSE (TRUE when [negated]).
   ///
   /// [values] must hold only values whose `==`/`hashCode` agree with the
-  /// engine's comparison semantics — see `PhysicalInExpression`, which decides
+  /// engine's comparison semantics: see `PhysicalInExpression`, which decides
   /// when this kernel is applicable and otherwise falls back to comparisons.
   static BoolMask isIn(
     Column column,
@@ -74,6 +85,23 @@ class Kernels {
     final n = column.length;
     final mask = BoolMask(n);
     final hasNull = values.contains(null);
+    if (column is StringVector) {
+      // Test each distinct value once, then spread the answer by code.
+      final (:codes, :firsts) = column.encode();
+      final hits = [for (final first in firsts) values.contains(column[first])];
+      for (int i = 0; i < n; i++) {
+        if (column.isNullAt(i)) {
+          mask.setNull(i);
+        } else if (hits[codes[i]]) {
+          if (!negated) mask.setTrue(i);
+        } else if (hasNull) {
+          mask.setNull(i);
+        } else if (negated) {
+          mask.setTrue(i);
+        }
+      }
+      return mask;
+    }
     for (int i = 0; i < n; i++) {
       final v = column[i];
       if (v == null) {
@@ -94,7 +122,7 @@ class Kernels {
   ///
   /// [scale] is [column]'s decimal scale (0 for every other type). A decimal
   /// column holds an unscaled BigInt, so a bare `1.00` literal would compare
-  /// against `100` and never match — see [_compareDecimalScalar].
+  /// against `100` and never match: see [_compareDecimalScalar].
   static BoolMask compareScalar(
     Column column,
     BinaryOperator operator,
@@ -114,13 +142,24 @@ class Kernels {
         (literal is int || literal.isFinite)) {
       return _compareDecimalScalar(column, operator, literal, scale);
     }
-    if (column is NumericColumn && literal is num) {
-      final raw = column.rawBuffer as List;
+    if (column is StringColumn && literal is String) {
+      final bytes = utf8.encode(literal);
+      for (int i = 0; i < n; i++) {
+        if (column.isNullAt(i)) {
+          mask.setNull(i);
+        } else if (_order(column.compareBytes(i, bytes), operator)) {
+          mask.setTrue(i);
+        }
+      }
+      return mask;
+    }
+    if (column is NumericVector && literal is num) {
+      final raw = column.raw as List;
       if (raw is List<int>) {
         for (int i = 0; i < n; i++) {
           if (column.isNullAt(i)) {
             mask.setNull(i);
-          } else if (_cmpNum(raw[i], operator, literal)) {
+          } else if (_holdsNumeric(raw[i], operator, literal)) {
             mask.setTrue(i);
           }
         }
@@ -130,7 +169,7 @@ class Kernels {
         for (int i = 0; i < n; i++) {
           if (column.isNullAt(i)) {
             mask.setNull(i);
-          } else if (_cmpNum(raw[i], operator, literal)) {
+          } else if (_holdsNumeric(raw[i], operator, literal)) {
             mask.setTrue(i);
           }
         }
@@ -141,7 +180,7 @@ class Kernels {
       final v = column[i];
       if (v == null) {
         mask.setNull(i);
-      } else if (_cmp(v, operator, literal)) {
+      } else if (_holds(v, operator, literal)) {
         mask.setTrue(i);
       }
     }
@@ -172,7 +211,7 @@ class Kernels {
       final v = _bigAt(column, i);
       if (v == null) {
         mask.setNull(i);
-      } else if (_cmp(widen == one ? v : v * widen, operator, value)) {
+      } else if (_holds(widen == one ? v : v * widen, operator, value)) {
         mask.setTrue(i);
       }
     }
@@ -206,18 +245,32 @@ class Kernels {
     }
     final n = a.length;
     final mask = BoolMask(n);
+    if (a is StringColumn && b is StringColumn) {
+      for (int i = 0; i < n; i++) {
+        if (a.isNullAt(i) || b.isNullAt(i)) {
+          mask.setNull(i);
+        } else if (_order(a.compareAt(i, b, i), operator)) {
+          mask.setTrue(i);
+        }
+      }
+      return mask;
+    }
     // Typed fast reads for numeric operands (skip operator[]'s per-element
     // length-division + type cascade); non-numeric operands fall back.
-    final aNum = a is NumericColumn ? a : null;
-    final aRaw = aNum?.rawBuffer as List?;
-    final bNum = b is NumericColumn ? b : null;
-    final bRaw = bNum?.rawBuffer as List?;
+    final numericA = a is NumericVector ? a : null;
+    final aRaw = numericA?.raw as List?;
+    final numericB = b is NumericVector ? b : null;
+    final bRaw = numericB?.raw as List?;
     for (int i = 0; i < n; i++) {
-      final x = aNum != null ? (aNum.isNullAt(i) ? null : aRaw![i]) : a[i];
-      final y = bNum != null ? (bNum.isNullAt(i) ? null : bRaw![i]) : b[i];
+      final x = numericA != null
+          ? (numericA.isNullAt(i) ? null : aRaw![i])
+          : a[i];
+      final y = numericB != null
+          ? (numericB.isNullAt(i) ? null : bRaw![i])
+          : b[i];
       if (x == null || y == null) {
         mask.setNull(i);
-      } else if (_cmp(x, operator, y)) {
+      } else if (_holds(x, operator, y)) {
         mask.setTrue(i);
       }
     }
@@ -246,7 +299,7 @@ class Kernels {
         final y = _bigAt(b, i);
         if (x == null || y == null) {
           mask.setNull(i);
-        } else if (_cmp(
+        } else if (_holds(
           widenA == one ? x : x * widenA,
           operator,
           widenB == one ? y : y * widenB,
@@ -258,36 +311,36 @@ class Kernels {
     }
     // One decimal, one not. If the other side is an INTEGER column the compare
     // is still EXACT: lift the integer to the decimal's scale as a BigInt and
-    // compare via BigInt — the double path loses precision above 2^53 (a
+    // compare via BigInt: the double path loses precision above 2^53 (a
     // decimal(20,0) and an int both holding 9007199254740993 would compare
     // unequal). Only a genuine FLOAT operand is inherently inexact.
     final aIsDecimal = scaleA != null;
-    final decCol = aIsDecimal ? a : b;
-    final decScale = (aIsDecimal ? scaleA : scaleB)!;
+    final decimal = aIsDecimal ? a : b;
+    final scale = (aIsDecimal ? scaleA : scaleB)!;
     final other = aIsDecimal ? b : a;
     if (other.dataType.isInteger) {
-      final widen = _pow10(decScale);
+      final widen = _pow10(scale);
       for (int i = 0; i < n; i++) {
-        final dec = _bigAt(decCol, i);
-        final iv = _bigAt(other, i); // int lifted exactly to BigInt
-        if (dec == null || iv == null) {
+        final unscaled = _bigAt(decimal, i);
+        final integer = _bigAt(other, i); // int lifted exactly to BigInt
+        if (unscaled == null || integer == null) {
           mask.setNull(i);
         } else {
-          final lifted = iv * widen;
-          final x = aIsDecimal ? dec : lifted;
-          final y = aIsDecimal ? lifted : dec;
-          if (_cmp(x, operator, y)) mask.setTrue(i);
+          final lifted = integer * widen;
+          final x = aIsDecimal ? unscaled : lifted;
+          final y = aIsDecimal ? lifted : unscaled;
+          if (_holds(x, operator, y)) mask.setTrue(i);
         }
       }
       return mask;
     }
     // A genuine float operand: compare as doubles (already inexact).
     for (int i = 0; i < n; i++) {
-      final x = _decimalAsNum(a, i, scaleA);
-      final y = _decimalAsNum(b, i, scaleB);
+      final x = _decimalAsNumber(a, i, scaleA);
+      final y = _decimalAsNumber(b, i, scaleB);
       if (x == null || y == null) {
         mask.setNull(i);
-      } else if (_cmpNum(x, operator, y)) {
+      } else if (_holdsNumeric(x, operator, y)) {
         mask.setTrue(i);
       }
     }
@@ -300,7 +353,7 @@ class Kernels {
 
   /// Element [i] of [c] as a plain number: an unscaled decimal is divided back
   /// down by its [scale]; a null [scale] means the column is already numeric.
-  static num? _decimalAsNum(Column c, int i, int? scale) {
+  static num? _decimalAsNumber(Column c, int i, int? scale) {
     if (scale == null) return c[i] as num?;
     final v = _bigAt(c, i);
     return v == null ? null : decimalToNum(v, scale);
@@ -308,7 +361,7 @@ class Kernels {
 
   /// Whether [arithmetic] produces a floating result for operands typed [a]/[b]
   /// under [operator]: division always floats, otherwise any float operand does.
-  static bool _floatArith(DataType a, DataType b, BinaryOperator operator) =>
+  static bool _floating(DataType a, DataType b, BinaryOperator operator) =>
       operator == BinaryOperator.divide ||
       a == DataType.float32 ||
       a == DataType.float64 ||
@@ -324,8 +377,8 @@ class Kernels {
     DataType b,
     BinaryOperator operator,
   ) {
-    if (_floatArith(a, b, operator)) return DataType.float64;
-    // A decimal operand keeps the result decimal (lossless BigInt) — so SUM(int)
+    if (_floating(a, b, operator)) return DataType.float64;
+    // A decimal operand keeps the result decimal (lossless BigInt), so SUM(int)
     // and other decimal columns compose in per-row arithmetic. Pure-integer
     // arithmetic stays int64 (int64 is the default int type; promoting every
     // `a + 1` to BigInt would be a large perf/ergonomics regression) and FAILS
@@ -337,7 +390,7 @@ class Kernels {
   /// `columnA OP (columnB | literal)` arithmetic -> a typed numeric column.
   /// Result is int64 unless either side is floating or the operator is divide.
   /// [scaleA]/[scaleB] are the operand decimal scales and [resultScale] the
-  /// output scale (a decimal column holds unscaled BigInt at that scale) — used
+  /// output scale (a decimal column holds unscaled BigInt at that scale): used
   /// only on the decimal path to align/combine scales; 0 for int/scale-0 domains.
   static Column arithmetic(
     Column a,
@@ -349,12 +402,13 @@ class Kernels {
     int? resultScale,
   }) {
     final n = a.length;
-    final bCol = b is Column ? b : null;
-    final bLit = b is Column ? null : (b as num?);
+    final columnB = b is Column ? b : null;
+    final literalB = b is Column ? null : (b as num?);
 
     final bType =
-        bCol?.dataType ?? (bLit is double ? DataType.float64 : DataType.int64);
-    final float = _floatArith(a.dataType, bType, operator);
+        columnB?.dataType ??
+        (literalB is double ? DataType.float64 : DataType.int64);
+    final float = _floating(a.dataType, bType, operator);
 
     // Division or modulo by zero yields NULL (SQL semantics), never NaN or an
     // `int.toInt()` crash.
@@ -364,41 +418,41 @@ class Kernels {
     // Typed fast reads: index the raw buffer directly (with the cheap isNullAt)
     // rather than NumericColumn.operator[], which recomputes length (a division)
     // and runs a 6-way type cascade PER element. Non-numeric operands fall back.
-    final aNum = a is NumericColumn ? a : null;
-    final aRaw = aNum?.rawBuffer as List?;
-    final bNum = bCol is NumericColumn ? bCol : null;
-    final bRaw = bNum?.rawBuffer as List?;
+    final numericA = a is NumericVector ? a : null;
+    final aRaw = numericA?.raw as List?;
+    final numericB = columnB is NumericVector ? columnB : null;
+    final bRaw = numericB?.raw as List?;
 
     if (float) {
       // A decimal operand can reach the float path (`decimal + 1.5` is
       // float-typed, since any float operand floats the result), and it holds
-      // unscaled BigInt — scale it back down rather than casting it to num.
+      // unscaled BigInt: scale it back down rather than casting it to num.
       final aScale = a.dataType == DataType.decimal ? scaleA : null;
-      final bScale = bCol?.dataType == DataType.decimal ? scaleB : null;
+      final bScale = columnB?.dataType == DataType.decimal ? scaleB : null;
       final out = Float64List(n);
       final nulls = Uint8List((n + 7) >> 3);
       var hasNull = false;
       for (int i = 0; i < n; i++) {
         final num? x = aScale != null
-            ? _decimalAsNum(a, i, aScale)
-            : (aNum != null
-                  ? (aNum.isNullAt(i) ? null : aRaw![i] as num)
+            ? _decimalAsNumber(a, i, aScale)
+            : (numericA != null
+                  ? (numericA.isNullAt(i) ? null : aRaw![i] as num)
                   : a[i] as num?);
-        final num? y = bCol == null
-            ? bLit
+        final num? y = columnB == null
+            ? literalB
             : (bScale != null
-                  ? _decimalAsNum(bCol, i, bScale)
-                  : (bNum != null
-                        ? (bNum.isNullAt(i) ? null : bRaw![i] as num)
-                        : bCol[i] as num?));
+                  ? _decimalAsNumber(columnB, i, bScale)
+                  : (numericB != null
+                        ? (numericB.isNullAt(i) ? null : bRaw![i] as num)
+                        : columnB[i] as num?));
         if (x == null || y == null || (zeroDivides && y == 0)) {
           nulls[i >> 3] |= (1 << (i & 7));
           hasNull = true;
         } else {
-          out[i] = _arithNum(x, operator, y).toDouble();
+          out[i] = _arithmetic(x, operator, y).toDouble();
         }
       }
-      return NumericColumn.adopt(
+      return NumericVector.adopt(
         name: name,
         dataType: DataType.float64,
         data: out,
@@ -408,20 +462,20 @@ class Kernels {
 
     // Decimal result: a decimal operand keeps the result a LOSSLESS BigInt
     // column. Values are unscaled BigInt at their operand scale; the result is
-    // produced at [resultScale] — +/-/% align both operands to it, * adds scales
+    // produced at [resultScale]: +/-/% align both operands to it, * adds scales
     // (so `resultScale` was computed as scaleA+scaleB). Division never lands here
     // (it is float). A scale-0/int operand contributes scale 0 (unchanged SUM
     // composition).
     if (arithResultType(a.dataType, bType, operator) == DataType.decimal) {
-      final rScale = resultScale ?? 0;
+      final scale = resultScale ?? 0;
       final data = List<BigInt?>.filled(n, null);
       for (int i = 0; i < n; i++) {
         final x = _bigAt(a, i);
-        final y = bCol == null ? _bigLit(bLit) : _bigAt(bCol, i);
+        final y = columnB == null ? _bigLiteral(literalB) : _bigAt(columnB, i);
         if (x == null || y == null || (zeroDivides && y == BigInt.zero)) {
           continue; // stays null
         }
-        data[i] = _arithBigScaled(x, scaleA, operator, y, scaleB, rScale);
+        data[i] = _arithmeticScaled(x, scaleA, operator, y, scaleB, scale);
       }
       return ListColumn<BigInt>(
         name: name,
@@ -435,26 +489,26 @@ class Kernels {
     final nulls = Uint8List((n + 7) >> 3);
     var hasNull = false;
     for (int i = 0; i < n; i++) {
-      final num? x = aNum != null
-          ? (aNum.isNullAt(i) ? null : aRaw![i] as num)
+      final num? x = numericA != null
+          ? (numericA.isNullAt(i) ? null : aRaw![i] as num)
           : a[i] as num?;
-      final num? y = bCol == null
-          ? bLit
-          : (bNum != null
-                ? (bNum.isNullAt(i) ? null : bRaw![i] as num)
-                : bCol[i] as num?);
+      final num? y = columnB == null
+          ? literalB
+          : (numericB != null
+                ? (numericB.isNullAt(i) ? null : bRaw![i] as num)
+                : columnB[i] as num?);
       if (x == null || y == null || (zeroDivides && y == 0)) {
         nulls[i >> 3] |= (1 << (i & 7));
         hasNull = true;
       } else if (x is int && y is int) {
         // Fail loud on 64-bit overflow instead of silently wrapping in the
         // Int64List (SUM is exact BigInt; per-row arithmetic must not corrupt).
-        out[i] = _checkedIntArith(x, operator, y, name);
+        out[i] = _checked(x, operator, y, name);
       } else {
-        out[i] = _arithNum(x, operator, y).toInt();
+        out[i] = _arithmetic(x, operator, y).toInt();
       }
     }
-    return NumericColumn.adopt(
+    return NumericVector.adopt(
       name: name,
       dataType: DataType.int64,
       data: out,
@@ -462,11 +516,11 @@ class Kernels {
     );
   }
 
-  /// Per-row twin of [arithmetic] for one operand pair — the SAME float /
+  /// Per-row twin of [arithmetic] for one operand pair: the SAME float /
   /// decimal / checked-int semantics, so the per-row `evaluate` path cannot
-  /// drift from the vectorized one (arithmetic previously fell through to raw
-  /// `BigInt + int`, which threw, or added unaligned unscaled decimals, which
-  /// silently produced the wrong magnitude). [x]/[y] must be non-null; the
+  /// drift from the vectorized one (a raw `BigInt + int` would throw, and
+  /// adding unaligned unscaled decimals would silently produce the wrong
+  /// magnitude). [x]/[y] must be non-null; the
   /// caller owes the SQL null short-circuit.
   static Object? arithScalar(
     Object x,
@@ -481,7 +535,7 @@ class Kernels {
   }) {
     final zeroDivides =
         operator == BinaryOperator.divide || operator == BinaryOperator.modulo;
-    if (_floatArith(typeX, typeY, operator)) {
+    if (_floating(typeX, typeY, operator)) {
       final num a = typeX == DataType.decimal
           ? decimalToNum(x as BigInt, scaleX)
           : x as num;
@@ -489,19 +543,26 @@ class Kernels {
           ? decimalToNum(y as BigInt, scaleY)
           : y as num;
       if (zeroDivides && b == 0) return null;
-      return _arithNum(a, operator, b).toDouble();
+      return _arithmetic(a, operator, b).toDouble();
     }
     if (arithResultType(typeX, typeY, operator) == DataType.decimal) {
       final a = x is BigInt ? x : BigInt.from((x as num).toInt());
       final b = y is BigInt ? y : BigInt.from((y as num).toInt());
       if (zeroDivides && b == BigInt.zero) return null;
-      return _arithBigScaled(a, scaleX, operator, b, scaleY, resultScale ?? 0);
+      return _arithmeticScaled(
+        a,
+        scaleX,
+        operator,
+        b,
+        scaleY,
+        resultScale ?? 0,
+      );
     }
     final a = x as num;
     final b = y as num;
     if (zeroDivides && b == 0) return null;
-    if (a is int && b is int) return _checkedIntArith(a, operator, b, name);
-    return _arithNum(a, operator, b).toInt();
+    if (a is int && b is int) return _checked(a, operator, b, name);
+    return _arithmetic(a, operator, b).toInt();
   }
 
   /// Read element [i] of [c] as an unscaled [BigInt] (a decimal column already
@@ -514,48 +575,49 @@ class Kernels {
     return BigInt.from((v as num).toInt());
   }
 
-  static BigInt? _bigLit(num? lit) =>
-      lit == null ? null : BigInt.from(lit.toInt());
+  static BigInt? _bigLiteral(num? literal) =>
+      literal == null ? null : BigInt.from(literal.toInt());
 
   static BigInt _pow10(int e) => BigInt.from(10).pow(e);
 
-  /// `x OP y` on unscaled BigInt decimals of scale [sx]/[sy], producing an
-  /// unscaled result at [rScale]. +/-/% align both operands to [rScale]
-  /// (`rScale = max(sx,sy)`); * needs no alignment (`rScale = sx+sy`). Division
-  /// is the float path, never here. Subsumes the scale-0/int case (sx=sy=0).
-  static BigInt _arithBigScaled(
+  /// `x OP y` on unscaled BigInt decimals of scale [scaleX]/[scaleY],
+  /// producing an unscaled result at [scale]. +/-/% align both operands to
+  /// [scale] (`scale = max(scaleX,scaleY)`); * needs no alignment
+  /// (`scale = scaleX+scaleY`). Division is the float path, never here.
+  /// Subsumes the scale-0/int case (scaleX=scaleY=0).
+  static BigInt _arithmeticScaled(
     BigInt x,
-    int sx,
-    BinaryOperator op,
+    int scaleX,
+    BinaryOperator operator,
     BigInt y,
-    int sy,
-    int rScale,
+    int scaleY,
+    int scale,
   ) {
-    switch (op) {
+    switch (operator) {
       case BinaryOperator.multiply:
         return x * y;
       case BinaryOperator.add:
       case BinaryOperator.subtract:
       case BinaryOperator.modulo:
-        final xa = sx == rScale ? x : x * _pow10(rScale - sx);
-        final ya = sy == rScale ? y : y * _pow10(rScale - sy);
-        return op == BinaryOperator.add
-            ? xa + ya
-            : op == BinaryOperator.subtract
-            ? xa - ya
-            : xa.remainder(
-                ya,
+        final alignedX = scaleX == scale ? x : x * _pow10(scale - scaleX);
+        final alignedY = scaleY == scale ? y : y * _pow10(scale - scaleY);
+        return operator == BinaryOperator.add
+            ? alignedX + alignedY
+            : operator == BinaryOperator.subtract
+            ? alignedX - alignedY
+            : alignedX.remainder(
+                alignedY,
               ); // SQL MOD: sign of the dividend, not the divisor
       default:
-        throw StateError('unsupported decimal arithmetic operator $op');
+        throw StateError('unsupported decimal arithmetic operator $operator');
     }
   }
 
-  static const int _i64Min = -9223372036854775807 - 1; // -2^63
+  static const int _int64Min = -9223372036854775807 - 1; // -2^63
 
-  static Never _overflow(String op, int x, int y, String name) {
+  static Never _overflow(String symbol, int x, int y, String name) {
     throw StateError(
-      'integer overflow in "$name": $x $op $y exceeds the signed 64-bit range '
+      'integer overflow in "$name": $x $symbol $y exceeds the signed 64-bit range '
       '(cast an operand to a wider/decimal type)',
     );
   }
@@ -563,8 +625,8 @@ class Kernels {
   /// `x OP y` for two ints, throwing on 64-bit overflow (add/subtract/multiply);
   /// modulo can't overflow. Uses standard sign/inverse checks so the fast path
   /// stays branch-cheap (no per-element BigInt).
-  static int _checkedIntArith(int x, BinaryOperator op, int y, String name) {
-    switch (op) {
+  static int _checked(int x, BinaryOperator operator, int y, String name) {
+    switch (operator) {
       case BinaryOperator.add:
         final s = x + y;
         if (((x ^ s) & (y ^ s)) < 0) _overflow('+', x, y, name);
@@ -577,13 +639,17 @@ class Kernels {
         final p = x * y;
         if (x != 0 &&
             (p ~/ x != y ||
-                (x == -1 && y == _i64Min) ||
-                (y == -1 && x == _i64Min))) {
+                (x == -1 && y == _int64Min) ||
+                (y == -1 && x == _int64Min))) {
           _overflow('*', x, y, name);
         }
         return p;
       default:
-        return _arithNum(x, op, y).toInt(); // modulo — magnitude ≤ operands
+        return _arithmetic(
+          x,
+          operator,
+          y,
+        ).toInt(); // modulo: magnitude ≤ operands
     }
   }
 
@@ -641,39 +707,41 @@ class Kernels {
         break;
       }
     }
-    if (column is NumericColumn) {
-      final src = column.rawBuffer as List;
+    if (column is NumericVector) {
+      final source = column.raw as List;
       final hasNulls = column.hasNulls;
       final needNulls = hasNulls || anyNeg;
       final nulls = needNulls ? Uint8List((n + 7) >> 3) : null;
       final outData = _alloc(column.dataType, n);
       final out = outData as List;
-      if (out is List<int> && src is List<int>) {
+      if (out is List<int> && source is List<int>) {
         for (int i = 0; i < n; i++) {
           final s = indices[i];
           if (s < 0 || (hasNulls && column.isNullAt(s))) {
             nulls![i >> 3] |= (1 << (i & 7));
           } else {
-            out[i] = src[s];
+            out[i] = source[s];
           }
         }
-      } else if (out is List<double> && src is List<double>) {
+      } else if (out is List<double> && source is List<double>) {
         for (int i = 0; i < n; i++) {
           final s = indices[i];
           if (s < 0 || (hasNulls && column.isNullAt(s))) {
             nulls![i >> 3] |= (1 << (i & 7));
           } else {
-            out[i] = src[s];
+            out[i] = source[s];
           }
         }
       }
-      return NumericColumn.adopt(
+      return NumericVector.adopt(
         name: column.name,
         dataType: column.dataType,
         data: outData,
         nullBitmap: nulls,
       );
     }
+    if (column is StringColumn) return column.gather(indices);
+    if (column is BoolColumn) return column.gather(indices);
     final data = [for (final i in indices) i < 0 ? null : column[i]];
     return ListColumn(
       name: column.name,
@@ -691,7 +759,7 @@ class Kernels {
   static Column concat(List<Column> pieces) => Column.concat(pieces);
 
   /// Build a column from boxed [values], using a typed [NumericColumn] when the
-  /// values already match the numeric [type] (no coercion — falls back to a
+  /// values already match the numeric [type] (no coercion: falls back to a
   /// boxed [ListColumn] otherwise, preserving exact value types).
   static Column fromValues(String name, DataType type, List<Object?> values) =>
       columnFromValues(name, type, values);
@@ -715,8 +783,8 @@ class Kernels {
           ? '${f.qualifier}.${f.name}'
           : f.name;
       // copyWith, not a fresh Field: this is a RENAME, and rebuilding by hand
-      // silently dropped precision/scale/children/metadata from EVERY field —
-      // not just the colliding ones — at the terminal user-facing boundary, so a
+      // silently dropped precision/scale/children/metadata from EVERY field,
+      // not just the colliding ones, at the terminal user-facing boundary, so a
       // join that happened to share a column name rendered an untouched decimal
       // 1.50 as "150" and cost a nested column the children its Parquet/Arrow
       // re-write needs.
@@ -733,12 +801,14 @@ class Kernels {
   /// Return [column] under a new [name], preserving the typed buffer for numerics.
   static Column rename(Column column, String name) {
     if (column.name == name) return column;
-    if (column is NumericColumn) {
-      return NumericColumn.adopt(
+    if (column is StringColumn) return column.withName(name);
+    if (column is BoolColumn) return column.withName(name);
+    if (column is NumericVector) {
+      return NumericVector.adopt(
         name: name,
         dataType: column.dataType,
-        data: column.rawBuffer,
-        nullBitmap: column.rawNullBitmap,
+        data: column.raw,
+        nullBitmap: column.nulls,
       );
     }
     return ListColumn(
@@ -759,7 +829,7 @@ class Kernels {
     if (value is num && type.isNumeric) {
       // Coerce the literal to its declared storage type so a float-typed literal
       // (e.g. `SELECT 5` common-typed to float64 in a CASE/COALESCE branch)
-      // holds a double, not an int — concat / Parquet-write paths trust the dtype.
+      // holds a double, not an int: concat / Parquet-write paths trust the dtype.
       final coerced = (type == DataType.float32 || type == DataType.float64)
           ? value.toDouble()
           : value;
@@ -780,21 +850,24 @@ class Kernels {
 
   /// Materialize a [BoolMask] as a boolean column (for projection outputs).
   static Column maskToColumn(BoolMask mask, String name) {
-    final data = <bool?>[];
-    for (int i = 0; i < mask.length; i++) {
-      data.add(mask.isNull(i) ? null : mask.isTrue(i));
-    }
-    return ListColumn(
+    final nullable = mask.nulls.any((byte) => byte != 0);
+    return BoolVector.adopt(
       name: name,
-      dataType: DataType.boolean,
-      data: data,
-      nullable: data.contains(null),
+      length: mask.length,
+      bits: Uint8List.fromList(mask.bits),
+      nulls: nullable ? Uint8List.fromList(mask.nulls) : null,
     );
   }
 
   /// Read a boolean column into a [BoolMask].
   static BoolMask columnToMask(Column column) {
     final mask = BoolMask(column.length);
+    if (column is BoolVector) {
+      mask.bits.setAll(0, column.bits);
+      final nulls = column.nulls;
+      if (nulls != null) mask.nulls.setAll(0, nulls);
+      return mask;
+    }
     for (int i = 0; i < column.length; i++) {
       final v = column[i];
       if (v == null) {
@@ -825,7 +898,7 @@ class Kernels {
     }
   }
 
-  static bool _cmpNum(num a, BinaryOperator operator, num b) {
+  static bool _holdsNumeric(num a, BinaryOperator operator, num b) {
     switch (operator) {
       case BinaryOperator.eq:
         return a == b;
@@ -844,8 +917,20 @@ class Kernels {
     }
   }
 
-  static bool _cmp(Object a, BinaryOperator operator, Object b) {
-    if (a is num && b is num) return _cmpNum(a, operator, b);
+  /// Whether a comparison that came out [sign] (negative, zero or positive)
+  /// satisfies [operator]; false for any other operator, as in [_holds].
+  static bool _order(int sign, BinaryOperator operator) => switch (operator) {
+    BinaryOperator.eq => sign == 0,
+    BinaryOperator.neq => sign != 0,
+    BinaryOperator.lt => sign < 0,
+    BinaryOperator.lte => sign <= 0,
+    BinaryOperator.gt => sign > 0,
+    BinaryOperator.gte => sign >= 0,
+    _ => false,
+  };
+
+  static bool _holds(Object a, BinaryOperator operator, Object b) {
+    if (a is num && b is num) return _holdsNumeric(a, operator, b);
     if (operator == BinaryOperator.eq) return a == b;
     if (operator == BinaryOperator.neq) return a != b;
     // Ordered comparison across different runtime types (e.g. a numeric column
@@ -856,8 +941,8 @@ class Kernels {
         'Cannot order-compare ${a.runtimeType} with ${b.runtimeType}',
       );
     }
-    if (a is Comparable && b is Comparable) {
-      final c = a.compareTo(b);
+    if ((a is Comparable && b is Comparable) || (a is bool && b is bool)) {
+      final c = compare(a, b);
       switch (operator) {
         case BinaryOperator.lt:
           return c < 0;
@@ -874,7 +959,7 @@ class Kernels {
     return false;
   }
 
-  static num _arithNum(num a, BinaryOperator operator, num b) {
+  static num _arithmetic(num a, BinaryOperator operator, num b) {
     switch (operator) {
       case BinaryOperator.add:
         return a + b;

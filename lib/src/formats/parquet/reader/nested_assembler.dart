@@ -13,17 +13,13 @@ import '../thrift/parquet_thrift.dart' as thrift;
 /// map-of-map) fall back to the original flat leaf columns so reads never break.
 class NestedAssembler {
   final List<thrift.SchemaElement> schema;
-  final Map<String, Field> _leafField = {};
-  final Map<String, Column> _leafColumn = {};
+  final Map<String, Field> _fields = {};
+  final Map<String, Column> _columns = {};
 
-  NestedAssembler(
-    this.schema,
-    List<Field> leafFields,
-    List<Column> leafColumns,
-  ) {
-    for (int i = 0; i < leafFields.length; i++) {
-      _leafField[leafFields[i].name] = leafFields[i];
-      _leafColumn[leafFields[i].name] = leafColumns[i];
+  NestedAssembler(this.schema, List<Field> fields, List<Column> columns) {
+    for (int i = 0; i < fields.length; i++) {
+      _fields[fields[i].name] = fields[i];
+      _columns[fields[i].name] = columns[i];
     }
   }
 
@@ -48,11 +44,11 @@ class NestedAssembler {
       } else {
         // Fall back to the flat leaves under this subtree.
         for (final path in _leafPaths(node, node.element.name ?? '')) {
-          final f = _leafField[path];
-          final c = _leafColumn[path];
-          if (f != null && c != null) {
-            fields.add(f);
-            columns.add(c);
+          final field = _fields[path];
+          final column = _columns[path];
+          if (field != null && column != null) {
+            fields.add(field);
+            columns.add(column);
           }
         }
       }
@@ -64,8 +60,8 @@ class NestedAssembler {
   /// it can't be safely reassembled.
   (Field, Column)? _build(SchemaNode node, String path) {
     if (node.isLeaf) {
-      final field = _leafField[path];
-      final column = _leafColumn[path];
+      final field = _fields[path];
+      final column = _columns[path];
       if (field == null || column == null) return null;
       return (field.copyWith(name: node.element.name), column);
     }
@@ -81,27 +77,27 @@ class NestedAssembler {
   }
 
   (Field, Column)? _buildStruct(SchemaNode node, String path) {
-    final childFields = <Field>[];
-    final childCols = <Column>[];
+    final fields = <Field>[];
+    final columns = <Column>[];
     for (final child in node.children) {
       final built = _build(child, '$path.${child.element.name}');
       if (built == null) return null;
-      childFields.add(built.$1);
-      childCols.add(built.$2);
+      fields.add(built.$1);
+      columns.add(built.$2);
     }
-    if (childCols.isEmpty) return null;
-    final n = childCols.first.length;
-    final names = [for (final f in childFields) f.name];
-    final lists = [for (final c in childCols) c.toList()];
+    if (columns.isEmpty) return null;
+    final count = columns.first.length;
+    final names = [for (final child in fields) child.name];
+    final lists = [for (final column in columns) column.toList()];
     final data = [
-      for (int r = 0; r < n; r++)
+      for (int r = 0; r < count; r++)
         {for (int j = 0; j < names.length; j++) names[j]: lists[j][r]},
     ];
     final field = Field(
       name: node.element.name ?? '',
       dataType: DataType.struct,
       nullable: true,
-      children: childFields,
+      children: fields,
     );
     return (
       field,
@@ -120,18 +116,19 @@ class NestedAssembler {
     final repeated = node.children.first;
     if (repeated.children.length != 1) return null;
     final element = repeated.children.first;
-    final elemPath = '$path.${repeated.element.name}.${element.element.name}';
+    final elementPath =
+        '$path.${repeated.element.name}.${element.element.name}';
 
     if (element.isLeaf) {
       // The leaf column is already assembled into one list per row.
-      final column = _leafColumn[elemPath];
-      final lf = _leafField[elemPath];
-      if (column == null || lf == null) return null;
+      final column = _columns[elementPath];
+      final leaf = _fields[elementPath];
+      if (column == null || leaf == null) return null;
       final field = Field(
         name: node.element.name ?? '',
         dataType: DataType.list,
         nullable: true,
-        children: [lf.copyWith(name: element.element.name)],
+        children: [leaf.copyWith(name: element.element.name)],
       );
       return (
         field,
@@ -148,28 +145,28 @@ class NestedAssembler {
     if (_classify(element) != _Nesting.struct) return null;
     final memberFields = <Field>[];
     final memberLists = <List<dynamic>>[];
-    for (final m in element.children) {
-      if (!m.isLeaf) return null; // deeper nesting -> fall back
-      final mp = '$elemPath.${m.element.name}';
-      final column = _leafColumn[mp];
-      final lf = _leafField[mp];
-      if (column == null || lf == null) return null;
-      memberFields.add(lf.copyWith(name: m.element.name));
+    for (final member in element.children) {
+      if (!member.isLeaf) return null; // deeper nesting -> fall back
+      final memberPath = '$elementPath.${member.element.name}';
+      final column = _columns[memberPath];
+      final leaf = _fields[memberPath];
+      if (column == null || leaf == null) return null;
+      memberFields.add(leaf.copyWith(name: member.element.name));
       memberLists.add(column.toList());
     }
-    final n = memberLists.isEmpty ? 0 : memberLists.first.length;
-    final names = [for (final f in memberFields) f.name];
+    final count = memberLists.isEmpty ? 0 : memberLists.first.length;
+    final names = [for (final member in memberFields) member.name];
     final data = <dynamic>[];
-    for (int r = 0; r < n; r++) {
-      final rowLists = [for (final ml in memberLists) ml[r] as List?];
-      if (rowLists.any((l) => l == null)) {
+    for (int r = 0; r < count; r++) {
+      final lists = [for (final list in memberLists) list[r] as List?];
+      if (lists.any((list) => list == null)) {
         data.add(null);
         continue;
       }
-      final length = rowLists.first!.length;
+      final length = lists.first!.length;
       data.add([
         for (int i = 0; i < length; i++)
-          {for (int j = 0; j < names.length; j++) names[j]: rowLists[j]![i]},
+          {for (int j = 0; j < names.length; j++) names[j]: lists[j]![i]},
       ]);
     }
     final field = Field(
@@ -199,34 +196,39 @@ class NestedAssembler {
   (Field, Column)? _buildMap(SchemaNode node, String path) {
     // MAP -> key_value (repeated) -> key, value.
     if (node.children.length != 1) return null;
-    final kv = node.children.first;
-    if (kv.children.length != 2) return null;
-    final keyNode = kv.children[0];
-    final valNode = kv.children[1];
-    if (!keyNode.isLeaf || !valNode.isLeaf) {
+    final entry = node.children.first;
+    if (entry.children.length != 2) return null;
+    final keyNode = entry.children[0];
+    final valueNode = entry.children[1];
+    if (!keyNode.isLeaf || !valueNode.isLeaf) {
       return null; // map-of-nested -> fall back
     }
-    final keyPath = '$path.${kv.element.name}.${keyNode.element.name}';
-    final valPath = '$path.${kv.element.name}.${valNode.element.name}';
-    final keyCol = _leafColumn[keyPath];
-    final valCol = _leafColumn[valPath];
-    final keyF = _leafField[keyPath];
-    final valF = _leafField[valPath];
-    if (keyCol == null || valCol == null || keyF == null || valF == null) {
+    final keyPath = '$path.${entry.element.name}.${keyNode.element.name}';
+    final valuePath = '$path.${entry.element.name}.${valueNode.element.name}';
+    final keyColumn = _columns[keyPath];
+    final valueColumn = _columns[valuePath];
+    final keyField = _fields[keyPath];
+    final valueField = _fields[valuePath];
+    if (keyColumn == null ||
+        valueColumn == null ||
+        keyField == null ||
+        valueField == null) {
       return null;
     }
-    final keys = keyCol.toList();
-    final vals = valCol.toList();
-    final n = keys.length;
+    final keys = keyColumn.toList();
+    final values = valueColumn.toList();
+    final count = keys.length;
     final data = <dynamic>[];
-    for (int r = 0; r < n; r++) {
-      final ks = keys[r] as List?;
-      final vs = vals[r] as List?;
-      if (ks == null || vs == null) {
+    for (int r = 0; r < count; r++) {
+      final entryKeys = keys[r] as List?;
+      final entryValues = values[r] as List?;
+      if (entryKeys == null || entryValues == null) {
         data.add(null);
         continue;
       }
-      data.add({for (int i = 0; i < ks.length; i++) ks[i]: vs[i]});
+      data.add({
+        for (int i = 0; i < entryKeys.length; i++) entryKeys[i]: entryValues[i],
+      });
     }
     final field = Field(
       name: node.element.name ?? '',
@@ -234,12 +236,12 @@ class NestedAssembler {
       nullable: true,
       children: [
         Field(
-          name: kv.element.name ?? 'key_value',
+          name: entry.element.name ?? 'key_value',
           dataType: DataType.struct,
           nullable: false,
           children: [
-            keyF.copyWith(name: keyNode.element.name),
-            valF.copyWith(name: valNode.element.name),
+            keyField.copyWith(name: keyNode.element.name),
+            valueField.copyWith(name: valueNode.element.name),
           ],
         ),
       ],
@@ -256,13 +258,13 @@ class NestedAssembler {
   }
 
   _Nesting _classify(SchemaNode node) {
-    final ct = node.element.convertedType;
-    if (ct == thrift.ConvertedType.list ||
+    final converted = node.element.convertedType;
+    if (converted == thrift.ConvertedType.list ||
         node.element.logicalType?.list != null) {
       return _Nesting.list;
     }
-    if (ct == thrift.ConvertedType.map ||
-        ct == thrift.ConvertedType.mapKeyValue ||
+    if (converted == thrift.ConvertedType.map ||
+        converted == thrift.ConvertedType.mapKeyValue ||
         node.element.logicalType?.map != null) {
       return _Nesting.map;
     }

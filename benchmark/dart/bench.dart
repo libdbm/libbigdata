@@ -4,9 +4,10 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:libbigdata/libbigdata.dart';
+import 'package:libbigdata/src/core/column.dart' show NumericVector;
 // CompressionCodec is not re-exported by the barrel.
-import 'package:libbigdata/src/formats/parquet/thrift/parquet_thrift.dart'
-    show CompressionCodec;
+
+import '../results.dart';
 
 /// libbigdata read/write Parquet benchmark.
 ///
@@ -31,7 +32,7 @@ Future<void> _read(String dataset, String path, int reps) async {
   final bytes = File(path).lengthSync();
   for (int r = 0; r < reps; r++) {
     final sw = Stopwatch()..start();
-    final table = await ParquetReader(path).read();
+    final table = await ParquetReader(path).read().ok;
     final agg = dataset == 'flights' ? _aggFlights(table) : _aggGen(table);
     sw.stop();
     _emit('read', dataset, 'none', sw, table.rowCount, bytes, agg);
@@ -41,17 +42,17 @@ Future<void> _read(String dataset, String path, int reps) async {
 Future<void> _write(String dataset, String csv, String codec, int reps) async {
   final out = 'out_libbigdata_$codec.parquet';
   final compression = codec == 'zstd'
-      ? CompressionCodec.zstd
+      ? ParquetCompression.zstd
       : codec == 'gzip'
-      ? CompressionCodec.gzip
-      : CompressionCodec.snappy;
+      ? ParquetCompression.gzip
+      : ParquetCompression.snappy;
   for (int r = 0; r < reps; r++) {
     final sw = Stopwatch()..start();
-    final table = await CsvReader().readFile(csv);
+    final table = await CsvReader().readFile(csv).ok;
     await ParquetWriter(
       out,
       options: ParquetWriterOptions(compression: compression),
-    ).write(table);
+    ).write(table).ok;
     sw.stop();
     _emit(
       'write',
@@ -95,9 +96,9 @@ List<num> _aggFlights(Table table) {
 num _sum(Table table, String name) {
   final col = table.column(name)!;
   // Fast path: iterate the typed buffer directly, skipping nulls, no boxing.
-  if (col is NumericColumn) {
-    final buf = col.rawBuffer;
-    final bitmap = col.rawNullBitmap;
+  if (col is NumericVector) {
+    final buf = col.raw;
+    final bitmap = col.nulls;
     bool present(int i) =>
         bitmap == null || (bitmap[i >> 3] & (1 << (i & 7))) == 0;
     num total = 0;
@@ -155,8 +156,8 @@ int _countTrue(Table table, String name) {
 
 int _countNonNull(Table table, String name) {
   final col = table.column(name)!;
-  if (col is NumericColumn) {
-    final bitmap = col.rawNullBitmap;
+  if (col is NumericVector) {
+    final bitmap = col.nulls;
     if (bitmap == null) return col.length;
     int total = 0;
     for (int i = 0; i < col.length; i++) {

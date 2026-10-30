@@ -3,6 +3,8 @@ import 'column.dart';
 import 'columnar.dart';
 import 'data_type.dart';
 import 'decimal.dart';
+import 'failure.dart';
+import 'result.dart';
 import 'schema.dart';
 import 'data_chunk.dart';
 import 'keys.dart';
@@ -13,7 +15,7 @@ import 'keys.dart';
 /// Every lakehouse reader needs this: files written before a column was added
 /// simply don't have it, so the read must pad rather than fail. Shared so a fix
 /// here (null-filling, concat width promotion) can't reach one reader and miss
-/// its twin — Delta and Iceberg carried byte-identical copies differing only in
+/// its twin: Delta and Iceberg carried byte-identical copies differing only in
 /// the table name.
 Table unifyTables(String name, List<Table> tables, Schema schema) => Table(
   name: name,
@@ -34,12 +36,22 @@ Table unifyTables(String name, List<Table> tables, Schema schema) => Table(
 
 /// Represents an in-memory table with columnar storage
 @immutable
-class Table {
+final class Table {
+  /// The table's name.
   final String name;
+
+  /// The columns, in [schema] order, all of [rowCount] rows.
   final List<Column> columns;
+
+  /// The fields describing [columns].
   final Schema schema;
+
+  /// Free-form key/value annotations carried with the table.
   final Map<String, dynamic> metadata;
 
+  /// A table of [columns] described by [schema]. Throws an [ArgumentError]
+  /// when they disagree: a different count, name, length or type, or a null
+  /// in a non-nullable field.
   Table({
     required this.name,
     required List<Column> columns,
@@ -53,18 +65,8 @@ class Table {
   void _validate() => validateColumns(columns, schema);
 
   /// Create an empty table
-  factory Table.empty(String name, Schema schema) {
-    final columns = schema.fields.map((field) {
-      return ListColumn(
-        name: field.name,
-        dataType: field.dataType,
-        data: [],
-        nullable: field.nullable,
-      );
-    }).toList();
-
-    return Table(name: name, columns: columns, schema: schema);
-  }
+  factory Table.empty(String name, Schema schema) =>
+      Table(name: name, columns: emptyColumns(schema), schema: schema);
 
   /// Create table from rows
   factory Table.fromRows(
@@ -113,7 +115,7 @@ class Table {
       }
     }
 
-    // Concatenate each column ONCE across all chunks — appending chunk-by-chunk
+    // Concatenate each column ONCE across all chunks: appending chunk-by-chunk
     // re-copies the growing accumulator every step (O(chunks × rows)).
     final width = chunks.first.columns.length;
     final columns = [
@@ -121,7 +123,13 @@ class Table {
         Column.concat([for (final chunk in chunks) chunk.columns[i]]),
     ];
 
-    return Table(name: name, columns: columns, schema: schema);
+    // A concat that widened a column (int32 then int64 chunks) carries the
+    // wider type into the schema, as [append] and [concat] do.
+    return Table(
+      name: name,
+      columns: columns,
+      schema: promotedSchema(schema, columns),
+    );
   }
 
   /// Number of rows in the table
@@ -132,7 +140,7 @@ class Table {
 
   /// Get column by name (null if absent). Throws on an AMBIGUOUS bare name (a
   /// post-join collision under distinct qualifiers) rather than silently
-  /// returning the first match — consistent with RecordBatch.column / resolve.
+  /// returning the first match: consistent with RecordBatch.column / resolve.
   Column? column(String name) {
     final index = schema.resolve(name);
     return index >= 0 ? columns[index] : null;
@@ -153,21 +161,13 @@ class Table {
   /// A decimal column is stored unscaled with its scale on the [Field], so a
   /// bare column value is a meaningless integer (1.50 reads as 150). This is the
   /// boundary that owns the schema, so it is where a decimal becomes a
-  /// [Decimal] — the value round-trips back through [Table.fromRows].
+  /// [Decimal], and the value round-trips back through [Table.fromRows].
   Map<String, dynamic> row(int index) {
     if (index < 0 || index >= rowCount) {
       throw RangeError('Row index $index out of range [0, $rowCount)');
     }
 
-    final row = <String, dynamic>{};
-    for (int i = 0; i < columns.length; i++) {
-      final field = schema.fields[i];
-      final value = columns[i][index];
-      row[field.name] = value is BigInt && field.dataType == DataType.decimal
-          ? Decimal(value, field.scale ?? 0)
-          : value;
-    }
-    return row;
+    return rowAt(schema, columns, index);
   }
 
   /// Convert table to list of rows
@@ -187,16 +187,7 @@ class Table {
     if (rowCount == 0) {
       return [DataChunk.empty(schema)];
     }
-
-    final chunks = <DataChunk>[];
-    for (int start = 0; start < rowCount; start += chunkSize) {
-      final end = (start + chunkSize).clamp(0, rowCount);
-      final chunkColumns = columns
-          .map((column) => column.slice(start, end))
-          .toList();
-      chunks.add(DataChunk(columns: chunkColumns, schema: schema));
-    }
-    return chunks;
+    return DataChunk(columns: columns, schema: schema).split(chunkSize);
   }
 
   /// Get chunk iterator
@@ -205,34 +196,20 @@ class Table {
   }
 
   /// Select subset of columns
-  Table select(List<String> columnNames) {
-    final schema = this.schema.select(columnNames);
-    final selectedColumns = <Column>[];
-
-    for (final name in columnNames) {
-      final column = this.column(name);
-      if (column == null) {
-        throw ArgumentError('Column not found: $name');
-      }
-      selectedColumns.add(column);
-    }
-
-    return Table(
-      name: name,
-      columns: selectedColumns,
-      schema: schema,
-      metadata: metadata,
-    );
-  }
+  Table select(List<String> names) => Table(
+    name: name,
+    // The schema first, so a missing name fails as it always has.
+    schema: schema.select(names),
+    columns: selectColumns(names, column),
+    metadata: metadata,
+  );
 
   /// Filter table by indices
   Table filter(List<int> indices) {
-    final filteredColumns = columns
-        .map((column) => column.filter(indices))
-        .toList();
+    final filtered = columns.map((column) => column.filter(indices)).toList();
     return Table(
       name: name,
-      columns: filteredColumns,
+      columns: filtered,
       schema: schema,
       metadata: metadata,
     );
@@ -248,44 +225,45 @@ class Table {
   /// high-cardinality key). The O(rows) index map is still built up front.
   ///
   /// [maxPartitions] caps the number of DISTINCT partitions and is enforced as
-  /// each new key is discovered — so a mistaken `partitionBy: ['id']` over
+  /// each new key is discovered, so a mistaken `partitionBy: ['id']` over
   /// millions of unique rows fails loud at the (cap+1)-th key instead of building
   /// a multi-million-entry grouping map first. Null disables the cap.
   Iterable<({Map<String, Object?> values, Table table})> splitByKeys(
     List<String> keys, {
     int? maxPartitions,
   }) sync* {
-    final keyCols = [for (final k in keys) column(k)!];
+    final sources = [for (final k in keys) column(k)!];
     final order = <RowKey>[];
     final groups = <RowKey, List<int>>{};
-    final groupVals = <RowKey, Map<String, Object?>>{};
+    final values = <RowKey, Map<String, Object?>>{};
     for (int i = 0; i < rowCount; i++) {
-      final vals = <String, Object?>{
-        for (int j = 0; j < keys.length; j++) keys[j]: keyCols[j][i],
+      final entry = <String, Object?>{
+        for (int j = 0; j < keys.length; j++) keys[j]: sources[j][i],
       };
       // Structural key: element-wise equality can't collide the way a string
       // join can (a value containing a separator, or a null vs the string
-      // "null") — see [RowKey].
-      final id = RowKey([for (int j = 0; j < keys.length; j++) keyCols[j][i]]);
-      final g = groups[id];
-      if (g == null) {
+      // "null"): see [RowKey].
+      final id = RowKey([for (int j = 0; j < keys.length; j++) sources[j][i]]);
+      final group = groups[id];
+      if (group == null) {
         if (maxPartitions != null && order.length >= maxPartitions) {
-          throw StateError(
+          throw Failure.of(
+            Kind.limit,
             'partitioning by ${keys.join(", ")} would create more than '
             '$maxPartitions partitions; a high-cardinality partition column '
-            '(e.g. an id) produces millions of tiny files — partition by a '
+            '(e.g. an id) produces millions of tiny files: partition by a '
             'low-cardinality column',
           );
         }
         order.add(id);
         groups[id] = [i];
-        groupVals[id] = vals;
+        values[id] = entry;
       } else {
-        g.add(i);
+        group.add(i);
       }
     }
     for (final id in order) {
-      yield (values: groupVals[id]!, table: filter(groups[id]!));
+      yield (values: values[id]!, table: filter(groups[id]!));
     }
   }
 
@@ -309,12 +287,10 @@ class Table {
       );
     }
 
-    final slicedColumns = columns
-        .map((column) => column.slice(start, stop))
-        .toList();
+    final sliced = columns.map((column) => column.slice(start, stop)).toList();
     return Table(
       name: name,
-      columns: slicedColumns,
+      columns: sliced,
       schema: schema,
       metadata: metadata,
     );
@@ -333,7 +309,7 @@ class Table {
 
   /// Add a column to the table. A decimal's scale/precision and a nested type's
   /// children live on the [Field], not the [Column], so pass [field] when adding
-  /// one of those — inferring a bare Field would drop the scale (reading `1.50`
+  /// one of those: inferring a bare Field would drop the scale (reading `1.50`
   /// back as `150`) or the children. For a plain scalar column [field] is
   /// optional and defaults to the column's own type/nullability.
   Table addColumn(Column column, {Field? field}) {
@@ -342,7 +318,7 @@ class Table {
         'Column length (${column.length}) must match table row count ($rowCount)',
       );
     }
-    final Field newField;
+    final Field added;
     if (field != null) {
       if (field.name != column.name || field.dataType != column.dataType) {
         throw ArgumentError(
@@ -350,7 +326,7 @@ class Table {
           'column (${column.name}:${column.dataType})',
         );
       }
-      newField = field;
+      added = field;
     } else if (column.dataType == DataType.decimal ||
         column.dataType.isNested) {
       throw ArgumentError(
@@ -359,7 +335,7 @@ class Table {
         'on the Field): pass field: to supply it',
       );
     } else {
-      newField = Field(
+      added = Field(
         name: column.name,
         dataType: column.dataType,
         nullable: column.nullable,
@@ -369,7 +345,7 @@ class Table {
     return Table(
       name: name,
       columns: [...columns, column],
-      schema: schema.addField(newField),
+      schema: schema.addField(added),
       metadata: metadata,
     );
   }
@@ -381,12 +357,12 @@ class Table {
       throw ArgumentError('Column not found: $columnName');
     }
 
-    final newColumns = [...columns];
-    newColumns.removeAt(index);
+    final remaining = [...columns];
+    remaining.removeAt(index);
 
     return Table(
       name: name,
-      columns: newColumns,
+      columns: remaining,
       schema: schema.removeField(columnName),
       metadata: metadata,
     );
@@ -394,7 +370,7 @@ class Table {
 
   /// Rename columns
   Table renameColumns(Map<String, String> renames) {
-    final renamedColumns = [
+    final renamed = [
       for (final column in columns)
         renames[column.name] is String
             ? column.withName(renames[column.name]!)
@@ -403,14 +379,14 @@ class Table {
 
     return Table(
       name: name,
-      columns: renamedColumns,
+      columns: renamed,
       schema: schema.rename(renames),
       metadata: metadata,
     );
   }
 
   /// Append another table. This materializes both tables' rows once (a bulk
-  /// operation, not an incremental row-appender — use builders for streaming
+  /// operation, not an incremental row-appender: use builders for streaming
   /// ingest). [Column.concat] promotes integer/float width across the pieces, so
   /// a wider column never truncates into a narrower buffer.
   Table append(Table other) {
@@ -418,7 +394,7 @@ class Table {
       throw ArgumentError('Cannot append tables with incompatible schemas');
     }
 
-    final combinedColumns = [
+    final combined = [
       for (int i = 0; i < columns.length; i++)
         Column.concat([columns[i], other.columns[i]]),
     ];
@@ -426,14 +402,14 @@ class Table {
     // field dtype and column dtype stay in agreement.
     return Table(
       name: name,
-      columns: combinedColumns,
-      schema: promotedSchema(schema, combinedColumns),
+      columns: combined,
+      schema: promotedSchema(schema, combined),
       metadata: metadata,
     );
   }
 
   /// Concatenate compatible-schema tables with ONE N-way [Column.concat] per
-  /// column — O(total rows). Repeated [append] in a loop recopies every prior
+  /// column: O(total rows). Repeated [append] in a loop recopies every prior
   /// row on each call (O(n^2)); callers accumulating a batch stream should use
   /// this instead.
   static Table concat(List<Table> tables) {
@@ -467,8 +443,11 @@ class Table {
   /// Get table statistics
   Map<String, ColumnStats?> get statistics {
     final stats = <String, ColumnStats?>{};
-    for (final column in columns) {
-      stats[column.name] = column.stats;
+    for (int i = 0; i < columns.length; i++) {
+      final column = columns[i];
+      stats[column.name] = column.dataType == DataType.decimal
+          ? decimalStats(column, schema.fields[i].scale ?? 0)
+          : column.stats;
     }
     return stats;
   }
@@ -482,10 +461,10 @@ class Table {
   @override
   String toString() => describe();
 
-  /// Human-readable summary with up to [previewRows] preview rows. `toString`
+  /// Human-readable summary with up to [rows] preview rows. `toString`
   /// uses the default 5; callers that want more (e.g. `DataFrame.show(n)`) pass a
   /// larger count instead of being silently capped at 5.
-  String describe([int previewRows = 5]) {
+  String describe([int rows = 5]) {
     final buffer = StringBuffer();
     buffer.writeln('Table: $name');
     buffer.writeln('Rows: $rowCount, Columns: $columnCount');
@@ -501,13 +480,13 @@ class Table {
         );
       }
 
-      buffer.writeln('\nPreview (first $previewRows rows):');
-      final preview = head(previewRows);
+      buffer.writeln('\nPreview (first $rows rows):');
+      final preview = head(rows);
       for (int i = 0; i < preview.rowCount; i++) {
         buffer.writeln('  ${preview.row(i)}');
       }
-      if (rowCount > previewRows) {
-        buffer.writeln('  ... ${rowCount - previewRows} more rows');
+      if (rowCount > rows) {
+        buffer.writeln('  ... ${rowCount - rows} more rows');
       }
     }
 

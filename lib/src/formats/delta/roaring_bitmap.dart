@@ -22,8 +22,8 @@ class Roaring {
 
   static Uint8List serializeTreemap(Iterable<int> values) {
     final buckets = SplayTreeMap<int, List<int>>();
-    for (final v in values) {
-      buckets.putIfAbsent(v >> 32, () => []).add(v & 0xFFFFFFFF);
+    for (final value in values) {
+      buckets.putIfAbsent(value >> 32, () => []).add(value & 0xFFFFFFFF);
     }
     final out = BytesBuilder();
     final header = ByteData(8)..setUint64(0, buckets.length, Endian.little);
@@ -39,47 +39,29 @@ class Roaring {
   /// Reject an implausible element [count] read from untrusted input before it is
   /// used to allocate or drive a decode loop: it can't exceed the remaining bytes
   /// divided by the minimum bytes each element consumes.
-  static void _checkCount(
-    int count,
-    int minBytesPerElem,
-    int pos,
-    ByteData bd,
-  ) {
-    final remaining = bd.lengthInBytes - pos;
-    if (count < 0 || remaining < 0 || count > remaining ~/ minBytesPerElem) {
+  static void _checkCount(int count, int minimum, int position, ByteData data) {
+    final remaining = data.lengthInBytes - position;
+    if (count < 0 || remaining < 0 || count > remaining ~/ minimum) {
       throw FormatException(
         'Roaring count $count exceeds the $remaining bytes remaining',
       );
     }
   }
 
-  /// The portable-format values of [bytes] as a plain `Set<int>`.
-  ///
-  /// Delegates to [deserializeToBitmap]. This used to be a byte-for-byte second
-  /// decoder, and every hardening — the strictly-increasing bucket-key check,
-  /// the cardinality budget — had to be hand-copied into both; the next one
-  /// would have landed in only one. Nothing in `lib/` needs a Set: prefer the
-  /// bitmap unless you specifically want the values materialized.
-  static Set<int> deserializeTreemap(
-    Uint8List bytes, [
-    int start = 0,
-    int? cardinality,
-  ]) => deserializeToBitmap(bytes, start, cardinality).values.toSet();
-
   /// Roaring treemap buckets are serialized in strictly-increasing high-key
   /// order. Reject a duplicate/out-of-order key: duplicates collapse in the
   /// bitmap yet still count toward a declared cardinality, silently dropping
   /// deletes.
-  static void _checkBucketKey(int key, int prevKey) {
-    if (key <= prevKey) {
+  static void _checkBucketKey(int key, int previous) {
+    if (key <= previous) {
       throw FormatException(
-        'Roaring bucket keys not strictly increasing (got $key after $prevKey)',
+        'Roaring bucket keys not strictly increasing (got $key after $previous)',
       );
     }
   }
 
   /// A caller that declares an EXACT [cardinality] (e.g. a Delta DV descriptor)
-  /// lets us reject a payload that decodes to a different count — a deliberately-
+  /// lets us reject a payload that decodes to a different count: a deliberately-
   /// valid bomb whose CRC checks out but whose contents disagree with the header.
   static void _checkCardinality(int decoded, int? cardinality) {
     if (cardinality != null && decoded != cardinality) {
@@ -90,8 +72,8 @@ class Roaring {
     }
   }
 
-  /// Like [deserializeTreemap] but builds a compressed [RoaringBitmap] directly,
-  /// so the persistent membership structure never materializes a `Set<int>`
+  /// The portable-format values of [bytes] as a compressed [RoaringBitmap], so
+  /// the persistent membership structure never materializes a `Set<int>`
   /// (only a transient per-bucket set is held). For large deletion vectors this
   /// is bits/element instead of ~40-50 bytes/element.
   static RoaringBitmap deserializeToBitmap(
@@ -99,31 +81,31 @@ class Roaring {
     int start = 0,
     int? cardinality,
   ]) {
-    final bd = ByteData.sublistView(bytes);
-    var pos = start;
-    final bucketCount = bd.getUint64(pos, Endian.little);
-    pos += 8;
+    final data = ByteData.sublistView(bytes);
+    var position = start;
+    final bucketCount = data.getUint64(position, Endian.little);
+    position += 8;
     // Each bucket consumes >= 8 bytes (4-byte key + >= 4-byte container cookie);
     // reject an implausible count before iterating/allocating.
-    _checkCount(bucketCount, 8, pos, bd);
+    _checkCount(bucketCount, 8, position, data);
     final limit = cardinality ?? _maxDecodedCardinality;
     final result = RoaringBitmap();
     var total = 0;
-    var prevKey = -1;
+    var previous = -1;
     for (int b = 0; b < bucketCount; b++) {
-      final key = bd.getUint32(pos, Endian.little);
-      pos += 4;
-      _checkBucketKey(key, prevKey);
-      prevKey = key;
-      final (low, consumed) = _deserialize32(bd, pos, limit - total);
-      pos += consumed;
+      final key = data.getUint32(position, Endian.little);
+      position += 4;
+      _checkBucketKey(key, previous);
+      previous = key;
+      final (low, consumed) = _deserialize32(data, position, limit - total);
+      position += consumed;
       total += low.length;
-      for (final v in low) {
-        result.add((key << 32) | v);
+      for (final value in low) {
+        result.add((key << 32) | value);
       }
     }
-    // Compare the FINAL distinct membership, not the running sum (see
-    // deserializeTreemap) — duplicate values collapse in RoaringBitmap.add.
+    // Compare the FINAL distinct membership, not the running sum: duplicate
+    // values collapse in RoaringBitmap.add.
     _checkCardinality(result.length, cardinality);
     return result;
   }
@@ -135,8 +117,8 @@ class Roaring {
   /// cookie (array/bitmap containers only) with an offset header.
   static Uint8List _serialize32(List<int> lows) {
     final containers = SplayTreeMap<int, List<int>>();
-    for (final v in lows) {
-      containers.putIfAbsent(v >> 16, () => []).add(v & 0xFFFF);
+    for (final value in lows) {
+      containers.putIfAbsent(value >> 16, () => []).add(value & 0xFFFF);
     }
     final keys = containers.keys.toList();
     final count = keys.length;
@@ -152,13 +134,13 @@ class Roaring {
         bodies.add(body.buffer.asUint8List());
       } else {
         final body = Uint8List(8192);
-        final bd = ByteData.sublistView(body);
-        for (final v in values) {
-          final word = v >> 6;
-          final bit = v & 63;
-          bd.setUint64(
+        final data = ByteData.sublistView(body);
+        for (final value in values) {
+          final word = value >> 6;
+          final bit = value & 63;
+          data.setUint64(
             word * 8,
-            bd.getUint64(word * 8, Endian.little) | (1 << bit),
+            data.getUint64(word * 8, Endian.little) | (1 << bit),
             Endian.little,
           );
         }
@@ -174,13 +156,13 @@ class Roaring {
       ..setUint32(4, count, Endian.little);
     out.add(head.buffer.asUint8List());
 
-    final desc = ByteData(count * 4);
+    final descriptive = ByteData(count * 4);
     for (int i = 0; i < count; i++) {
-      final card = containers[keys[i]]!.length;
-      desc.setUint16(i * 4, keys[i], Endian.little);
-      desc.setUint16(i * 4 + 2, card - 1, Endian.little);
+      final cardinality = containers[keys[i]]!.length;
+      descriptive.setUint16(i * 4, keys[i], Endian.little);
+      descriptive.setUint16(i * 4 + 2, cardinality - 1, Endian.little);
     }
-    out.add(desc.buffer.asUint8List());
+    out.add(descriptive.buffer.asUint8List());
 
     final offsets = ByteData(count * 4);
     var running = headerSize;
@@ -198,13 +180,13 @@ class Roaring {
 
   /// Deserialize a 32-bit portable bitmap at [start]; returns the low 32-bit
   /// values and the number of bytes consumed. [budget] is the remaining decoded
-  /// cardinality allowed across the whole payload — a container is rejected
+  /// cardinality allowed across the whole payload: a container is rejected
   /// BEFORE expansion once it would exceed it, so a run-container bomb (4 bytes →
   /// 65536 values) can't inflate the transient `Set<int>`.
-  static (Set<int>, int) _deserialize32(ByteData bd, int start, int budget) {
-    var pos = start;
-    final cookie = bd.getUint32(pos, Endian.little);
-    pos += 4;
+  static (Set<int>, int) _deserialize32(ByteData data, int start, int budget) {
+    var position = start;
+    final cookie = data.getUint32(position, Endian.little);
+    position += 4;
 
     bool hasRun;
     int count;
@@ -215,33 +197,33 @@ class Roaring {
       final runBytes = (count + 7) >> 3;
       runBitset = Uint8List(runBytes);
       for (int i = 0; i < runBytes; i++) {
-        runBitset[i] = bd.getUint8(pos + i);
+        runBitset[i] = data.getUint8(position + i);
       }
-      pos += runBytes;
+      position += runBytes;
     } else if (cookie == serialCookieNoRun) {
       hasRun = false;
-      count = bd.getUint32(pos, Endian.little);
-      pos += 4;
+      count = data.getUint32(position, Endian.little);
+      position += 4;
     } else {
       throw FormatException('Unknown Roaring cookie: $cookie');
     }
 
     // Validate the attacker-controlled container count against the bytes that
-    // actually remain (each container descriptor is 4 bytes) BEFORE allocating —
+    // actually remain (each container descriptor is 4 bytes) BEFORE allocating;
     // otherwise a tiny payload declaring count=0xFFFFFFFF forces a multi-GB
     // List.filled. CRC (checked later) does not protect a deliberately-valid one.
-    _checkCount(count, 4, pos, bd);
+    _checkCount(count, 4, position, data);
     final keys = List<int>.filled(count, 0);
-    final cards = List<int>.filled(count, 0);
+    final cardinalities = List<int>.filled(count, 0);
     for (int i = 0; i < count; i++) {
-      keys[i] = bd.getUint16(pos, Endian.little);
-      cards[i] = bd.getUint16(pos + 2, Endian.little) + 1;
-      pos += 4;
+      keys[i] = data.getUint16(position, Endian.little);
+      cardinalities[i] = data.getUint16(position + 2, Endian.little) + 1;
+      position += 4;
     }
 
     // Offset header present unless run-cookie with fewer than 4 containers.
     final hasOffsets = !hasRun || count >= 4;
-    if (hasOffsets) pos += count * 4;
+    if (hasOffsets) position += count * 4;
 
     final result = <int>{};
     var added = 0; // decoded values in THIS 32-bit bitmap, charged to [budget]
@@ -249,12 +231,12 @@ class Roaring {
       final high = keys[i] << 16;
       final isRun = hasRun && (runBitset![i >> 3] & (1 << (i & 7))) != 0;
       if (isRun) {
-        final runCount = bd.getUint16(pos, Endian.little);
-        pos += 2;
+        final runCount = data.getUint16(position, Endian.little);
+        position += 2;
         for (int r = 0; r < runCount; r++) {
-          final value = bd.getUint16(pos, Endian.little);
-          final length = bd.getUint16(pos + 2, Endian.little);
-          pos += 4;
+          final value = data.getUint16(position, Endian.little);
+          final length = data.getUint16(position + 2, Endian.little);
+          position += 4;
           // A run must stay within the 16-bit container; value+length spilling
           // past 0xFFFF would leak into the next bucket's bit range.
           if (value + length > 0xFFFF) {
@@ -262,7 +244,7 @@ class Roaring {
               'Roaring run [$value,+$length] overflows its 16-bit container',
             );
           }
-          // Charge the full run BEFORE expanding it — this is the amplification
+          // Charge the full run BEFORE expanding it; this is the amplification
           // path (4 bytes → up to 65536 values).
           added += length + 1;
           if (added > budget) _cardinalityBomb();
@@ -270,19 +252,19 @@ class Roaring {
             result.add(high | v);
           }
         }
-      } else if (cards[i] <= 4096) {
-        added += cards[i];
+      } else if (cardinalities[i] <= 4096) {
+        added += cardinalities[i];
         if (added > budget) _cardinalityBomb();
-        for (int v = 0; v < cards[i]; v++) {
-          result.add(high | bd.getUint16(pos, Endian.little));
-          pos += 2;
+        for (int v = 0; v < cardinalities[i]; v++) {
+          result.add(high | data.getUint16(position, Endian.little));
+          position += 2;
         }
       } else {
-        added += cards[i];
+        added += cardinalities[i];
         if (added > budget) _cardinalityBomb();
         for (int w = 0; w < 1024; w++) {
-          final word = bd.getUint64(pos, Endian.little);
-          pos += 8;
+          final word = data.getUint64(position, Endian.little);
+          position += 8;
           if (word == 0) continue;
           for (int bit = 0; bit < 64; bit++) {
             if ((word & (1 << bit)) != 0) result.add(high | (w << 6) | bit);
@@ -290,7 +272,7 @@ class Roaring {
         }
       }
     }
-    return (result, pos - start);
+    return (result, position - start);
   }
 
   static Never _cardinalityBomb() => throw const FormatException(
@@ -299,7 +281,7 @@ class Roaring {
   );
 }
 
-/// A mutable, compressed set of non-negative ints — the queryable in-memory
+/// A mutable, compressed set of non-negative ints: the queryable in-memory
 /// counterpart to [Roaring]'s (de)serialization. Membership over a large, often
 /// dense set (e.g. hundreds of millions of Iceberg position deletes) costs a few
 /// bits per value in the dense case, versus the ~40-50 bytes/element a Dart
@@ -322,13 +304,13 @@ class RoaringBitmap {
   /// Every value the bitmap holds, without materializing a `Set<int>`.
   ///
   /// Ascending WITHIN a container, but the containers themselves come out in
-  /// insertion order — `_buckets` and the per-bucket map are plain `Map`s. The
+  /// insertion order: `_buckets` and the per-bucket map are plain `Map`s. The
   /// only caller that needs global ordering, `serializeTreemap`, sorts them
   /// itself; do not assume it here.
   Iterable<int> get values sync* {
-    for (final MapEntry(key: hi, value: containers) in _buckets.entries) {
+    for (final MapEntry(key: high, value: containers) in _buckets.entries) {
       for (final MapEntry(key: key, value: container) in containers.entries) {
-        final prefix = (hi << 32) | (key << 16);
+        final prefix = (high << 32) | (key << 16);
         for (final low in container.values) {
           yield prefix | low;
         }
@@ -337,8 +319,8 @@ class RoaringBitmap {
   }
 
   void add(int value) {
-    final hi = value >> 32;
-    final containers = _buckets.putIfAbsent(hi, () => <int, _Container>{});
+    final high = value >> 32;
+    final containers = _buckets.putIfAbsent(high, () => <int, _Container>{});
     final key = (value >> 16) & 0xFFFF;
     final low = value & 0xFFFF;
     final existing = containers[key];
@@ -355,8 +337,8 @@ class RoaringBitmap {
   bool contains(int value) {
     final containers = _buckets[value >> 32];
     if (containers == null) return false;
-    final c = containers[(value >> 16) & 0xFFFF];
-    return c != null && c.contains(value & 0xFFFF);
+    final container = containers[(value >> 16) & 0xFFFF];
+    return container != null && container.contains(value & 0xFFFF);
   }
 
   /// A conservative estimate of resident bytes, for memory budgeting. Sums each
@@ -365,8 +347,8 @@ class RoaringBitmap {
     var bytes = 32; // top-level map baseline
     for (final containers in _buckets.values) {
       bytes += 32 + containers.length * 16; // per-bucket map + entry overhead
-      for (final c in containers.values) {
-        bytes += c.sizeInBytes;
+      for (final container in containers.values) {
+        bytes += container.sizeInBytes;
       }
     }
     return bytes;
@@ -417,19 +399,19 @@ class _ArrayContainer implements _Container {
 
   /// Index of [low], or `-(insertionPoint + 1)` when absent.
   int _search(int low) {
-    var lo = 0;
-    var hi = _values.length - 1;
-    while (lo <= hi) {
-      final mid = (lo + hi) >> 1;
-      final v = _values[mid];
-      if (v == low) return mid;
-      if (v < low) {
-        lo = mid + 1;
+    var bottom = 0;
+    var top = _values.length - 1;
+    while (bottom <= top) {
+      final mid = (bottom + top) >> 1;
+      final value = _values[mid];
+      if (value == low) return mid;
+      if (value < low) {
+        bottom = mid + 1;
       } else {
-        hi = mid - 1;
+        top = mid - 1;
       }
     }
-    return -(lo + 1);
+    return -(bottom + 1);
   }
 }
 
@@ -437,8 +419,8 @@ class _BitmapContainer implements _Container {
   final Uint64List _words = Uint64List(1024); // 65536 bits
 
   _BitmapContainer.fromArray(List<int> values) {
-    for (final v in values) {
-      _words[v >> 6] |= 1 << (v & 63);
+    for (final value in values) {
+      _words[value >> 6] |= 1 << (value & 63);
     }
   }
 
@@ -461,7 +443,7 @@ class _BitmapContainer implements _Container {
       while (word != 0) {
         final bit = word & -word; // lowest set bit
         // `_words` is a Uint64List, so a word with bit 63 set reads back as a
-        // NEGATIVE Dart int and `word & -word` isolates it as -2^63 — the only
+        // NEGATIVE Dart int and `word & -word` isolates it as -2^63: the only
         // negative single-bit value. Dart defines (-2^63).bitLength as 63 (it is
         // the bit length of the magnitude minus one), so `bitLength - 1` would
         // say 62 and silently report the WRONG ROW.

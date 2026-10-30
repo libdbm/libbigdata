@@ -1,6 +1,10 @@
 import 'dart:io';
 
+import 'package:meta/meta.dart';
+
 import '../../core/column.dart';
+import '../../core/failure.dart';
+import '../../core/result.dart';
 import '../../core/data_type.dart';
 import '../../core/paths.dart';
 import '../../core/schema.dart';
@@ -14,28 +18,28 @@ import 'schema/schema_converter.dart';
 import '../../core/ids.dart' as ids;
 
 /// Parquet file writer.
-class ParquetWriter {
+final class ParquetWriter {
   final String filePath;
   final ParquetWriterOptions options;
 
-  late FileWriter _fileWriter;
+  late FileWriter _writer;
   final List<thrift.RowGroup> _rowGroups = [];
-  int _totalRows = 0;
+  int _rows = 0;
 
   // Streaming state.
   List<thrift.SchemaElement>? _schema;
   Schema? _coreSchema;
-  List<String> _colNames = const [];
-  // Row-group accrual holds COLUMN REFS (zero-copy), not boxed values — typed
+  List<String> _names = const [];
+  // Row-group accrual holds COLUMN REFS (zero-copy), not boxed values: typed
   // columns are only materialized one row group at a time, at flush.
   Map<String, List<Column>>? _buffer;
-  int _bufferRows = 0;
+  int _buffered = 0;
   // Rows already consumed from the FIRST accrued piece of each column; lets a
   // flush emit a prefix without re-slicing (re-copying) the tail every time.
   int _head = 0;
   bool _open = false;
   // True once the underlying file handle is acquired, independent of the
-  // higher-level _open flag — so abort() always closes the fd + temp file even
+  // higher-level _open flag, so abort() always closes the fd + temp file even
   // if open() throws (e.g. writeMagic) before _open is set.
   bool _fileOpen = false;
 
@@ -53,46 +57,27 @@ class ParquetWriter {
   /// sliced per row group (no whole-table `toList`). A mid-write failure aborts
   /// cleanly (handle closed, partial file removed) rather than leaving a corrupt
   /// file at [filePath].
-  Future<void> write(Table table) async {
-    try {
-      await open(table.schema, columns: table.columns);
-      final fast = _fastNames(table.schema);
-      final n = table.rowCount;
-      for (int s = 0; s < n; s += options.rowGroupSize) {
-        final e = (s + options.rowGroupSize).clamp(0, n);
-        final data = <String, List<dynamic>>{};
-        final typed = <String, NumericColumn>{};
-        for (final column in table.columns) {
-          if (column is NumericColumn && fast.contains(column.name)) {
-            typed[column.name] = column.slice(s, e) as NumericColumn;
-          } else {
-            data[column.name] = _sliceColumn(column, s, e);
-          }
-        }
-        await _writeRowGroup(data, e - s, typed: typed);
-      }
-      await close();
-    } catch (_) {
-      await abort();
-      rethrow;
-    }
+  ///
+  /// A failure is reported as an [Err], with no partial file left behind:
+  /// [Kind.io] when the file cannot be written, [Kind.invalid] for a value its
+  /// column's physical type would truncate, and [Kind.unsupported] for a
+  /// format version this writer cannot produce.
+  @useResult
+  Future<Result<void, ErrorDetails>> write(Table table) {
+    _require(opening: true);
+    return capture(() => _write(table));
   }
 
-  /// Begin a streaming write. [columns] (when writing a whole table) lets leaves
-  /// be marked required from real null content; streaming opens mark every leaf
-  /// optional so any later batch may carry nulls.
-  Future<void> open(Schema schema, {List<Column>? columns}) async {
+  /// The caller's preconditions, checked before any work so they throw rather
+  /// than being reported: a positive row-group size and, when [opening], no
+  /// write already open.
+  void _require({bool opening = false}) {
     // Reject re-entry: a second open() while a write is live would overwrite the
     // temp path + file handle, leaking the first fd and orphaning its .tmp.
-    if (_open || _fileOpen) {
+    if (opening && (_open || _fileOpen)) {
       throw StateError(
         'ParquetWriter.open called while a write is already open; close() or '
         'abort() the current write first',
-      );
-    }
-    if (!writable(options.compression)) {
-      throw ArgumentError(
-        'Compression codec ${options.compression.name} is not supported for writing',
       );
     }
     // Enforce in production too (the const-constructor assert is dev-only): a
@@ -104,100 +89,168 @@ class ParquetWriter {
         'must be positive',
       );
     }
-    // Likewise reject a version this library can't read back (the reader accepts
-    // only {1,2}) — fail at write time rather than emit a self-unreadable file.
+  }
+
+  Future<void> _write(Table table) async {
+    try {
+      await _begin(table.schema, columns: table.columns);
+      final fast = _fastNames(table.schema);
+      final count = table.rowCount;
+      for (int start = 0; start < count; start += options.rowGroupSize) {
+        final end = (start + options.rowGroupSize).clamp(0, count);
+        final data = <String, List<dynamic>>{};
+        final typed = <String, NumericVector>{};
+        for (final column in table.columns) {
+          if (column is NumericVector && fast.contains(column.name)) {
+            typed[column.name] = column.slice(start, end) as NumericVector;
+          } else {
+            data[column.name] = _sliceColumn(column, start, end);
+          }
+        }
+        await _writeRowGroup(data, end - start, typed: typed);
+      }
+      await _close();
+    } catch (_) {
+      await abort();
+      rethrow;
+    }
+  }
+
+  /// Begin a streaming write. [columns] (when writing a whole table) lets leaves
+  /// be marked required from real null content; streaming opens mark every leaf
+  /// optional so any later batch may carry nulls. Failures are reported as
+  /// [write] reports them.
+  @useResult
+  Future<Result<void, ErrorDetails>> open(
+    Schema schema, {
+    List<Column>? columns,
+  }) {
+    _require(opening: true);
+    return capture(() => _begin(schema, columns: columns));
+  }
+
+  Future<void> _begin(Schema schema, {List<Column>? columns}) async {
+    // Reject a version this library can't read back (the reader accepts
+    // only {1,2}): fail at write time rather than emit a self-unreadable file.
     if (!ParquetWriterOptions.supportedVersions.contains(options.version)) {
-      throw ArgumentError.value(
-        options.version,
-        'version',
-        'unsupported Parquet version (must be 1 or 2)',
+      throw Failure.of(
+        Kind.unsupported,
+        'Unsupported Parquet version ${options.version} (must be 1 or 2)',
       );
     }
     _rowGroups.clear();
-    _totalRows = 0;
-    _bufferRows = 0;
+    _rows = 0;
+    _buffered = 0;
     _head = 0;
 
     // Convert the schema BEFORE acquiring the file handle, so a conversion
     // failure (e.g. an unsupported type) throws without ever holding an open
     // writer + .tmp file.
     final parquetSchema = SchemaConverter().toParquetSchema(schema);
-    // Refine leaf nullability from real null content — only for a flat schema,
-    // where leaves map 1:1 to fields. With nested fields the leaf↔field mapping
-    // no longer holds, so keep the repetition types the schema emitter assigned.
+    // Leaf nullability from the field, widened by real null content, only
+    // for a flat schema, where leaves map 1:1 to fields. With nested fields
+    // the leaf↔field mapping no longer holds, so keep the repetition types the
+    // schema emitter assigned. A nullable field stays OPTIONAL with no null
+    // in it: narrowing it to REQUIRED changed the schema on a round trip.
     final nested = schema.fields.any(
-      (f) =>
-          f.dataType == DataType.list ||
-          f.dataType == DataType.struct ||
-          f.dataType == DataType.map,
+      (field) =>
+          field.dataType == DataType.list ||
+          field.dataType == DataType.struct ||
+          field.dataType == DataType.map,
     );
     if (!nested) {
-      final leaves = parquetSchema.where((e) => e.type != null).toList();
+      final leaves = parquetSchema
+          .where((element) => element.type != null)
+          .toList();
       for (int i = 0; i < leaves.length; i++) {
-        final required = columns != null && i < columns.length
-            ? !columns[i].hasNulls
-            : !(i < schema.fields.length && schema.fields[i].nullable);
-        leaves[i].repetitionType = required
-            ? thrift.FieldRepetitionType.required
-            : thrift.FieldRepetitionType.optional;
+        final nullable =
+            (i < schema.fields.length && schema.fields[i].nullable) ||
+            (columns != null && i < columns.length && columns[i].hasNulls);
+        leaves[i].repetitionType = nullable
+            ? thrift.FieldRepetitionType.optional
+            : thrift.FieldRepetitionType.required;
       }
     }
 
     _temp = '$filePath.${ids.token()}.tmp';
-    _fileWriter = FileWriter(_temp);
+    _writer = FileWriter(_temp);
     try {
-      await _fileWriter.open();
+      await _writer.open();
       _fileOpen =
-          true; // fd held — abort() must close it even if a later step throws
-      await _fileWriter.writeMagic();
+          true; // fd held: abort() must close it even if a later step throws
+      await _writer.writeMagic();
 
       _schema = parquetSchema;
       _coreSchema = schema;
-      _colNames = schema.fields.map((f) => f.name).toList();
-      _buffer = {for (final n in _colNames) n: <Column>[]};
+      _names = schema.fields.map((field) => field.name).toList();
+      _buffer = {for (final name in _names) name: <Column>[]};
       _open = true;
     } catch (_) {
       // A failure once the fd is acquired (writeMagic, etc.) must self-clean for
-      // a caller using the streaming API who invoked open() directly —
+      // a caller using the streaming API who invoked open() directly:
       // write()/writeBatches() wrap their own bodies, but a manual open() has no
-      // outer guard. abort() is idempotent and gated on _fileOpen.
+      // outer guard. abort() is idempotent and conditional on _fileOpen.
       await abort();
       rethrow;
     }
   }
 
   /// Append a batch to a streaming write, flushing full row groups as they fill.
-  Future<void> writeBatch(Table table) async {
-    if (!_open) await open(table.schema);
+  /// A failure ([Kind.schema] for a batch whose schema differs from the
+  /// writer's, otherwise as [write]) abandons the write, so no partial file is
+  /// left.
+  @useResult
+  Future<Result<void, ErrorDetails>> writeBatch(Table table) {
+    _require();
+    return capture(() async {
+      try {
+        await _writeBatch(table);
+      } catch (_) {
+        await abort();
+        rethrow;
+      }
+    });
+  }
+
+  Future<void> _writeBatch(Table table) async {
+    if (!_open) await _begin(table.schema);
     // Reject schema drift BEFORE mutating the buffer. Encoding is positional
-    // against the FROZEN physical schema, so the type must match EXACTLY —
+    // against the FROZEN physical schema, so the type must match EXACTLY:
     // `isCompatibleWith` permits int32→int64 widening, which would encode int64
     // values under an int32 column and SILENTLY TRUNCATE them (1<<40 → 0).
     if (!_coreSchema!.encodesAs(table.schema)) {
-      throw ArgumentError(
+      throw Failure.of(
+        Kind.schema,
         'Batch schema does not match the Parquet writer schema; every batch '
         'must have the same columns in the same order and EXACT type (a wider '
-        'batch is not narrowed — declare the wider type when opening the writer)',
+        'batch is not narrowed: declare the wider type when opening the writer)',
       );
     }
     for (final column in table.columns) {
       // Accrue the column REF (zero-copy); values are materialized only at flush.
       _buffer![column.name]!.add(column);
     }
-    _bufferRows += table.rowCount;
-    while (_bufferRows >= options.rowGroupSize) {
+    _buffered += table.rowCount;
+    while (_buffered >= options.rowGroupSize) {
       await _flushBuffer(options.rowGroupSize);
     }
   }
 
   /// Drain a stream of batches into one Parquet file and finalize it. A failure
-  /// aborts cleanly rather than leaving a corrupt file at [filePath].
-  Future<void> writeBatches(Stream<Table> batches) async {
+  /// aborts cleanly rather than leaving a corrupt file at [filePath], and is
+  /// reported as [writeBatch] reports it.
+  @useResult
+  Future<Result<void, ErrorDetails>> writeBatches(Stream<Table> batches) {
+    _require();
+    return capture(() => _writeBatches(batches));
+  }
+
+  Future<void> _writeBatches(Stream<Table> batches) async {
     try {
       await for (final batch in batches) {
-        await writeBatch(batch);
+        await _writeBatch(batch);
       }
-      await close();
+      await _close();
     } catch (_) {
       await abort();
       rethrow;
@@ -205,14 +258,18 @@ class ParquetWriter {
   }
 
   /// Finish a streaming write: flush the remainder, write the footer, close, then
-  /// atomically rename the temp file onto [filePath].
-  Future<void> close() async {
+  /// atomically rename the temp file onto [filePath]. A failure leaves no
+  /// partial file and is reported as [write] reports it.
+  @useResult
+  Future<Result<void, ErrorDetails>> close() => capture(_close);
+
+  Future<void> _close() async {
     if (!_open) return;
     try {
-      if (_bufferRows > 0) await _flushBuffer(_bufferRows);
+      if (_buffered > 0) await _flushBuffer(_buffered);
       final metadata = _createMetadata(_schema!);
-      await MetadataWriter(_fileWriter).writeMetadata(metadata);
-      await _fileWriter.close();
+      await MetadataWriter(_writer).writeMetadata(metadata);
+      await _writer.close();
       // The clears run only AFTER the rename succeeds: if replaceAtomic throws,
       // _fileOpen stays true so the catch below (abort) still deletes the temp.
       await replaceAtomic(File(_temp), filePath);
@@ -222,15 +279,15 @@ class ParquetWriter {
     } catch (_) {
       // SELF-CLEAN on any finalize failure (footer / fd close / rename): a caller
       // that doesn't wrap close() in its own abort() still can't leak the temp or
-      // fd. abort() is idempotent (gated on _fileOpen, still true here).
+      // fd. abort() is idempotent (conditional on _fileOpen, still true here).
       await abort();
       rethrow;
     }
   }
 
   /// Abandon an in-progress write: close the handle (best effort) and delete the
-  /// temp file so no partial output survives at [filePath]. Gated on the file
-  /// handle (not [_open]) so a failure during open() — before _open is set — is
+  /// temp file so no partial output survives at [filePath]. Conditional on the file
+  /// handle (not [_open]) so a failure during open() (before _open is set) is
   /// still cleaned up.
   Future<void> abort() async {
     if (!_fileOpen) return;
@@ -238,7 +295,7 @@ class ParquetWriter {
     _fileOpen = false;
     _buffer = null;
     try {
-      await _fileWriter.close();
+      await _writer.close();
     } catch (_) {
       /* already closing/closed */
     }
@@ -246,38 +303,40 @@ class ParquetWriter {
     if (await temp.exists()) await temp.delete();
   }
 
-  Future<void> _flushBuffer(int n) async {
-    // Consume the first n accrued rows by slicing only the head pieces and
-    // advancing a shared cursor — the untouched tail is never re-copied (avoids
+  Future<void> _flushBuffer(int count) async {
+    // Consume the first [count] accrued rows by slicing only the head pieces and
+    // advancing a shared cursor: the untouched tail is never re-copied (avoids
     // the O(n^2) re-materialization of a big multi-row-group batch). All columns
     // share piece boundaries (batches are appended atomically), so one cursor
     // drives every name.
-    final dt = {for (final f in _coreSchema!.fields) f.name: f.dataType};
+    final types = {
+      for (final field in _coreSchema!.fields) field.name: field.dataType,
+    };
     bool fast(String name) {
       final pieces = _buffer![name]!;
       return pieces.isNotEmpty &&
-          pieces.first is NumericColumn &&
-          _isPlainNumeric(dt[name]!);
+          pieces.first is NumericVector &&
+          _isPlainNumeric(types[name]!);
     }
 
     // Fast (numeric) columns accrue their typed slices for one zero-boxing
     // concat; the rest are boxed exactly as before.
     final slices = <String, List<Column>>{
-      for (final name in _colNames)
+      for (final name in _names)
         if (fast(name)) name: <Column>[],
     };
     final data = <String, List<dynamic>>{
-      for (final name in _colNames)
+      for (final name in _names)
         if (!fast(name)) name: <dynamic>[],
     };
-    var need = n;
-    final lead = _colNames.first;
+    var need = count;
+    final lead = _names.first;
     while (need > 0) {
       final piece = _buffer![lead]!.first;
       final take = (piece.length - _head).clamp(0, need);
       final end = _head + take;
       if (take > 0) {
-        for (final name in _colNames) {
+        for (final name in _names) {
           final slice = _buffer![name]!.first.slice(_head, end);
           if (slices.containsKey(name)) {
             slices[name]!.add(slice);
@@ -289,7 +348,7 @@ class ParquetWriter {
       }
       if (end >= piece.length) {
         // Head piece fully consumed: drop it from every column, reset the cursor.
-        for (final name in _colNames) {
+        for (final name in _names) {
           _buffer![name]!.removeAt(0);
         }
         _head = 0;
@@ -297,33 +356,33 @@ class ParquetWriter {
         _head = end;
       }
     }
-    final typed = <String, NumericColumn>{
-      for (final e in slices.entries)
-        e.key: Column.concat(e.value) as NumericColumn,
+    final typed = <String, NumericVector>{
+      for (final entry in slices.entries)
+        entry.key: Column.concat(entry.value) as NumericVector,
     };
-    await _writeRowGroup(data, n, typed: typed);
-    _bufferRows -= n;
+    await _writeRowGroup(data, count, typed: typed);
+    _buffered -= count;
   }
 
   Future<void> _writeRowGroup(
     Map<String, List<dynamic>> data,
-    int numRows, {
-    Map<String, NumericColumn> typed = const {},
+    int rows, {
+    Map<String, NumericVector> typed = const {},
   }) async {
     final rowGroup = await RowGroupWriter(
-      _fileWriter,
+      _writer,
       _schema!,
       options,
       coreFields: _coreSchema?.fields,
-    ).write(_physicalize(data), numRows, typed: typed);
+    ).write(_physicalize(data), rows, typed: typed);
     _rowGroups.add(rowGroup);
-    _totalRows += numRows;
+    _rows += rows;
   }
 
   /// Names of flat numeric fields eligible for the typed (no-boxing) write path.
   Set<String> _fastNames(Schema schema) => {
-    for (final f in schema.fields)
-      if (_isPlainNumeric(f.dataType)) f.name,
+    for (final field in schema.fields)
+      if (_isPlainNumeric(field.dataType)) field.name,
   };
 
   /// Whether [type] maps directly to a Parquet physical int/float with no
@@ -353,7 +412,7 @@ class ParquetWriter {
           type == DataType.decimal) {
         final precision = field.precision ?? 38;
         out[field.name] = [
-          for (final v in values) toPhysicalValue(type, precision, v),
+          for (final value in values) toPhysicalValue(type, precision, value),
         ];
       } else {
         out[field.name] = values;
@@ -362,7 +421,7 @@ class ParquetWriter {
     return out;
   }
 
-  /// Box one row group's worth of a column's values ([start, end)) — caps peak
+  /// Box one row group's worth of a column's values ([start, end)): caps peak
   /// memory at a row group instead of the whole column.
   List<dynamic> _sliceColumn(Column column, int start, int end) => [
     for (int i = start; i < end; i++) column[i],
@@ -373,8 +432,15 @@ class ParquetWriter {
     final metadata = thrift.FileMetaData();
     metadata.version = options.version;
     metadata.schema = schema;
-    metadata.numRows = _totalRows;
+    metadata.numRows = _rows;
     metadata.rowGroups = _rowGroups;
+    // Every leaf's min_value and max_value follow its type's defined order:
+    // signed integers, floats without NaN, unsigned bytes for byte arrays.
+    metadata.columnOrders = [
+      for (final element in schema.skip(1))
+        if ((element.numChildren ?? 0) == 0)
+          thrift.ColumnOrder()..typeOrder = thrift.TypeDefinedOrder(),
+    ];
 
     // Add key-value metadata
     metadata.keyValueMetadata = [
@@ -396,11 +462,8 @@ class ParquetWriter {
   }
 }
 
-// Secure entropy so concurrent writers (isolates/pods) can't collide on temp
-// paths via identical clock seeds.
-
 /// Options for writing Parquet files
-class ParquetWriterOptions {
+final class ParquetWriterOptions {
   /// Parquet file version (1 or 2)
   final int version;
 
@@ -408,7 +471,7 @@ class ParquetWriterOptions {
   final int rowGroupSize;
 
   /// Compression codec to use
-  final thrift.CompressionCodec compression;
+  final ParquetCompression compression;
 
   /// Whether to write statistics
   final bool writeStatistics;
@@ -429,7 +492,7 @@ class ParquetWriterOptions {
   const ParquetWriterOptions({
     this.version = 1,
     this.rowGroupSize = 100000,
-    this.compression = thrift.CompressionCodec.snappy,
+    this.compression = ParquetCompression.snappy,
     this.writeStatistics = true,
     this.writeChecksums = true,
     this.createdBy,

@@ -1,6 +1,6 @@
 # Makefile for BigData SQL CLI
 
-.PHONY: help build build-debug install uninstall clean test run-example
+.PHONY: help build build-debug install uninstall clean test interop run-example
 
 # Default target
 help:
@@ -14,6 +14,7 @@ help:
 	@echo "  make uninstall      - Remove from /usr/local/bin"
 	@echo "  make clean          - Clean build artifacts"
 	@echo "  make test           - Run tests"
+	@echo "  make interop        - Run the cross-engine interop tests (see tool/interop/README.md)"
 	@echo "  make run-example    - Run example queries"
 	@echo ""
 
@@ -74,6 +75,16 @@ clean:
 test:
 	@echo "Running tests..."
 	@dart test
+
+# Run the interop suite against Spark, DuckDB, delta-rs and pyiceberg. The
+# tests generate their own fixtures (tool/interop/gen_external.py and
+# write_samples.dart); this checks the engines are installed first.
+interop:
+	@command -v python3 >/dev/null 2>&1 || { \
+		echo "make interop: python3 is not on PATH. See tool/interop/README.md."; \
+		exit 1; }
+	@python3 tool/interop/check.py
+	@dart test -t interop --run-skipped
 
 # Run example queries
 run-example: build

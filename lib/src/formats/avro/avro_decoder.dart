@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import '../../core/conversions.dart';
 import '../../core/limits.dart';
+import '../../util/varint.dart';
 
 /// Avro schema model (subset sufficient for Iceberg manifests) parsed from the
 /// writer's JSON schema, plus a binary decoder. Named types (records/enums/fixed)
@@ -69,21 +70,23 @@ class AvroSchema {
 
   AvroSchema._(this.root, this.named);
 
-  /// Per-record logical-value budget: an array of `null` costs ~0 payload bytes
-  /// per element, so a tiny block count can otherwise declare billions of items
-  /// and pass the compressed/decompressed byte guards. Charged BEFORE expansion.
-  static const _maxValuesPerRecord = defaultMaxMaterializedRows;
+  /// Logical-value budget for everything this schema decodes (one schema is
+  /// parsed per file): an array of `null` costs ~0 payload bytes per element,
+  /// so a tiny block count can otherwise declare billions of items and pass the
+  /// compressed/decompressed byte guards. Charged BEFORE expansion, and never
+  /// reset, so many small records cannot add up past it.
+  static const _maxValues = defaultMaxMaterializedRows;
 
   /// Collection-nesting depth cap (array-of-array…), defence against a
   /// pathological schema driving unbounded recursion.
   static const _maxDepth = 100;
 
-  int _valuesLeft = 0;
+  int _remaining = _maxValues;
   int _depth = 0;
 
   factory AvroSchema.parse(String json) {
     final named = <String, AvroType>{};
-    final root = _parse(jsonDecode(json), named, null);
+    final root = _parse(jsonDecode(json), named, null, 0);
     return AvroSchema._(root, named);
   }
 
@@ -91,7 +94,13 @@ class AvroSchema {
     dynamic json,
     Map<String, AvroType> named,
     String? namespace,
+    int depth,
   ) {
+    if (depth > defaultMaxSchemaDepth) {
+      throw const FormatException(
+        'Avro schema nesting exceeds depth $defaultMaxSchemaDepth',
+      );
+    }
     if (json is String) {
       const primitives = {
         'null',
@@ -104,57 +113,112 @@ class AvroSchema {
         'string',
       };
       if (primitives.contains(json)) return AvroPrimitive(json);
-      return AvroRef(json); // named-type reference
+      // A named-type reference: a short name resolves in the enclosing
+      // namespace first, then as written.
+      final full = _full(json, namespace);
+      return AvroRef(named.containsKey(full) ? full : json);
     }
     if (json is List) {
-      return AvroUnion([for (final b in json) _parse(b, named, namespace)]);
+      return AvroUnion([
+        for (final branch in json) _parse(branch, named, namespace, depth + 1),
+      ]);
     }
-    final map = json as Map<String, dynamic>;
+    if (json is! Map<String, dynamic>) {
+      throw FormatException('Avro schema: unexpected ${json.runtimeType}');
+    }
+    final map = json;
     final type = map['type'];
-    final ns = (map['namespace'] as String?) ?? namespace;
+    final space = _field<String?>(map, 'namespace') ?? namespace;
     switch (type) {
       case 'record':
-        final name = map['name'] as String;
+        // Named types are registered by FULL name: two records called `Item`
+        // in different namespaces are different types, and the short name
+        // let the second replace the first.
+        final name = _full(_field<String>(map, 'name'), space);
         final record = AvroRecord(name);
         named[name] = record;
-        if (ns != null) named['$ns.$name'] = record;
-        for (final f in (map['fields'] as List).cast<Map<String, dynamic>>()) {
+        // A record's fields live in the namespace of its full name.
+        final inner = name.contains('.')
+            ? name.substring(0, name.lastIndexOf('.'))
+            : null;
+        for (final field in _field<List>(map, 'fields')) {
+          if (field is! Map<String, dynamic>) {
+            throw FormatException('Avro schema: field ${field.runtimeType}');
+          }
           record.fields.add(
-            AvroField(f['name'] as String, _parse(f['type'], named, ns)),
+            AvroField(
+              _field<String>(field, 'name'),
+              _parse(field['type'], named, inner, depth + 1),
+            ),
           );
         }
         return record;
       case 'array':
-        return AvroArray(_parse(map['items'], named, ns));
+        return AvroArray(_parse(map['items'], named, space, depth + 1));
       case 'map':
-        return AvroMap(_parse(map['values'], named, ns));
+        return AvroMap(_parse(map['values'], named, space, depth + 1));
       case 'enum':
-        final e = AvroEnum((map['symbols'] as List).cast<String>());
-        named[map['name'] as String] = e;
-        return e;
+        final enumeration = AvroEnum([
+          for (final symbol in _field<List>(map, 'symbols'))
+            symbol is String
+                ? symbol
+                : throw FormatException('Avro schema: enum symbol $symbol'),
+        ]);
+        named[_full(_field<String>(map, 'name'), space)] = enumeration;
+        return enumeration;
       case 'fixed':
-        final fx = AvroFixed(
-          map['size'] as int,
-          logicalType: map['logicalType'] as String?,
-          precision: map['precision'] as int?,
-          scale: map['scale'] as int?,
+        final fixed = AvroFixed(
+          _field<int>(map, 'size'),
+          logicalType: _field<String?>(map, 'logicalType'),
+          precision: _precision(map),
+          scale: _field<int?>(map, 'scale'),
         );
-        named[map['name'] as String] = fx;
-        return fx;
+        named[_full(_field<String>(map, 'name'), space)] = fixed;
+        return fixed;
       default:
-        // {"type":"long","logicalType":"timestamp-micros"} etc. — keep the
+        // {"type":"long","logicalType":"timestamp-micros"} etc.: keep the
         // logical type so [_decode] can convert (date/timestamp/decimal/uuid).
-        final logical = map['logicalType'] as String?;
+        final logical = _field<String?>(map, 'logicalType');
         if (logical != null && type is String) {
           return AvroPrimitive(
             type,
             logicalType: logical,
-            precision: map['precision'] as int?,
-            scale: map['scale'] as int?,
+            precision: _precision(map),
+            scale: _field<int?>(map, 'scale'),
           );
         }
-        return _parse(type, named, ns);
+        return _parse(type, named, space, depth + 1);
     }
+  }
+
+  /// The full name of a named type called [name] in [namespace]: a dotted
+  /// name is already full.
+  static String _full(String name, String? namespace) =>
+      name.contains('.') || namespace == null || namespace.isEmpty
+      ? name
+      : '$namespace.$name';
+
+  /// A decimal's precision, checked with its scale: both come from the file.
+  /// Null for any other logical type.
+  static int? _precision(Map<String, dynamic> map) {
+    final precision = _field<int?>(map, 'precision');
+    if (_field<String?>(map, 'logicalType') != 'decimal') return precision;
+    return checkedDecimal(
+      precision ?? 0,
+      _field<int?>(map, 'scale') ?? 0,
+    ).precision;
+  }
+
+  /// [map]'s [key] as a [T], or a [FormatException] naming the key: the
+  /// schema JSON comes from the file, so its shape is not guaranteed.
+  static T _field<T>(Map<String, dynamic> map, String key) {
+    final value = map[key];
+    if (value is! T) {
+      throw FormatException(
+        'Avro schema: "$key" is ${value.runtimeType}, expected $T',
+      );
+    }
+    return value;
   }
 
   /// Apply a SCALAR Avro logical type to a freshly-decoded primitive value.
@@ -183,11 +247,9 @@ class AvroSchema {
   }
 
   /// Decode one top-level value (typically a record → `Map<String,dynamic>`).
-  /// Resets the per-record value/depth budgets so intra-record collection
-  /// amplification is bounded (the outer `maxRecords` guard only fires AFTER a
-  /// whole record decodes).
+  /// Resets the depth only; the value budget carries across records, since the
+  /// outer `maxRecords` guard only fires AFTER a whole record decodes.
   Object? decode(AvroReader reader) {
-    _valuesLeft = _maxValuesPerRecord;
     _depth = 0;
     return _decode(root, reader);
   }
@@ -196,58 +258,61 @@ class AvroSchema {
   /// unions, and named-type refs recurse through here, so a self-referential
   /// schema (record → union[null, ref-to-self]) is bounded by [_maxDepth]
   /// instead of stack-overflowing the isolate.
-  Object? _decode(AvroType type, AvroReader r) {
+  Object? _decode(AvroType type, AvroReader reader) {
     if (++_depth > _maxDepth) {
       throw FormatException('Avro decoding nesting exceeds depth $_maxDepth');
     }
     try {
-      return _decodeInner(type, r);
+      return _decodeInner(type, reader);
     } finally {
       _depth--;
     }
   }
 
-  Object? _decodeInner(AvroType type, AvroReader r) {
+  Object? _decodeInner(AvroType type, AvroReader reader) {
     switch (type) {
-      case final AvroPrimitive p:
-        final raw = switch (p.name) {
+      case final AvroPrimitive primitive:
+        final raw = switch (primitive.name) {
           'null' => null,
-          'boolean' => r.readBoolean(),
-          'int' || 'long' => r.readLong(),
-          'float' => r.readFloat(),
-          'double' => r.readDouble(),
-          'bytes' => r.readBytes(),
-          _ => r.readString(),
+          'boolean' => reader.readBoolean(),
+          'int' || 'long' => reader.readLong(),
+          'float' => reader.readFloat(),
+          'double' => reader.readDouble(),
+          'bytes' => reader.readBytes(),
+          _ => reader.readString(),
         };
-        return _logical(raw, p.logicalType);
-      case final AvroRecord rec:
-        return {for (final f in rec.fields) f.name: _decode(f.type, r)};
-      case final AvroUnion u:
-        final i = r.readLong();
-        if (i < 0 || i >= u.branches.length) {
-          throw FormatException('Avro union branch index $i out of range');
+        return _logical(raw, primitive.logicalType);
+      case final AvroRecord record:
+        return {
+          for (final field in record.fields)
+            field.name: _decode(field.type, reader),
+        };
+      case final AvroUnion union:
+        final index = reader.readLong();
+        if (index < 0 || index >= union.branches.length) {
+          throw FormatException('Avro union branch index $index out of range');
         }
-        return _decode(u.branches[i], r);
-      case final AvroArray a:
-        return _decodeBlocks(r, () => _decode(a.items, r));
-      case final AvroMap m:
+        return _decode(union.branches[index], reader);
+      case final AvroArray array:
+        return _decodeBlocks(reader, () => _decode(array.items, reader));
+      case final AvroMap map:
         final out = <String, Object?>{};
-        _decodeBlocks(r, () {
-          final k = r.readString();
-          out[k] = _decode(m.values, r);
+        _decodeBlocks(reader, () {
+          final key = reader.readString();
+          out[key] = _decode(map.values, reader);
           return null;
         });
         return out;
-      case final AvroEnum e:
-        final i = r.readLong();
-        if (i < 0 || i >= e.symbols.length) {
-          throw FormatException('Avro enum symbol index $i out of range');
+      case final AvroEnum enumeration:
+        final index = reader.readLong();
+        if (index < 0 || index >= enumeration.symbols.length) {
+          throw FormatException('Avro enum symbol index $index out of range');
         }
-        return e.symbols[i];
-      case final AvroFixed fx:
-        final bytes = r.readFixed(fx.size);
+        return enumeration.symbols[index];
+      case final AvroFixed fixed:
+        final bytes = reader.readFixed(fixed.size);
         // decimal-as-fixed → unscaled BigInt (big-endian two's-complement).
-        if (fx.logicalType == 'decimal') {
+        if (fixed.logicalType == 'decimal') {
           return bytesToBigInt(bytes, littleEndian: false);
         }
         return bytes;
@@ -256,33 +321,33 @@ class AvroSchema {
         if (resolved == null) {
           throw FormatException('unknown Avro type ${ref.name}');
         }
-        return _decode(resolved, r);
+        return _decode(resolved, reader);
     }
   }
 
   /// Decode array/map blocks: repeated [count][items...] until a 0 count. A
   /// negative count is followed by a byte-size (skipped) then |count| items.
-  List<Object?> _decodeBlocks(AvroReader r, Object? Function() item) {
+  List<Object?> _decodeBlocks(AvroReader reader, Object? Function() item) {
     // Depth is charged at _decode's entry (arrays/maps call _decode on each
     // item), so no separate collection-depth guard is needed here.
     final out = <Object?>[];
     while (true) {
-      var count = r.readLong();
+      var count = reader.readLong();
       if (count == 0) break;
       if (count < 0) {
-        r.readLong(); // block byte size (unused)
+        reader.readLong(); // block byte size (unused)
         count = -count;
       }
-      // Charge the declared count against the per-record budget BEFORE expanding:
+      // Charge the declared count against the value budget BEFORE expanding:
       // a null-element array costs ~0 bytes/item, so `count` alone (not the byte
       // guards) is what must be bounded. `count < 0` catches the -(minInt) wrap.
-      if (count < 0 || count > _valuesLeft) {
+      if (count < 0 || count > _remaining) {
         throw FormatException(
-          'Avro collection declares $count items, over the remaining per-record '
-          'value budget ($_valuesLeft)',
+          'Avro collection declares $count items, over the remaining '
+          'value budget ($_remaining)',
         );
       }
-      _valuesLeft -= count;
+      _remaining -= count;
       for (int i = 0; i < count; i++) {
         out.add(item());
       }
@@ -293,75 +358,63 @@ class AvroSchema {
 
 /// Binary cursor over Avro-encoded bytes.
 class AvroReader {
-  final Uint8List _b;
+  final Uint8List _bytes;
   final ByteData _view;
-  int _pos = 0;
+  int _position = 0;
 
-  AvroReader(this._b) : _view = ByteData.sublistView(_b);
+  AvroReader(this._bytes) : _view = ByteData.sublistView(_bytes);
 
-  bool get atEnd => _pos >= _b.length;
-  int get position => _pos;
+  bool get atEnd => _position >= _bytes.length;
+  int get position => _position;
 
   int _varint() {
-    int result = 0, shift = 0;
-    // A 64-bit varint is at most 10 bytes; cap the loop and bounds-check each
-    // read so truncated or all-high-bit input fails loud instead of running off
-    // the buffer (raw RangeError) or spinning forever (JS out-of-bounds → NaN).
-    for (int i = 0; i < 10; i++) {
-      if (_pos >= _b.length) {
-        throw const FormatException('Truncated Avro varint');
-      }
-      final b = _b[_pos++];
-      result |= (b & 0x7f) << shift;
-      if ((b & 0x80) == 0) return result;
-      shift += 7;
-    }
-    throw const FormatException('Avro varint exceeds 64 bits');
+    final (:value, :next) = readVarint(_bytes, _position, label: 'Avro');
+    _position = next;
+    return value;
   }
 
   int readLong() {
-    final n = _varint();
-    return (n >>> 1) ^ -(n & 1); // zigzag decode
+    return unzigzag(_varint());
   }
 
   bool readBoolean() {
     _need(1);
-    return _b[_pos++] != 0;
+    return _bytes[_position++] != 0;
   }
 
   double readFloat() {
     _need(4);
-    final v = _view.getFloat32(_pos, Endian.little);
-    _pos += 4;
-    return v;
+    final value = _view.getFloat32(_position, Endian.little);
+    _position += 4;
+    return value;
   }
 
   double readDouble() {
     _need(8);
-    final v = _view.getFloat64(_pos, Endian.little);
-    _pos += 8;
-    return v;
+    final value = _view.getFloat64(_position, Endian.little);
+    _position += 8;
+    return value;
   }
 
   Uint8List readBytes() {
     final length = readLong();
     _need(length);
-    final out = Uint8List.sublistView(_b, _pos, _pos + length);
-    _pos += length;
+    final out = Uint8List.sublistView(_bytes, _position, _position + length);
+    _position += length;
     return out;
   }
 
   Uint8List readFixed(int size) {
     _need(size);
-    final out = Uint8List.sublistView(_b, _pos, _pos + size);
-    _pos += size;
+    final out = Uint8List.sublistView(_bytes, _position, _position + size);
+    _position += size;
     return out;
   }
 
   // Fail loud (FormatException) on a truncated/over-long read instead of letting
   // sublistView throw a low-signal RangeError.
   void _need(int n) {
-    if (n < 0 || _pos + n > _b.length) {
+    if (n < 0 || _position + n > _bytes.length) {
       throw const FormatException('Truncated Avro data');
     }
   }

@@ -1,10 +1,14 @@
 import 'dart:typed_data';
 
 import 'package:libbigdata/libbigdata.dart';
+import 'package:libbigdata/src/core/column.dart' show NumericVector;
+
+import 'results.dart';
 
 /// Deterministic data synthesis for >1M-row profiling. Numeric columns are built
-/// straight into typed buffers and `NumericColumn.adopt`ed (zero-copy, no boxing);
-/// strings/bools use `ListColumn`. Shared by `sql_bench.dart` and `test/perf_test.dart`.
+/// straight into typed buffers and `NumericVector.adopt`ed (zero-copy, no boxing);
+/// strings use `StringColumn`, bools `ListColumn`. Shared by `sql_bench.dart` and
+/// `test/perf_test.dart`.
 
 /// Small reproducible xorshift32 PRNG (same family as `gen_data.dart`).
 class _Rng {
@@ -61,25 +65,20 @@ Table synthTable(
   return Table(
     name: name,
     columns: [
-      NumericColumn.adopt(name: 'id', dataType: DataType.int64, data: id),
-      NumericColumn.adopt(name: 'key', dataType: DataType.int64, data: key),
-      NumericColumn.adopt(
+      NumericVector.adopt(name: 'id', dataType: DataType.int64, data: id),
+      NumericVector.adopt(name: 'key', dataType: DataType.int64, data: key),
+      NumericVector.adopt(
         name: 'amount',
         dataType: DataType.float64,
         data: amount,
       ),
-      NumericColumn.adopt(
+      NumericVector.adopt(
         name: 'score',
         dataType: DataType.float64,
         data: score,
         nullBitmap: scoreNulls,
       ),
-      ListColumn<String>(
-        name: 'category',
-        dataType: DataType.string,
-        data: category,
-        nullable: false,
-      ),
+      StringColumn(name: 'category', values: category, nullable: false),
       ListColumn<bool>(
         name: 'flag',
         dataType: DataType.boolean,
@@ -111,13 +110,8 @@ Table synthDim(int rows, {int seed = 7, String name = 'dim'}) {
   return Table(
     name: name,
     columns: [
-      NumericColumn.adopt(name: 'key', dataType: DataType.int64, data: key),
-      ListColumn<String>(
-        name: 'label',
-        dataType: DataType.string,
-        data: label,
-        nullable: false,
-      ),
+      NumericVector.adopt(name: 'key', dataType: DataType.int64, data: key),
+      StringColumn(name: 'label', values: label, nullable: false),
     ],
     schema: Schema(
       fields: [
@@ -140,7 +134,7 @@ Future<void> synthParquet(
   await ParquetWriter(
     path,
     options: options ?? const ParquetWriterOptions(),
-  ).write(table);
+  ).write(table).ok;
 }
 
 /// Median of [values] (sorts a copy).

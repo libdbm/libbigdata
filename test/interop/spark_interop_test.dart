@@ -9,8 +9,8 @@ import 'package:test/test.dart';
 /// real external-engine round-trip compatibility. libbigdata
 /// writes sample files (tool/interop/write_samples.dart); Apache Spark reads the
 /// Parquet/CSV/JSON, delta-rs reads the Delta table, and pyiceberg reads the
-/// Iceberg table (tool/interop/validate_all.py). Gated behind the `interop` tag
-/// (needs a local python + spark/delta-rs/pyiceberg) — run with:
+/// Iceberg table (tool/interop/validate_all.py). Tagged `interop`
+/// (needs a local python + spark/delta-rs/pyiceberg): run with:
 ///   dart test -t interop --run-skipped
 /// Skips gracefully when those engines aren't installed.
 void main() {
@@ -89,6 +89,32 @@ void main() {
     ]);
   });
 
+  test('delta-rs reads Delta with struct, array and map columns', () {
+    final r = fmt('delta_nested');
+    expect(r['ok'], isTrue, reason: '${r['error']}');
+    final fields = {
+      for (final field in (r['schema']['fields'] as List).cast<Map>())
+        field['name']: field['type'],
+    };
+    expect(fields['tags'], containsPair('type', 'array'));
+    expect(fields['info'], containsPair('type', 'struct'));
+    expect(fields['props'], containsPair('type', 'map'));
+    expect(r['rows'], [
+      {
+        'id': 1,
+        'tags': [1, 2],
+        'info': {'a': 1, 'b': 'x'},
+        'props': {'k1': 1},
+      },
+      {
+        'id': 2,
+        'tags': [9],
+        'info': {'a': 2, 'b': 'y'},
+        'props': {'k2': 2},
+      },
+    ]);
+  });
+
   test('delta-rs reads partitioned Delta', () {
     final r = fmt('delta_partitioned');
     expect(r['ok'], isTrue, reason: '${r['error']}');
@@ -131,6 +157,15 @@ void main() {
     expect(r['ok'], isTrue, reason: '${r['error']}');
     expect(r['nsnapshots'], 1); // three appends expired down to one
     expect(r['rows'], 12); // ...but every row of all three still reads
+  });
+
+  test('pyiceberg reads the metadata log and snapshot lineage', () {
+    final r = fmt('iceberg_history');
+    expect(r['ok'], isTrue, reason: '${r['error']}');
+    expect(r['metadata_log'], 2); // the two metadata files before the current
+    expect(r['history'], 3);
+    expect(r['parents_linked'], isTrue);
+    expect(r['first_parent'], isNull);
   });
 
   // A null partition value must reach delta-rs as null, not as the literal text

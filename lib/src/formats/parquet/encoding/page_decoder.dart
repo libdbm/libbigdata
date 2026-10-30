@@ -45,7 +45,7 @@ class PageDecoder {
 
   final thrift.ParquetType type;
   final thrift.SchemaElement? schema;
-  DictionaryDecoder? dictDecoder;
+  DictionaryDecoder? dictionary;
 
   // Max levels and their bit widths - calculated from schema
   final int maxDef;
@@ -71,17 +71,38 @@ class PageDecoder {
        repLevelBitWidth = levelBitWidth(maxRepetitionLevel ?? 0);
 
   /// Reject a page whose declared value count is absurd before we size level or
-  /// value buffers from it — the count is an untrusted thrift header field.
-  void _guardNumValues(int n) {
-    if (n < 0 || n > maxPageValues) {
-      throw FormatException('Implausible Parquet page value count: $n');
+  /// value buffers from it: the count is an untrusted thrift header field.
+  void _guardNumValues(int count) {
+    if (count < 0 || count > maxPageValues) {
+      throw FormatException('Implausible Parquet page value count: $count');
     }
+  }
+
+  /// Definition levels of the current page, reused from page to page. Callers
+  /// copy the levels they keep, so one buffer serves the whole column.
+  Uint8List _levels = Uint8List(0);
+
+  /// Decode [count] definition levels from [data] into the reused buffer.
+  /// Returns a view of the levels the data held and how many reached [maxDef].
+  ({Uint8List levels, int present}) _definitions(Uint8List data, int count) {
+    if (_levels.length < count) _levels = Uint8List(count);
+    final (:decoded, :present) = RleBitpackedHybrid.decodeLevels(
+      data,
+      defLevelBitWidth,
+      count,
+      _levels,
+      maxDef,
+    );
+    return (
+      levels: Uint8List.sublistView(_levels, 0, decoded),
+      present: present,
+    );
   }
 
   /// Set dictionary from dictionary page
   void setDictionary(Uint8List data, int numValues) {
-    dictDecoder = DictionaryDecoder(type, schema: schema);
-    dictDecoder!.setDictionary(data, numValues);
+    dictionary = DictionaryDecoder(type, schema: schema);
+    dictionary!.setDictionary(data, numValues);
   }
 
   /// Decode a data page
@@ -106,10 +127,12 @@ class PageDecoder {
 
   /// Decode dictionary page
   DecodedPage decodeDictionary(thrift.PageHeader header, Uint8List data) {
-    final dictHeader = header.dictionaryPageHeader!;
+    final dictionaryHeader =
+        header.dictionaryPageHeader ??
+        (throw const FormatException('Dictionary page without its header'));
 
     // Store dictionary for later use
-    setDictionary(data, dictHeader.numValues);
+    setDictionary(data, dictionaryHeader.numValues);
 
     return DecodedPage(
       values: [],
@@ -126,12 +149,14 @@ class PageDecoder {
   /// Parse the v1 page body: repetition/definition levels (each length-prefixed)
   /// then the (still-encoded) value bytes, without decoding the values.
   PageBody _parseV1(thrift.PageHeader header, Uint8List data) {
-    final dataHeader = header.dataPageHeader!;
+    final dataHeader =
+        header.dataPageHeader ??
+        (throw const FormatException('Data page without its header'));
     _guardNumValues(dataHeader.numValues);
     int offset = 0;
 
     // A level section this decoder cannot read must NOT be skipped: `offset`
-    // would stay put and the level bytes would be decoded as VALUES — the same
+    // would stay put and the level bytes would be decoded as VALUES: the same
     // fabricated-data failure as writing levels the reader never reads. Only RLE
     // is supported; BIT_PACKED levels (deprecated, pre-1.0 parquet-mr) are
     // rejected rather than silently mis-decoded.
@@ -149,60 +174,77 @@ class PageDecoder {
     List<int>? repLevels;
     if (repLevelBitWidth > 0 &&
         dataHeader.repetitionLevelEncoding == thrift.Encoding.rle) {
-      final view = ByteData.view(data.buffer, data.offsetInBytes);
-      final repLength = view.getInt32(offset, Endian.little);
-      offset += 4;
-      if (repLength < 0 || offset + repLength > data.length) {
+      if (offset + 4 > data.length) {
         throw FormatException(
-          'Corrupt page: repetition-level length $repLength exceeds the page '
+          'Corrupt page: no room for the repetition-level length '
           '(${data.length - offset} bytes left)',
         );
       }
-      if (repLength > 0) {
-        final repData = Uint8List.sublistView(data, offset, offset + repLength);
+      final view = ByteData.view(data.buffer, data.offsetInBytes);
+      final length = view.getInt32(offset, Endian.little);
+      offset += 4;
+      if (length < 0 || offset + length > data.length) {
+        throw FormatException(
+          'Corrupt page: repetition-level length $length exceeds the page '
+          '(${data.length - offset} bytes left)',
+        );
+      }
+      if (length > 0) {
+        final bytes = Uint8List.sublistView(data, offset, offset + length);
         repLevels = RleBitpackedHybrid.decode(
-          repData,
+          bytes,
           repLevelBitWidth,
           hasLength: false,
           maxValues: dataHeader.numValues,
         );
-        offset += repLength;
+        offset += length;
       }
     }
 
     List<int>? defLevels;
+    // A leaf value is present only when the definition level reaches its max.
+    int present = dataHeader.numValues;
     if (defLevelBitWidth > 0 &&
         dataHeader.definitionLevelEncoding == thrift.Encoding.rle) {
-      final view = ByteData.view(data.buffer, data.offsetInBytes);
-      final defLength = view.getInt32(offset, Endian.little);
-      offset += 4;
-      if (defLength < 0 || offset + defLength > data.length) {
+      if (offset + 4 > data.length) {
         throw FormatException(
-          'Corrupt page: definition-level length $defLength exceeds the page '
+          'Corrupt page: no room for the definition-level length '
           '(${data.length - offset} bytes left)',
         );
       }
-      if (defLength > 0) {
-        final defData = Uint8List.sublistView(data, offset, offset + defLength);
-        defLevels = RleBitpackedHybrid.decode(
-          defData,
-          defLevelBitWidth,
-          hasLength: false,
-          maxValues: dataHeader.numValues,
+      final view = ByteData.view(data.buffer, data.offsetInBytes);
+      final length = view.getInt32(offset, Endian.little);
+      offset += 4;
+      if (length < 0 || offset + length > data.length) {
+        throw FormatException(
+          'Corrupt page: definition-level length $length exceeds the page '
+          '(${data.length - offset} bytes left)',
         );
-        offset += defLength;
+      }
+      if (length > 0) {
+        final bytes = Uint8List.sublistView(data, offset, offset + length);
+        if (defLevelBitWidth <= 8) {
+          final decoded = _definitions(bytes, dataHeader.numValues);
+          defLevels = decoded.levels;
+          present = decoded.present;
+        } else {
+          defLevels = clamp(
+            RleBitpackedHybrid.decode(
+              bytes,
+              defLevelBitWidth,
+              hasLength: false,
+              maxValues: dataHeader.numValues,
+            ),
+            dataHeader.numValues,
+          );
+          present = defLevels!.where((level) => level == maxDef).length;
+        }
+        offset += length;
       }
     }
 
     // The RLE/bit-packed decoder rounds up to whole groups, so trim padding.
     repLevels = clamp(repLevels, dataHeader.numValues);
-    defLevels = clamp(defLevels, dataHeader.numValues);
-
-    // A leaf value is present only when the definition level reaches its max.
-    int present = dataHeader.numValues;
-    if (defLevels != null) {
-      present = defLevels.where((level) => level == maxDef).length;
-    }
 
     return PageBody(
       defLevels: defLevels,
@@ -215,15 +257,15 @@ class PageDecoder {
   }
 
   /// Boxed finish shared by v1/v2: decode values, reconstruct nulls, pad.
-  DecodedPage _finishBoxed(PageBody b) {
-    final actualValues = decodeValues(b.valueData, b.present, b.encoding);
-    final values = reconstruct(actualValues, b.defLevels);
-    if (tolerant) pad(values, b.numValues);
+  DecodedPage _finishBoxed(PageBody body) {
+    final decoded = decodeValues(body.valueData, body.present, body.encoding);
+    final values = reconstruct(decoded, body.defLevels);
+    if (tolerant) pad(values, body.numValues);
     return DecodedPage(
       values: values,
-      defLevels: b.defLevels,
-      repLevels: b.repLevels,
-      numValues: b.numValues,
+      defLevels: body.defLevels,
+      repLevels: body.repLevels,
+      numValues: body.numValues,
     );
   }
 
@@ -252,7 +294,7 @@ class PageDecoder {
     for (final level in defLevels) {
       if (level == maxDef) {
         // A corrupt page whose definition levels claim more present values than
-        // the page body actually decoded — fail with a domain error, not a raw
+        // the page body actually decoded: fail with a domain error, not a raw
         // RangeError (which reads as an internal VM bug).
         if (index >= present.length) {
           throw FormatException(
@@ -276,8 +318,27 @@ class PageDecoder {
   /// Parse the v2 page body: repetition/definition levels (byte-length framed,
   /// no 4-byte prefix) then the value bytes, without decoding the values.
   PageBody _parseV2(thrift.PageHeader header, Uint8List data) {
-    final dataHeader = header.dataPageHeaderV2!;
+    final dataHeader =
+        header.dataPageHeaderV2 ??
+        (throw const FormatException('V2 data page without its header'));
     _guardNumValues(dataHeader.numValues);
+    // Header fields are untrusted: a negative null count would inflate the
+    // present count into a multi-gigabyte value buffer.
+    if (dataHeader.numNulls < 0 ||
+        dataHeader.numNulls > dataHeader.numValues ||
+        dataHeader.repetitionLevelsByteLength < 0 ||
+        dataHeader.definitionLevelsByteLength < 0 ||
+        // Nulls with no definition levels: nothing says which values are
+        // missing, and the typed paths would read their slots as zeros.
+        (dataHeader.numNulls > 0 &&
+            dataHeader.definitionLevelsByteLength == 0)) {
+      throw FormatException(
+        'Corrupt V2 page: ${dataHeader.numNulls} nulls of '
+        '${dataHeader.numValues} values, level lengths '
+        '${dataHeader.repetitionLevelsByteLength}/'
+        '${dataHeader.definitionLevelsByteLength}',
+      );
+    }
     int offset = 0;
 
     List<int>? repLevels;
@@ -292,14 +353,14 @@ class PageDecoder {
           '(${data.length - offset} bytes left)',
         );
       }
-      final repData = Uint8List.sublistView(
+      final bytes = Uint8List.sublistView(
         data,
         offset,
         offset + dataHeader.repetitionLevelsByteLength,
       );
       repLevels = repLevelBitWidth > 0
           ? RleBitpackedHybrid.decode(
-              repData,
+              bytes,
               repLevelBitWidth,
               hasLength: false,
               maxValues: dataHeader.numValues,
@@ -309,6 +370,9 @@ class PageDecoder {
     }
 
     List<int>? defLevels;
+    // Count present values from the levels, as V1 does, so the value count
+    // always agrees with the levels the reader scatters by.
+    var present = dataHeader.numValues - dataHeader.numNulls;
     if (dataHeader.definitionLevelsByteLength > 0) {
       if (offset + dataHeader.definitionLevelsByteLength > data.length) {
         throw FormatException(
@@ -317,36 +381,45 @@ class PageDecoder {
           '(${data.length - offset} bytes left)',
         );
       }
-      final defData = Uint8List.sublistView(
+      final bytes = Uint8List.sublistView(
         data,
         offset,
         offset + dataHeader.definitionLevelsByteLength,
       );
-      defLevels = defLevelBitWidth > 0
-          ? RleBitpackedHybrid.decode(
-              defData,
-              defLevelBitWidth,
-              hasLength: false,
-              maxValues: dataHeader.numValues,
-            )
-          : List.filled(dataHeader.numValues, 0);
+      if (defLevelBitWidth > 0 && defLevelBitWidth <= 8) {
+        final decoded = _definitions(bytes, dataHeader.numValues);
+        defLevels = decoded.levels;
+        present = decoded.present;
+      } else {
+        defLevels = clamp(
+          defLevelBitWidth > 0
+              ? RleBitpackedHybrid.decode(
+                  bytes,
+                  defLevelBitWidth,
+                  hasLength: false,
+                  maxValues: dataHeader.numValues,
+                )
+              : List.filled(dataHeader.numValues, 0),
+          dataHeader.numValues,
+        );
+        present = defLevels!.where((level) => level == maxDef).length;
+      }
       offset += dataHeader.definitionLevelsByteLength;
     }
 
     repLevels = clamp(repLevels, dataHeader.numValues);
-    defLevels = clamp(defLevels, dataHeader.numValues);
 
     return PageBody(
       defLevels: defLevels,
       repLevels: repLevels,
       valueData: Uint8List.sublistView(data, offset),
-      present: dataHeader.numValues - dataHeader.numNulls,
+      present: present,
       encoding: dataHeader.encoding,
       numValues: dataHeader.numValues,
     );
   }
 
-  /// Parse a data page body (v1 or v2) without decoding values — used by the
+  /// Parse a data page body (v1 or v2) without decoding values: used by the
   /// typed fast path. Not valid for dictionary/index pages.
   PageBody parseBody(thrift.PageHeader header, Uint8List data) {
     switch (header.type) {
@@ -365,50 +438,73 @@ class PageDecoder {
   void decodeValuesTyped(
     Uint8List valueData,
     int present,
-    thrift.Encoding enc,
+    thrift.Encoding encoding,
     List<num> out,
     int outStart,
   ) {
-    if (enc == thrift.Encoding.plainDictionary ||
-        enc == thrift.Encoding.rleDictionary) {
-      if (dictDecoder == null) {
+    if (type == thrift.ParquetType.boolean) {
+      _booleans(valueData, present, encoding, out as Uint8List, outStart);
+      return;
+    }
+    if (encoding == thrift.Encoding.plainDictionary ||
+        encoding == thrift.Encoding.rleDictionary) {
+      if (dictionary == null) {
         throw FormatException('Dictionary encoding without dictionary page');
       }
-      final indices = dictDecoder!.decodeIndices(valueData, present);
-      final dict = dictDecoder!.dictionary;
-      // Mirror the boxed path's validation: a corrupt index or a short index
-      // run must fail as a structured FormatException, not a raw RangeError.
-      if (indices.length < present) {
-        throw FormatException(
-          'Dictionary index run shorter than declared: '
-          '${indices.length} < $present',
-        );
-      }
-      for (int i = 0; i < present; i++) {
-        final index = indices[i];
-        if (index < 0 || index >= dict.length) {
-          throw FormatException('Dictionary index out of bounds: $index');
-        }
-        out[outStart + i] = dict[index] as num;
-      }
-      return;
-    }
-    if (enc == thrift.Encoding.deltaBinaryPacked) {
-      // Thread the width like the boxed path: an int32 delta chain must
-      // reconstruct with 32-bit wrapping, not 64-bit. Correctness happened to
-      // hold only because the sink is an Int32List that truncates — passing bits
-      // makes it independent of the storage container.
-      final list = DeltaBinaryPackedDecoder.decode(
+      if (_indices.length < present) _indices = Int32List(present);
+      final decoded = dictionary!.decodeIndicesInto(
         valueData,
         present,
-        bits: type == thrift.ParquetType.int32 ? 32 : 64,
+        _indices,
       );
+      // Mirror the boxed path's validation: a corrupt index or a short index
+      // run must fail as a structured FormatException, not a raw RangeError.
+      if (decoded < present) {
+        throw FormatException(
+          'Dictionary index run shorter than declared: $decoded < $present',
+        );
+      }
+      final typed = dictionary!.typed;
+      if (typed != null) {
+        _gather(_indices, present, typed, out, outStart);
+        return;
+      }
+      final boxed = dictionary!.dictionary;
       for (int i = 0; i < present; i++) {
-        out[outStart + i] = list[i];
+        final index = _indices[i];
+        if (index < 0 || index >= boxed.length) {
+          throw FormatException('Dictionary index out of bounds: $index');
+        }
+        out[outStart + i] = boxed[index] as num;
       }
       return;
     }
-    if (enc == thrift.Encoding.plain) {
+    if (encoding == thrift.Encoding.deltaBinaryPacked) {
+      // Thread the width like the boxed path: an int32 delta chain must
+      // reconstruct with 32-bit wrapping, not 64-bit. Correctness happened to
+      // hold only because the sink is an Int32List that truncates: passing bits
+      // makes it independent of the storage container.
+      final bits = type == thrift.ParquetType.int32 ? 32 : 64;
+      final direct = out is Int64List;
+      if (!direct && _deltas.length < present) _deltas = Int64List(present);
+      final target = direct ? out : _deltas;
+      final start = direct ? outStart : 0;
+      final decoded = DeltaBinaryPackedDecoder.decodeInto(
+        valueData,
+        present,
+        target,
+        start,
+        bits: bits,
+      );
+      if (decoded < present) {
+        throw FormatException(
+          'DELTA_BINARY_PACKED run shorter than declared: $decoded < $present',
+        );
+      }
+      if (!direct) out.setRange(outStart, outStart + present, _deltas);
+      return;
+    }
+    if (encoding == thrift.Encoding.plain) {
       final view = ByteData.view(
         valueData.buffer,
         valueData.offsetInBytes,
@@ -416,15 +512,30 @@ class PageDecoder {
       );
       // Surface a truncated/corrupt page as a structured error rather than a raw
       // RangeError from the ByteData getters below.
-      final elementSize = switch (type) {
+      final width = switch (type) {
         thrift.ParquetType.int32 || thrift.ParquetType.float => 4,
         thrift.ParquetType.int64 || thrift.ParquetType.double => 8,
         _ => 0,
       };
-      if (elementSize > 0 && valueData.length < present * elementSize) {
+      if (width > 0 && valueData.length < present * width) {
         throw FormatException(
-          'Truncated PLAIN page: $present values need ${present * elementSize} bytes, have ${valueData.length}',
+          'Truncated PLAIN page: $present values need ${present * width} bytes, have ${valueData.length}',
         );
+      }
+      // PLAIN is little-endian fixed width: on a little-endian host it is
+      // already the typed buffer's layout, so copy the bytes in one call.
+      if (Endian.host == Endian.little &&
+          out is TypedData &&
+          (out as TypedData).elementSizeInBytes == width &&
+          _matches(out, type)) {
+        final target = out as TypedData;
+        target.buffer
+            .asUint8List(
+              target.offsetInBytes + outStart * width,
+              present * width,
+            )
+            .setRange(0, present * width, valueData);
+        return;
       }
       switch (type) {
         case thrift.ParquetType.int32:
@@ -451,8 +562,124 @@ class PageDecoder {
           throw UnsupportedError('typed PLAIN decode for $type');
       }
     }
-    throw UnsupportedError('typed decode for $enc');
+    if (encoding == thrift.Encoding.byteStreamSplit) {
+      ByteStreamSplitDecoder(
+        type,
+      ).decodeInto(valueData, present, out, outStart);
+      return;
+    }
+    throw UnsupportedError('typed decode for $encoding');
   }
+
+  /// Decode [present] booleans into [out] from [start], one byte (0 or 1) a
+  /// value: PLAIN bit-packs them, RLE is the hybrid of width 1 after a 4-byte
+  /// length.
+  void _booleans(
+    Uint8List data,
+    int present,
+    thrift.Encoding encoding,
+    Uint8List out,
+    int start,
+  ) {
+    if (encoding == thrift.Encoding.plain) {
+      if (data.length * 8 < present) {
+        throw FormatException(
+          'Truncated PLAIN page: $present booleans need '
+          '${(present + 7) >> 3} bytes, have ${data.length}',
+        );
+      }
+      for (var i = 0; i < present; i++) {
+        out[start + i] = (data[i >> 3] >> (i & 7)) & 1;
+      }
+      return;
+    }
+    if (encoding != thrift.Encoding.rle) {
+      throw UnsupportedError('typed boolean decode for $encoding');
+    }
+    final size = data.length < 4
+        ? -1
+        : ByteData.sublistView(data).getUint32(0, Endian.little);
+    if (size < 0 || size > data.length - 4) {
+      throw FormatException(
+        'RLE boolean run of $size bytes overruns its ${data.length}-byte page',
+      );
+    }
+    if (_indices.length < present) _indices = Int32List(present);
+    final decoded = RleBitpackedHybrid.decodeInto(
+      Uint8List.sublistView(data, 4, 4 + size),
+      1,
+      present,
+      _indices,
+    );
+    if (decoded < present) {
+      throw FormatException(
+        'RLE boolean run shorter than declared: $decoded < $present',
+      );
+    }
+    for (var i = 0; i < present; i++) {
+      out[start + i] = _indices[i] != 0 ? 1 : 0;
+    }
+  }
+
+  /// Dictionary indices of the current page, reused from page to page.
+  Int32List _indices = Int32List(0);
+
+  /// DELTA_BINARY_PACKED values of the current page when the output is not an
+  /// Int64List, reused from page to page.
+  Int64List _deltas = Int64List(0);
+
+  /// Copy `dictionary[indices[i]]` to `out[start + i]` for the first [count]
+  /// indices, rejecting an index outside [dictionary]. Specialized per typed list so
+  /// the loop reads and writes unboxed values.
+  static void _gather(
+    Int32List indices,
+    int count,
+    List<num> dictionary,
+    List<num> out,
+    int start,
+  ) {
+    final size = dictionary.length;
+    for (var i = 0; i < count; i++) {
+      final index = indices[i];
+      if (index < 0 || index >= size) {
+        throw FormatException('Dictionary index out of bounds: $index');
+      }
+    }
+    switch ((dictionary, out)) {
+      case (final Int64List from, final Int64List to):
+        for (var i = 0; i < count; i++) {
+          to[start + i] = from[indices[i]];
+        }
+      case (final Float64List from, final Float64List to):
+        for (var i = 0; i < count; i++) {
+          to[start + i] = from[indices[i]];
+        }
+      case (final Int32List from, final Int32List to):
+        for (var i = 0; i < count; i++) {
+          to[start + i] = from[indices[i]];
+        }
+      case (final Float32List from, final Float32List to):
+        for (var i = 0; i < count; i++) {
+          to[start + i] = from[indices[i]];
+        }
+      default:
+        for (var i = 0; i < count; i++) {
+          out[start + i] = dictionary[indices[i]];
+        }
+    }
+  }
+
+  /// Whether [out] holds [type]'s values in Parquet's own representation, so a
+  /// byte copy is a faithful decode (an int32 page into an Int32List, not into a
+  /// Float32List of the same width).
+  static bool _matches(List<num> out, thrift.ParquetType type) =>
+      switch (type) {
+        thrift.ParquetType.int32 => out is Int32List,
+        thrift.ParquetType.int64 => out is Int64List,
+        thrift.ParquetType.float => out is Float32List,
+        thrift.ParquetType.double => out is Float64List,
+        _ => false,
+      };
 
   /// Decode values based on encoding
   List<dynamic> decodeValues(
@@ -463,13 +690,13 @@ class PageDecoder {
     // Use dictionary decoder if available for dictionary encoding
     if ((encoding == thrift.Encoding.plainDictionary ||
             encoding == thrift.Encoding.rleDictionary) &&
-        dictDecoder != null) {
-      return dictDecoder!.decode(data, numValues);
+        dictionary != null) {
+      return dictionary!.decode(data, numValues);
     }
 
     // For plain dictionary without a dictionary, it's likely the encoding
     // was specified wrong or we're dealing with a plain encoding
-    if (encoding == thrift.Encoding.plainDictionary && dictDecoder == null) {
+    if (encoding == thrift.Encoding.plainDictionary && dictionary == null) {
       // This shouldn't happen in a valid file
       throw FormatException('Dictionary encoding without dictionary page');
     }

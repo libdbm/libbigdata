@@ -4,6 +4,8 @@ import 'package:libbigdata/libbigdata.dart';
 import 'package:libbigdata/src/sql/exec/kernels.dart';
 import 'package:test/test.dart';
 
+import 'support/results.dart';
+
 /// The SQL planner used to label every projected column `string` (an unresolved
 /// placeholder), so `SELECT int_col` produced a string-typed output Field over an
 /// int64 Column. These tests pin the output-schema Field types to what the
@@ -44,7 +46,7 @@ void main() {
 
   late SqlEngine engine;
   setUp(() {
-    engine = SqlEngine();
+    engine = SqlEngine.open().ok;
     engine.registerTable('t', typed());
   });
 
@@ -54,7 +56,9 @@ void main() {
   test(
     'column passthrough preserves real types (not the string placeholder)',
     () async {
-      final r = await engine.execute('SELECT id, amount, name, active FROM t');
+      final r = await engine
+          .execute('SELECT id, amount, name, active FROM t')
+          .ok;
       expect(typeOf(r, 'id'), DataType.int64);
       expect(typeOf(r, 'amount'), DataType.float64);
       expect(typeOf(r, 'name'), DataType.string);
@@ -63,9 +67,11 @@ void main() {
   );
 
   test('arithmetic result types match the kernel', () async {
-    final r = await engine.execute(
-      'SELECT id + 1 AS a, amount / 2 AS b, id + amount AS c, id * id AS d FROM t',
-    );
+    final r = await engine
+        .execute(
+          'SELECT id + 1 AS a, amount / 2 AS b, id + amount AS c, id * id AS d FROM t',
+        )
+        .ok;
     expect(typeOf(r, 'a'), DataType.int64); // int + int -> int64
     expect(typeOf(r, 'b'), DataType.float64); // division -> float64
     expect(typeOf(r, 'c'), DataType.float64); // int + float -> float64
@@ -73,10 +79,12 @@ void main() {
   });
 
   test('string functions and CAST', () async {
-    final r = await engine.execute(
-      'SELECT UPPER(name) AS u, LENGTH(name) AS l, '
-      'CAST(id AS DOUBLE) AS d, CAST(id AS VARCHAR) AS s FROM t',
-    );
+    final r = await engine
+        .execute(
+          'SELECT UPPER(name) AS u, LENGTH(name) AS l, '
+          'CAST(id AS DOUBLE) AS d, CAST(id AS VARCHAR) AS s FROM t',
+        )
+        .ok;
     expect(typeOf(r, 'u'), DataType.string);
     expect(typeOf(r, 'l'), DataType.int64);
     expect(typeOf(r, 'd'), DataType.float64);
@@ -84,10 +92,12 @@ void main() {
   });
 
   test('aggregate result types', () async {
-    final r = await engine.execute(
-      'SELECT COUNT(*) AS c, SUM(id) AS s, AVG(id) AS a, '
-      'MIN(id) AS mn, MAX(amount) AS mx FROM t',
-    );
+    final r = await engine
+        .execute(
+          'SELECT COUNT(*) AS c, SUM(id) AS s, AVG(id) AS a, '
+          'MIN(id) AS mn, MAX(amount) AS mx FROM t',
+        )
+        .ok;
     expect(typeOf(r, 'c'), DataType.int64);
     expect(typeOf(r, 's'), DataType.decimal); // integer SUM -> lossless decimal
     expect(typeOf(r, 'a'), DataType.float64);
@@ -98,9 +108,11 @@ void main() {
   test(
     'every output column type equals its schema field (no mislabel)',
     () async {
-      final r = await engine.execute(
-        'SELECT id, id + 1 AS a, amount / 2 AS b, UPPER(name) AS u FROM t',
-      );
+      final r = await engine
+          .execute(
+            'SELECT id, id + 1 AS a, amount / 2 AS b, UPPER(name) AS u FROM t',
+          )
+          .ok;
       for (final f in r.schema.fields) {
         expect(r.column(f.name)!.dataType, f.dataType, reason: f.name);
       }
@@ -110,9 +122,9 @@ void main() {
   test('GROUP BY output types are correct and spill-invariant', () async {
     const sql =
         'SELECT active, SUM(id) AS s, COUNT(*) AS c FROM t GROUP BY active';
-    final plain = await SqlEngine(spillThresholdBytes: 0).let((e) {
+    final plain = await SqlEngine.open(spillThresholdBytes: 0).ok.let((e) {
       e.registerTable('t', typed());
-      return e.execute(sql);
+      return e.execute(sql).ok;
     });
     expect(typeOf(plain, 'active'), DataType.boolean);
     expect(typeOf(plain, 's'), DataType.decimal);
@@ -138,9 +150,12 @@ void main() {
       final dir = Directory.systemTemp.createTempSync('type_spill');
       try {
         // Tiny threshold vs ~2 KiB of int8 data forces the sort to spill.
-        final e = SqlEngine(spillThresholdBytes: 512, spillDir: dir.path);
+        final e = SqlEngine.open(
+          spillThresholdBytes: 512,
+          spillDir: dir.path,
+        ).ok;
         e.registerTable('t', t);
-        final r = await e.execute('SELECT small FROM t ORDER BY small');
+        final r = await e.execute('SELECT small FROM t ORDER BY small').ok;
         expect(typeOf(r, 'small'), DataType.int8); // not widened by the spill
         final want = [...small]..sort();
         expect(r.column('small')!.toList(), want);

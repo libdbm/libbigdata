@@ -43,9 +43,11 @@ enum ConvertedType {
   uint64(14),
   int8(15),
   int16(16),
-  json(17),
-  bson(18),
-  interval(19);
+  int32(17),
+  int64(18),
+  json(19),
+  bson(20),
+  interval(21);
 
   final int value;
   const ConvertedType(this.value);
@@ -200,20 +202,23 @@ class SchemaElement extends ParquetBase {
 
       switch (field.id) {
         case 1:
-          final typeValue = protocol.readI32();
+          final raw = protocol.readI32();
           type = ParquetType.values.firstWhere(
-            (e) => e.value == typeValue,
+            (item) => item.value == raw,
             orElse: () =>
-                throw FormatException('Invalid ParquetType value: $typeValue'),
+                throw FormatException('Invalid ParquetType value: $raw'),
           );
           break;
         case 2:
           typeLength = protocol.readI32();
           break;
         case 3:
-          final repValue = protocol.readI32();
+          final raw = protocol.readI32();
           repetitionType = FieldRepetitionType.values.firstWhere(
-            (e) => e.value == repValue,
+            (item) => item.value == raw,
+            orElse: () => throw FormatException(
+              'Invalid FieldRepetitionType value: $raw',
+            ),
           );
           break;
         case 4:
@@ -223,10 +228,12 @@ class SchemaElement extends ParquetBase {
           numChildren = protocol.readI32();
           break;
         case 6:
-          final convValue = protocol.readI32();
-          convertedType = ConvertedType.values.firstWhere(
-            (e) => e.value == convValue,
-          );
+          // An unknown value (a newer writer) is treated as absent, as
+          // parquet-mr does: the logical type or physical type still apply.
+          final raw = protocol.readI32();
+          convertedType = ConvertedType.values
+              .where((item) => item.value == raw)
+              .firstOrNull;
           break;
         case 7:
           scale = protocol.readI32();
@@ -305,6 +312,19 @@ class SchemaElement extends ParquetBase {
     protocol.writeFieldStop();
     protocol.writeStructEnd();
   }
+}
+
+/// Write [value] as struct field [id], or nothing when it is null.
+void _writeStructField(
+  TProtocol protocol,
+  String name,
+  int id,
+  ParquetBase? value,
+) {
+  if (value == null) return;
+  protocol.writeFieldBegin(TField(name, TType.STRUCT, id));
+  value.write(protocol);
+  protocol.writeFieldEnd();
 }
 
 class LogicalType extends ParquetBase {
@@ -392,7 +412,21 @@ class LogicalType extends ParquetBase {
 
   @override
   void write(TProtocol protocol) {
-    protocol.writeStructBegin(TStruct('MapType'));
+    // A union: exactly one member is set.
+    protocol.writeStructBegin(TStruct('LogicalType'));
+    _writeStructField(protocol, 'STRING', 1, string);
+    _writeStructField(protocol, 'MAP', 2, map);
+    _writeStructField(protocol, 'LIST', 3, list);
+    _writeStructField(protocol, 'ENUM', 4, enum_);
+    _writeStructField(protocol, 'DECIMAL', 5, decimal);
+    _writeStructField(protocol, 'DATE', 6, date);
+    _writeStructField(protocol, 'TIME', 7, time);
+    _writeStructField(protocol, 'TIMESTAMP', 8, timestamp);
+    _writeStructField(protocol, 'INTEGER', 10, integer);
+    _writeStructField(protocol, 'UNKNOWN', 11, unknown);
+    _writeStructField(protocol, 'JSON', 12, json);
+    _writeStructField(protocol, 'BSON', 13, bson);
+    _writeStructField(protocol, 'UUID', 14, uuid);
     protocol.writeFieldStop();
     protocol.writeStructEnd();
   }
@@ -413,7 +447,7 @@ class StringType extends ParquetBase {
 
   @override
   void write(TProtocol protocol) {
-    protocol.writeStructBegin(TStruct('MapType'));
+    protocol.writeStructBegin(TStruct('StringType'));
     protocol.writeFieldStop();
     protocol.writeStructEnd();
   }
@@ -455,7 +489,7 @@ class ListType extends ParquetBase {
 
   @override
   void write(TProtocol protocol) {
-    protocol.writeStructBegin(TStruct('MapType'));
+    protocol.writeStructBegin(TStruct('ListType'));
     protocol.writeFieldStop();
     protocol.writeStructEnd();
   }
@@ -476,7 +510,7 @@ class EnumType extends ParquetBase {
 
   @override
   void write(TProtocol protocol) {
-    protocol.writeStructBegin(TStruct('MapType'));
+    protocol.writeStructBegin(TStruct('EnumType'));
     protocol.writeFieldStop();
     protocol.writeStructEnd();
   }
@@ -510,7 +544,13 @@ class DecimalType extends ParquetBase {
 
   @override
   void write(TProtocol protocol) {
-    protocol.writeStructBegin(TStruct('MapType'));
+    protocol.writeStructBegin(TStruct('DecimalType'));
+    protocol.writeFieldBegin(TField('scale', TType.I32, 1));
+    protocol.writeI32(scale ?? 0);
+    protocol.writeFieldEnd();
+    protocol.writeFieldBegin(TField('precision', TType.I32, 2));
+    protocol.writeI32(precision!);
+    protocol.writeFieldEnd();
     protocol.writeFieldStop();
     protocol.writeStructEnd();
   }
@@ -531,7 +571,7 @@ class DateType extends ParquetBase {
 
   @override
   void write(TProtocol protocol) {
-    protocol.writeStructBegin(TStruct('MapType'));
+    protocol.writeStructBegin(TStruct('DateType'));
     protocol.writeFieldStop();
     protocol.writeStructEnd();
   }
@@ -566,7 +606,11 @@ class TimeType extends ParquetBase {
 
   @override
   void write(TProtocol protocol) {
-    protocol.writeStructBegin(TStruct('MapType'));
+    protocol.writeStructBegin(TStruct('TimeType'));
+    protocol.writeFieldBegin(TField('isAdjustedToUTC', TType.BOOL, 1));
+    protocol.writeBool(isAdjustedToUTC!);
+    protocol.writeFieldEnd();
+    _writeStructField(protocol, 'unit', 2, unit);
     protocol.writeFieldStop();
     protocol.writeStructEnd();
   }
@@ -601,7 +645,11 @@ class TimestampType extends ParquetBase {
 
   @override
   void write(TProtocol protocol) {
-    protocol.writeStructBegin(TStruct('MapType'));
+    protocol.writeStructBegin(TStruct('TimestampType'));
+    protocol.writeFieldBegin(TField('isAdjustedToUTC', TType.BOOL, 1));
+    protocol.writeBool(isAdjustedToUTC!);
+    protocol.writeFieldEnd();
+    _writeStructField(protocol, 'unit', 2, unit);
     protocol.writeFieldStop();
     protocol.writeStructEnd();
   }
@@ -642,7 +690,11 @@ class TimeUnit extends ParquetBase {
 
   @override
   void write(TProtocol protocol) {
-    protocol.writeStructBegin(TStruct('MapType'));
+    // A union: exactly one member is set.
+    protocol.writeStructBegin(TStruct('TimeUnit'));
+    _writeStructField(protocol, 'MILLIS', 1, millis);
+    _writeStructField(protocol, 'MICROS', 2, micros);
+    _writeStructField(protocol, 'NANOS', 3, nanos);
     protocol.writeFieldStop();
     protocol.writeStructEnd();
   }
@@ -663,7 +715,7 @@ class MilliSeconds extends ParquetBase {
 
   @override
   void write(TProtocol protocol) {
-    protocol.writeStructBegin(TStruct('MapType'));
+    protocol.writeStructBegin(TStruct('MilliSeconds'));
     protocol.writeFieldStop();
     protocol.writeStructEnd();
   }
@@ -684,7 +736,7 @@ class MicroSeconds extends ParquetBase {
 
   @override
   void write(TProtocol protocol) {
-    protocol.writeStructBegin(TStruct('MapType'));
+    protocol.writeStructBegin(TStruct('MicroSeconds'));
     protocol.writeFieldStop();
     protocol.writeStructEnd();
   }
@@ -705,7 +757,7 @@ class NanoSeconds extends ParquetBase {
 
   @override
   void write(TProtocol protocol) {
-    protocol.writeStructBegin(TStruct('MapType'));
+    protocol.writeStructBegin(TStruct('NanoSeconds'));
     protocol.writeFieldStop();
     protocol.writeStructEnd();
   }
@@ -739,7 +791,13 @@ class IntType extends ParquetBase {
 
   @override
   void write(TProtocol protocol) {
-    protocol.writeStructBegin(TStruct('MapType'));
+    protocol.writeStructBegin(TStruct('IntType'));
+    protocol.writeFieldBegin(TField('bitWidth', TType.BYTE, 1));
+    protocol.writeByte(bitWidth!);
+    protocol.writeFieldEnd();
+    protocol.writeFieldBegin(TField('isSigned', TType.BOOL, 2));
+    protocol.writeBool(isSigned!);
+    protocol.writeFieldEnd();
     protocol.writeFieldStop();
     protocol.writeStructEnd();
   }
@@ -760,7 +818,7 @@ class UnknownType extends ParquetBase {
 
   @override
   void write(TProtocol protocol) {
-    protocol.writeStructBegin(TStruct('MapType'));
+    protocol.writeStructBegin(TStruct('UnknownType'));
     protocol.writeFieldStop();
     protocol.writeStructEnd();
   }
@@ -781,7 +839,7 @@ class JsonType extends ParquetBase {
 
   @override
   void write(TProtocol protocol) {
-    protocol.writeStructBegin(TStruct('MapType'));
+    protocol.writeStructBegin(TStruct('JsonType'));
     protocol.writeFieldStop();
     protocol.writeStructEnd();
   }
@@ -802,7 +860,7 @@ class BsonType extends ParquetBase {
 
   @override
   void write(TProtocol protocol) {
-    protocol.writeStructBegin(TStruct('MapType'));
+    protocol.writeStructBegin(TStruct('BsonType'));
     protocol.writeFieldStop();
     protocol.writeStructEnd();
   }
@@ -823,7 +881,7 @@ class UuidType extends ParquetBase {
 
   @override
   void write(TProtocol protocol) {
-    protocol.writeStructBegin(TStruct('MapType'));
+    protocol.writeStructBegin(TStruct('UuidType'));
     protocol.writeFieldStop();
     protocol.writeStructEnd();
   }
@@ -848,28 +906,27 @@ class DataPageHeader extends ParquetBase {
           numValues = protocol.readI32();
           break;
         case 2:
-          final encValue = protocol.readI32();
+          final raw = protocol.readI32();
           encoding = Encoding.values.firstWhere(
-            (e) => e.value == encValue,
-            orElse: () =>
-                throw FormatException('Invalid Encoding value: $encValue'),
+            (item) => item.value == raw,
+            orElse: () => throw FormatException('Invalid Encoding value: $raw'),
           );
           break;
         case 3:
-          final defValue = protocol.readI32();
+          final raw = protocol.readI32();
           definitionLevelEncoding = Encoding.values.firstWhere(
-            (e) => e.value == defValue,
+            (item) => item.value == raw,
             orElse: () => throw FormatException(
-              'Invalid Encoding value for definition level: $defValue',
+              'Invalid Encoding value for definition level: $raw',
             ),
           );
           break;
         case 4:
-          final repValue = protocol.readI32();
+          final raw = protocol.readI32();
           repetitionLevelEncoding = Encoding.values.firstWhere(
-            (e) => e.value == repValue,
+            (item) => item.value == raw,
             orElse: () => throw FormatException(
-              'Invalid Encoding value for repetition level: $repValue',
+              'Invalid Encoding value for repetition level: $raw',
             ),
           );
           break;
@@ -944,11 +1001,10 @@ class DataPageHeaderV2 extends ParquetBase {
           numRows = protocol.readI32();
           break;
         case 4:
-          final encValue = protocol.readI32();
+          final raw = protocol.readI32();
           encoding = Encoding.values.firstWhere(
-            (e) => e.value == encValue,
-            orElse: () =>
-                throw FormatException('Invalid Encoding value: $encValue'),
+            (item) => item.value == raw,
+            orElse: () => throw FormatException('Invalid Encoding value: $raw'),
           );
           break;
         case 5:
@@ -974,7 +1030,25 @@ class DataPageHeaderV2 extends ParquetBase {
 
   @override
   void write(TProtocol protocol) {
-    protocol.writeStructBegin(TStruct('MapType'));
+    protocol.writeStructBegin(TStruct('DataPageHeaderV2'));
+    for (final (name, id, value) in [
+      ('num_values', 1, numValues),
+      ('num_nulls', 2, numNulls),
+      ('num_rows', 3, numRows),
+      ('encoding', 4, encoding.value),
+      ('definition_levels_byte_length', 5, definitionLevelsByteLength),
+      ('repetition_levels_byte_length', 6, repetitionLevelsByteLength),
+    ]) {
+      protocol.writeFieldBegin(TField(name, TType.I32, id));
+      protocol.writeI32(value);
+      protocol.writeFieldEnd();
+    }
+    if (isCompressed != null) {
+      protocol.writeFieldBegin(TField('is_compressed', TType.BOOL, 7));
+      protocol.writeBool(isCompressed!);
+      protocol.writeFieldEnd();
+    }
+    _writeStructField(protocol, 'statistics', 8, statistics);
     protocol.writeFieldStop();
     protocol.writeStructEnd();
   }
@@ -997,11 +1071,10 @@ class DictionaryPageHeader extends ParquetBase {
           numValues = protocol.readI32();
           break;
         case 2:
-          final encValue = protocol.readI32();
+          final raw = protocol.readI32();
           encoding = Encoding.values.firstWhere(
-            (e) => e.value == encValue,
-            orElse: () =>
-                throw FormatException('Invalid Encoding value: $encValue'),
+            (item) => item.value == raw,
+            orElse: () => throw FormatException('Invalid Encoding value: $raw'),
           );
           break;
         case 3:
@@ -1052,11 +1125,10 @@ class PageHeader extends ParquetBase {
 
       switch (field.id) {
         case 1:
-          final typeValue = protocol.readI32();
+          final raw = protocol.readI32();
           type = PageType.values.firstWhere(
-            (e) => e.value == typeValue,
-            orElse: () =>
-                throw FormatException('Invalid PageType value: $typeValue'),
+            (item) => item.value == raw,
+            orElse: () => throw FormatException('Invalid PageType value: $raw'),
           );
           break;
         case 2:
@@ -1209,7 +1281,16 @@ class SortingColumn extends ParquetBase {
 
   @override
   void write(TProtocol protocol) {
-    protocol.writeStructBegin(TStruct('MapType'));
+    protocol.writeStructBegin(TStruct('SortingColumn'));
+    protocol.writeFieldBegin(TField('column_idx', TType.I32, 1));
+    protocol.writeI32(columnIdx);
+    protocol.writeFieldEnd();
+    protocol.writeFieldBegin(TField('descending', TType.BOOL, 2));
+    protocol.writeBool(descending);
+    protocol.writeFieldEnd();
+    protocol.writeFieldBegin(TField('nulls_first', TType.BOOL, 3));
+    protocol.writeBool(nullsFirst);
+    protocol.writeFieldEnd();
     protocol.writeFieldStop();
     protocol.writeStructEnd();
   }
@@ -1229,15 +1310,17 @@ class PageEncodingStats extends ParquetBase {
 
       switch (field.id) {
         case 1:
-          final typeValue = protocol.readI32();
-          pageType = PageType.values.firstWhere((e) => e.value == typeValue);
+          final raw = protocol.readI32();
+          pageType = PageType.values.firstWhere(
+            (item) => item.value == raw,
+            orElse: () => throw FormatException('Invalid PageType value: $raw'),
+          );
           break;
         case 2:
-          final encValue = protocol.readI32();
+          final raw = protocol.readI32();
           encoding = Encoding.values.firstWhere(
-            (e) => e.value == encValue,
-            orElse: () =>
-                throw FormatException('Invalid Encoding value: $encValue'),
+            (item) => item.value == raw,
+            orElse: () => throw FormatException('Invalid Encoding value: $raw'),
           );
           break;
         case 3:
@@ -1253,7 +1336,16 @@ class PageEncodingStats extends ParquetBase {
 
   @override
   void write(TProtocol protocol) {
-    protocol.writeStructBegin(TStruct('MapType'));
+    protocol.writeStructBegin(TStruct('PageEncodingStats'));
+    protocol.writeFieldBegin(TField('page_type', TType.I32, 1));
+    protocol.writeI32(pageType.value);
+    protocol.writeFieldEnd();
+    protocol.writeFieldBegin(TField('encoding', TType.I32, 2));
+    protocol.writeI32(encoding.value);
+    protocol.writeFieldEnd();
+    protocol.writeFieldBegin(TField('count', TType.I32, 3));
+    protocol.writeI32(count);
+    protocol.writeFieldEnd();
     protocol.writeFieldStop();
     protocol.writeStructEnd();
   }
@@ -1284,23 +1376,23 @@ class ColumnMetaData extends ParquetBase {
 
       switch (field.id) {
         case 1:
-          final typeValue = protocol.readI32();
+          final raw = protocol.readI32();
           type = ParquetType.values.firstWhere(
-            (e) => e.value == typeValue,
+            (item) => item.value == raw,
             orElse: () =>
-                throw FormatException('Invalid ParquetType value: $typeValue'),
+                throw FormatException('Invalid ParquetType value: $raw'),
           );
           break;
         case 2:
           encodings = [];
           final listHeader = protocol.readListBegin();
           for (int i = 0; i < listHeader.length; i++) {
-            final encValue = protocol.readI32();
+            final raw = protocol.readI32();
             encodings.add(
               Encoding.values.firstWhere(
-                (e) => e.value == encValue,
+                (item) => item.value == raw,
                 orElse: () => throw FormatException(
-                  'Invalid Encoding value in list: $encValue',
+                  'Invalid Encoding value in list: $raw',
                 ),
               ),
             );
@@ -1316,12 +1408,11 @@ class ColumnMetaData extends ParquetBase {
           protocol.readListEnd();
           break;
         case 4:
-          final codecValue = protocol.readI32();
+          final raw = protocol.readI32();
           codec = CompressionCodec.values.firstWhere(
-            (e) => e.value == codecValue,
-            orElse: () => throw FormatException(
-              'Invalid CompressionCodec value: $codecValue',
-            ),
+            (item) => item.value == raw,
+            orElse: () =>
+                throw FormatException('Invalid CompressionCodec value: $raw'),
           );
           break;
         case 5:
@@ -1335,11 +1426,11 @@ class ColumnMetaData extends ParquetBase {
           break;
         case 8:
           keyValueMetadata = [];
-          final kvHeader = protocol.readListBegin();
-          for (int i = 0; i < kvHeader.length; i++) {
-            final kv = KeyValue();
-            kv.read(protocol);
-            keyValueMetadata!.add(kv);
+          final entryHeader = protocol.readListBegin();
+          for (int i = 0; i < entryHeader.length; i++) {
+            final entry = KeyValue();
+            entry.read(protocol);
+            keyValueMetadata!.add(entry);
           }
           protocol.readListEnd();
           break;
@@ -1358,8 +1449,8 @@ class ColumnMetaData extends ParquetBase {
           break;
         case 13:
           encodingStats = [];
-          final encStatsHeader = protocol.readListBegin();
-          for (int i = 0; i < encStatsHeader.length; i++) {
+          final statsHeader = protocol.readListBegin();
+          for (int i = 0; i < statsHeader.length; i++) {
             final stats = PageEncodingStats();
             stats.read(protocol);
             encodingStats!.add(stats);
@@ -1417,8 +1508,8 @@ class ColumnMetaData extends ParquetBase {
     if (keyValueMetadata != null) {
       protocol.writeFieldBegin(TField('key_value_metadata', TType.LIST, 8));
       protocol.writeListBegin(TList(TType.STRUCT, keyValueMetadata!.length));
-      for (final kv in keyValueMetadata!) {
-        kv.write(protocol);
+      for (final entry in keyValueMetadata!) {
+        entry.write(protocol);
       }
       protocol.writeListEnd();
       protocol.writeFieldEnd();
@@ -1475,7 +1566,6 @@ class ColumnChunk extends ParquetBase {
   int? offsetIndexLength;
   int? columnIndexOffset;
   int? columnIndexLength;
-  Uint8List? cryptoMetadata;
   Uint8List? encryptedColumnMetadata;
 
   @override
@@ -1509,7 +1599,8 @@ class ColumnChunk extends ParquetBase {
           columnIndexLength = protocol.readI32();
           break;
         case 8:
-          cryptoMetadata = Uint8List.fromList(protocol.readBinary());
+          // ColumnCryptoMetaData, a struct; encrypted columns are unsupported.
+          TProtocolUtil.skip(protocol, field.type);
           break;
         case 9:
           encryptedColumnMetadata = Uint8List.fromList(protocol.readBinary());
@@ -1566,12 +1657,6 @@ class ColumnChunk extends ParquetBase {
       protocol.writeFieldEnd();
     }
 
-    if (cryptoMetadata != null) {
-      protocol.writeFieldBegin(TField('crypto_metadata', TType.STRING, 8));
-      protocol.writeBinary(Int8List.fromList(cryptoMetadata!));
-      protocol.writeFieldEnd();
-    }
-
     protocol.writeFieldStop();
     protocol.writeStructEnd();
   }
@@ -1596,8 +1681,8 @@ class RowGroup extends ParquetBase {
       switch (field.id) {
         case 1:
           columns = [];
-          final colHeader = protocol.readListBegin();
-          for (int i = 0; i < colHeader.length; i++) {
+          final columnHeader = protocol.readListBegin();
+          for (int i = 0; i < columnHeader.length; i++) {
             final chunk = ColumnChunk();
             chunk.read(protocol);
             columns.add(chunk);
@@ -1690,7 +1775,38 @@ class RowGroup extends ParquetBase {
   }
 }
 
+/// The order a column's `min_value` and `max_value` statistics follow: a
+/// union whose only member, [typeOrder], is the order the format defines for
+/// the column's type.
 class ColumnOrder extends ParquetBase {
+  TypeDefinedOrder? typeOrder;
+
+  @override
+  void read(TProtocol protocol) {
+    protocol.readStructBegin();
+    while (true) {
+      final field = protocol.readFieldBegin();
+      if (field.type == TType.STOP) break;
+      if (field.id == 1 && field.type == TType.STRUCT) {
+        typeOrder = TypeDefinedOrder()..read(protocol);
+      } else {
+        TProtocolUtil.skip(protocol, field.type);
+      }
+      protocol.readFieldEnd();
+    }
+    protocol.readStructEnd();
+  }
+
+  @override
+  void write(TProtocol protocol) {
+    protocol.writeStructBegin(TStruct('ColumnOrder'));
+    _writeStructField(protocol, 'TYPE_ORDER', 1, typeOrder);
+    protocol.writeFieldStop();
+    protocol.writeStructEnd();
+  }
+}
+
+class TypeDefinedOrder extends ParquetBase {
   @override
   void read(TProtocol protocol) {
     protocol.readStructBegin();
@@ -1705,7 +1821,7 @@ class ColumnOrder extends ParquetBase {
 
   @override
   void write(TProtocol protocol) {
-    protocol.writeStructBegin(TStruct('MapType'));
+    protocol.writeStructBegin(TStruct('TypeDefinedOrder'));
     protocol.writeFieldStop();
     protocol.writeStructEnd();
   }
@@ -1746,8 +1862,8 @@ class FileMetaData extends ParquetBase {
           break;
         case 4:
           rowGroups = [];
-          final rgHeader = protocol.readListBegin();
-          for (int i = 0; i < rgHeader.length; i++) {
+          final groupHeader = protocol.readListBegin();
+          for (int i = 0; i < groupHeader.length; i++) {
             final rg = RowGroup();
             rg.read(protocol);
             rowGroups.add(rg);
@@ -1756,11 +1872,11 @@ class FileMetaData extends ParquetBase {
           break;
         case 5:
           keyValueMetadata = [];
-          final kvHeader = protocol.readListBegin();
-          for (int i = 0; i < kvHeader.length; i++) {
-            final kv = KeyValue();
-            kv.read(protocol);
-            keyValueMetadata!.add(kv);
+          final entryHeader = protocol.readListBegin();
+          for (int i = 0; i < entryHeader.length; i++) {
+            final entry = KeyValue();
+            entry.read(protocol);
+            keyValueMetadata!.add(entry);
           }
           protocol.readListEnd();
           break;
@@ -1769,8 +1885,8 @@ class FileMetaData extends ParquetBase {
           break;
         case 7:
           columnOrders = [];
-          final coHeader = protocol.readListBegin();
-          for (int i = 0; i < coHeader.length; i++) {
+          final orderHeader = protocol.readListBegin();
+          for (int i = 0; i < orderHeader.length; i++) {
             final co = ColumnOrder();
             co.read(protocol);
             columnOrders!.add(co);
@@ -1816,8 +1932,8 @@ class FileMetaData extends ParquetBase {
     if (keyValueMetadata != null) {
       protocol.writeFieldBegin(TField('key_value_metadata', TType.LIST, 5));
       protocol.writeListBegin(TList(TType.STRUCT, keyValueMetadata!.length));
-      for (final kv in keyValueMetadata!) {
-        kv.write(protocol);
+      for (final entry in keyValueMetadata!) {
+        entry.write(protocol);
       }
       protocol.writeListEnd();
       protocol.writeFieldEnd();

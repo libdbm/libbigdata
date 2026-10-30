@@ -4,10 +4,18 @@ import 'conversions.dart';
 
 /// Represents a field in a schema
 @immutable
-class Field {
+final class Field {
+  /// The column name.
   final String name;
+
+  /// The type of the column's values.
   final DataType dataType;
+
+  /// Whether the column may hold nulls.
   final bool nullable;
+
+  /// Free-form key/value annotations carried with the field. Excluded from
+  /// equality/hashCode.
   final Map<String, dynamic> metadata;
 
   /// Optional table qualifier (alias) used to disambiguate same-named columns
@@ -21,19 +29,23 @@ class Field {
   /// [qualifier]) so spill schema-equality / concatenation stay unaffected.
   final List<Field> children;
 
-  /// Decimal precision/scale (only set for [DataType.decimal]). Also excluded
-  /// from equality/hashCode.
+  /// Decimal precision (total digits; only set for [DataType.decimal]).
+  /// Excluded from equality/hashCode.
   final int? precision;
+
+  /// Decimal scale (digits after the point; only set for [DataType.decimal]).
+  /// Excluded from equality/hashCode.
   final int? scale;
 
   /// Optional column field-id, emitted into the Parquet SchemaElement when set
   /// (Iceberg/Spark-Iceberg use file-level field-ids for schema evolution and
-  /// column reordering). Carried metadata — excluded from equality/hashCode.
+  /// column reordering). Carried metadata: excluded from equality/hashCode.
   final int? id;
 
+  /// A field named [name] of [dataType]; see the fields for the rest.
   // Not const: defensively wrap the caller's [children]/[metadata] so a mutation
   // after construction can't invalidate this @immutable field (empty stays the
-  // shared const instance, so scalar fields — the hot case — allocate nothing).
+  // shared const instance, so scalar fields (the hot case) allocate nothing).
   Field({
     required this.name,
     required this.dataType,
@@ -47,6 +59,7 @@ class Field {
   }) : metadata = metadata.isEmpty ? const {} : Map.unmodifiable(metadata),
        children = children.isEmpty ? const [] : List.unmodifiable(children);
 
+  /// This field with the given members replaced.
   Field copyWith({
     String? name,
     DataType? dataType,
@@ -71,17 +84,18 @@ class Field {
     );
   }
 
-  /// Structural compatibility for append/concat/spill: same name, a common data
-  /// type, matching decimal scale, and — for nested types — recursively
-  /// compatible [children]. Distinct from [==], which is deliberately loose (it
-  /// ignores children/precision/scale so carried metadata doesn't block
-  /// concatenation); this guards the axes whose mismatch would corrupt data.
+  /// Structural compatibility for append/concat/spill: same name, a data type
+  /// [Column.concat] combines without a cast (the same type, one integer or
+  /// one float family, or a column of nulls), matching decimal scale, and,
+  /// for nested types: recursively compatible [children]. Distinct from
+  /// [==], which is deliberately loose (it ignores children/precision/scale so
+  /// carried metadata doesn't block concatenation); this guards the axes whose
+  /// mismatch would corrupt data. [DataType.commonType] is wider (an integer
+  /// and a string meet at string) because a query casts to it; a concat does
+  /// not, so it failed later with a less clear error.
   bool isCompatibleWith(Field other) {
     if (name != other.name) return false;
-    if (dataType != other.dataType &&
-        DataType.commonType(dataType, other.dataType) == null) {
-      return false;
-    }
+    if (!_concatenable(dataType, other.dataType)) return false;
     // Merging unscaled BigInts of different decimal scales corrupts values;
     // precision may differ (same-scale unscaled ints concatenate safely).
     if (dataType == DataType.decimal &&
@@ -90,7 +104,7 @@ class Field {
       return false;
     }
     // Nested types (list/struct/map) carry their shape in [children], which
-    // [==] ignores — so struct<a,b> and struct<a,c> would otherwise look
+    // [==] ignores, so struct<a,b> and struct<a,c> would otherwise look
     // compatible and mis-pair column data on concat.
     if (children.length != other.children.length) return false;
     for (int i = 0; i < children.length; i++) {
@@ -99,9 +113,23 @@ class Field {
     return true;
   }
 
+  static bool _concatenable(DataType a, DataType b) {
+    bool integer(DataType t) =>
+        t == DataType.int8 ||
+        t == DataType.int16 ||
+        t == DataType.int32 ||
+        t == DataType.int64;
+    bool float(DataType t) => t == DataType.float32 || t == DataType.float64;
+    return a == b ||
+        a == DataType.null_ ||
+        b == DataType.null_ ||
+        (integer(a) && integer(b)) ||
+        (float(a) && float(b));
+  }
+
   /// EXACT encoding compatibility for a STREAMING write against an
-  /// already-frozen physical schema: same name, the SAME `dataType` (NO widening
-  /// — an int64 batch under an int32 column would be encoded positionally and
+  /// already-frozen physical schema: same name, the SAME `dataType` (NO widening:
+  /// an int64 batch under an int32 column would be encoded positionally and
   /// silently truncated), matching decimal precision/scale, and recursively-exact
   /// nested [children]. Distinct from [isCompatibleWith], which permits width
   /// promotion (safe only for IN-MEMORY append/concat, never for encoding under a
@@ -134,6 +162,7 @@ class Field {
   @override
   String toString() => 'Field($name: ${dataType.name}${nullable ? "?" : ""})';
 
+  /// This field as JSON; [Field.fromJson] reads it back.
   Map<String, dynamic> toJson() => {
     'name': name,
     'type': dataType.name,
@@ -146,10 +175,11 @@ class Field {
     if (id != null) 'id': id,
   };
 
+  /// The field [toJson] wrote.
   factory Field.fromJson(Map<String, dynamic> json) {
     return Field(
       name: json['name'] as String,
-      dataType: _parseDataType(json['type'] as String),
+      dataType: _parse(json['type'] as String),
       nullable: json['nullable'] as bool? ?? true,
       metadata: (json['metadata'] as Map<String, dynamic>?) ?? {},
       children: ((json['children'] as List<dynamic>?) ?? const [])
@@ -161,8 +191,8 @@ class Field {
     );
   }
 
-  static DataType _parseDataType(String typeName) {
-    switch (typeName) {
+  static DataType _parse(String type) {
+    switch (type) {
       case 'boolean':
         return DataType.boolean;
       case 'int8':
@@ -196,17 +226,21 @@ class Field {
       case 'null':
         return DataType.null_;
       default:
-        throw ArgumentError('Unknown data type: $typeName');
+        throw ArgumentError('Unknown data type: $type');
     }
   }
 }
 
 /// Represents the schema of a table or DataFrame
 @immutable
-class Schema {
+final class Schema {
+  /// The fields, in column order.
   final List<Field> fields;
+
+  /// Free-form key/value annotations carried with the schema.
   final Map<String, dynamic> metadata;
 
+  /// A schema of [fields], in column order.
   // Defensively copy into an unmodifiable list so a caller mutating the passed
   // list after construction can't silently invalidate column order/type against
   // the table's buffers (the name→index maps below are memoized once).
@@ -215,7 +249,7 @@ class Schema {
     Map<String, dynamic> metadata = const {},
   }) : fields = List.unmodifiable(fields),
        metadata = metadata.isEmpty ? const {} : Map.unmodifiable(metadata) {
-    _validateFieldNames();
+    _validate();
   }
 
   /// Lazily-built name → first-index map so [field]/[fieldIndex] are O(1)
@@ -225,18 +259,18 @@ class Schema {
     for (int i = fields.length - 1; i >= 0; i--) fields[i].name: i,
   };
 
-  /// Names that occur on more than one field — a bare (unqualified) reference to
+  /// Names that occur on more than one field: a bare (unqualified) reference to
   /// one is ambiguous. Built once so [resolve] is O(1) instead of O(cols).
-  late final Set<String> _ambiguousNames = () {
+  late final Set<String> _ambiguous = () {
     final seen = <String>{};
-    final dup = <String>{};
+    final repeated = <String>{};
     for (final f in fields) {
-      if (!seen.add(f.name)) dup.add(f.name);
+      if (!seen.add(f.name)) repeated.add(f.name);
     }
-    return dup;
+    return repeated;
   }();
 
-  void _validateFieldNames() {
+  void _validate() {
     final names = <String>{};
     for (final field in fields) {
       // Uniqueness is on the (qualifier, name) pair, so two joined inputs may
@@ -255,12 +289,12 @@ class Schema {
   /// -1 when absent.
   ///
   /// [strict] controls what an UNKNOWN qualifier (one no field carries) does. The
-  /// default falls back to a bare match — required at RUNTIME, where a spilled
-  /// batch re-read through [ColumnListSchema.schemaOf] has lost its qualifiers
+  /// default falls back to a bare match: required at RUNTIME, where a spilled
+  /// batch re-read through `schemaOf` has lost its qualifiers
   /// (columns don't carry them), so an operator resolving a join key by its
   /// original qualifier must still find it by name. `strict: true` is for the
-  /// PLAN-TIME binding gate, where the schema still has qualifiers: there an
-  /// unknown qualifier is a real user error (a typo'd alias), NOT a fall-back —
+  /// PLAN-TIME binding check, where the schema still has qualifiers: there an
+  /// unknown qualifier is a real user error (a typo'd alias), NOT a fall-back;
   /// otherwise `typo.n` silently binds to an unrelated column.
   int resolve(String name, {String? qualifier, bool strict = false}) {
     if (qualifier != null) {
@@ -273,7 +307,7 @@ class Schema {
       }
       return (known || strict) ? -1 : resolve(name);
     }
-    if (_ambiguousNames.contains(name)) {
+    if (_ambiguous.contains(name)) {
       throw StateError(
         'Ambiguous column "$name" (qualify it, e.g. alias.$name)',
       );
@@ -306,25 +340,25 @@ class Schema {
   int get length => fields.length;
 
   /// Select subset of fields
-  Schema select(List<String> fieldNames) {
-    final selectedFields = <Field>[];
-    for (final name in fieldNames) {
+  Schema select(List<String> names) {
+    final selected = <Field>[];
+    for (final name in names) {
       final field = this.field(name);
       if (field == null) {
         throw ArgumentError('Field not found: $name');
       }
-      selectedFields.add(field);
+      selected.add(field);
     }
-    return Schema(fields: selectedFields, metadata: metadata);
+    return Schema(fields: selected, metadata: metadata);
   }
 
   /// Rename fields
   Schema rename(Map<String, String> renames) {
-    final renamedFields = fields.map((field) {
-      final newName = renames[field.name];
-      return newName != null ? field.copyWith(name: newName) : field;
+    final renamed = fields.map((field) {
+      final target = renames[field.name];
+      return target != null ? field.copyWith(name: target) : field;
     }).toList();
-    return Schema(fields: renamedFields, metadata: metadata);
+    return Schema(fields: renamed, metadata: metadata);
   }
 
   /// Add a field to the schema
@@ -348,30 +382,27 @@ class Schema {
 
   /// Merge with another schema
   Schema merge(Schema other, {bool overwrite = false}) {
-    final mergedFields = <Field>[];
-    final usedNames = <String>{};
+    final merged = <Field>[];
+    final used = <String>{};
 
     for (final field in fields) {
-      mergedFields.add(field);
-      usedNames.add(field.name);
+      merged.add(field);
+      used.add(field.name);
     }
 
     for (final field in other.fields) {
-      if (usedNames.contains(field.name)) {
+      if (used.contains(field.name)) {
         if (overwrite) {
-          final index = mergedFields.indexWhere((f) => f.name == field.name);
-          mergedFields[index] = field;
+          final index = merged.indexWhere((f) => f.name == field.name);
+          merged[index] = field;
         }
       } else {
-        mergedFields.add(field);
-        usedNames.add(field.name);
+        merged.add(field);
+        used.add(field.name);
       }
     }
 
-    return Schema(
-      fields: mergedFields,
-      metadata: {...metadata, ...other.metadata},
-    );
+    return Schema(fields: merged, metadata: {...metadata, ...other.metadata});
   }
 
   /// Check if schemas are compatible (per-field [Field.isCompatibleWith], which
@@ -385,7 +416,7 @@ class Schema {
   }
 
   /// EXACT encoding compatibility (see [Field.encodesAs]): same arity and every
-  /// field exactly encodable — used by streaming writers whose physical schema is
+  /// field exactly encodable: used by streaming writers whose physical schema is
   /// frozen, so a widened batch is rejected rather than silently truncated.
   bool encodesAs(Schema other) {
     if (fields.length != other.fields.length) return false;
@@ -405,7 +436,7 @@ class Schema {
       return Schema(fields: []);
     }
 
-    final fieldTypes = <String, DataType>{};
+    final types = <String, DataType>{};
     final sample = records.take(sampleSize);
 
     for (final record in sample) {
@@ -417,20 +448,20 @@ class Schema {
           continue; // nullability is derived exhaustively below
         }
 
-        final valueType = DataType.fromValue(value);
+        final found = DataType.fromValue(value);
 
-        if (!fieldTypes.containsKey(key)) {
-          fieldTypes[key] = valueType;
+        if (!types.containsKey(key)) {
+          types[key] = found;
         } else {
-          final currentType = fieldTypes[key]!;
-          if (currentType != valueType) {
+          final current = types[key]!;
+          if (current != found) {
             // inferredCommon (not commonType) so a large int mixed with a float
             // promotes to a lossless decimal instead of a rounding float64.
-            final common = DataType.inferredCommon(currentType, valueType);
+            final common = DataType.inferredCommon(current, found);
             if (common != null) {
-              fieldTypes[key] = common;
+              types[key] = common;
             } else {
-              fieldTypes[key] = DataType.string;
+              types[key] = DataType.string;
             }
           }
         }
@@ -438,31 +469,31 @@ class Schema {
     }
 
     // Keys and nullability are derived from ALL records (a cheap key scan), not
-    // just the sampled prefix — otherwise a field that first appears (or is first
+    // just the sampled prefix; otherwise a field that first appears (or is first
     // null) beyond [sampleSize] would be silently dropped or mis-typed as
     // non-null. Type inference stays bounded by the sample (the cost contract); a
     // field seen only beyond the sample defaults to string (pass a larger
     // sampleSize for exact typing).
-    final allKeys = <String>{};
+    final keys = <String>{};
     for (final record in records) {
-      allKeys.addAll(record.keys);
+      keys.addAll(record.keys);
     }
     // A field is non-null only if present AND non-null in EVERY record
     // (`record[k] == null` is true for both an absent key and a null value).
-    final required = <String>{...allKeys};
+    final required = <String>{...keys};
     for (final record in records) {
       required.removeWhere((k) => record[k] == null);
     }
 
     final fields = <Field>[];
-    for (final key in allKeys) {
-      var type = fieldTypes[key] ?? DataType.string;
+    for (final key in keys) {
+      var type = types[key] ?? DataType.string;
       int? precision;
       int? scale;
       if (type == DataType.decimal) {
         // A decimal promoted from a mixed int/float column: derive the exact
         // scale + precision by scanning ALL values (so no fractional digit is
-        // truncated). A non-finite value can't be a decimal — fall back to
+        // truncated). A non-finite value can't be a decimal: fall back to
         // float64 rather than throwing.
         final meta = inferDecimalMeta([
           for (final record in records) record[key],
@@ -493,9 +524,9 @@ class Schema {
       identical(this, other) ||
       other is Schema &&
           runtimeType == other.runtimeType &&
-          _fieldsEqual(fields, other.fields);
+          _equal(fields, other.fields);
 
-  static bool _fieldsEqual(List<Field> a, List<Field> b) {
+  static bool _equal(List<Field> a, List<Field> b) {
     if (a.length != b.length) return false;
     for (int i = 0; i < a.length; i++) {
       if (a[i] != b[i]) return false;
@@ -516,18 +547,20 @@ class Schema {
     return buffer.toString();
   }
 
+  /// This schema as JSON; [Schema.fromJson] reads it back.
   Map<String, dynamic> toJson() => {
     'fields': fields.map((f) => f.toJson()).toList(),
     if (metadata.isNotEmpty) 'metadata': metadata,
   };
 
+  /// The schema [toJson] wrote.
   factory Schema.fromJson(Map<String, dynamic> json) {
-    final fieldsList = (json['fields'] as List<dynamic>)
+    final parsed = (json['fields'] as List<dynamic>)
         .map((f) => Field.fromJson(f as Map<String, dynamic>))
         .toList();
 
     return Schema(
-      fields: fieldsList,
+      fields: parsed,
       metadata: (json['metadata'] as Map<String, dynamic>?) ?? {},
     );
   }

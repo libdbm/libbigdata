@@ -1,27 +1,538 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:libbigdata/libbigdata.dart';
+import 'package:libbigdata/src/core/column.dart'
+    show NumericVector, StringVector;
 import 'package:libbigdata/src/core/backoff.dart';
 import 'package:libbigdata/src/core/conversions.dart';
 import 'package:libbigdata/src/core/encoding.dart';
 import 'package:libbigdata/src/core/keys.dart';
 import 'package:libbigdata/src/core/partitions.dart';
 import 'package:libbigdata/src/core/paths.dart';
-import 'package:libbigdata/src/core/row_filter.dart';
 import 'package:libbigdata/src/core/stats.dart';
+import 'package:libbigdata/src/util/varint.dart';
 import 'package:libbigdata/src/formats/delta/delta_schema.dart';
 import 'package:libbigdata/src/formats/delta/roaring_bitmap.dart';
 import 'package:libbigdata/src/formats/iceberg/iceberg_schema.dart';
 import 'package:libbigdata/src/sql/exec/kernels.dart';
-import 'package:libbigdata/src/sql/execution/memory_manager.dart';
 import 'package:libbigdata/src/sql/execution/exec_core.dart';
 import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
 
+import 'support/results.dart';
+
 void main() {
+  group('untrusted decimal and statistics input', () {
+    test('decimal parameters are bounded', () {
+      expect(decimalTypeParams('decimal(10,2)'), (precision: 10, scale: 2));
+      for (final type in [
+        'decimal(10,2000000000)',
+        'decimal(5,6)',
+        'decimal(39,2)',
+        'decimal(0,0)',
+      ]) {
+        expect(
+          () => decimalTypeParams(type),
+          throwsFormatException,
+          reason: type,
+        );
+      }
+      expect(checkedDecimal(76, 10), (precision: 76, scale: 10));
+      expect(() => checkedDecimal(77, 0), throwsFormatException);
+      expect(() => checkedDecimal(10, -1), throwsFormatException);
+    });
+
+    test('decimal text must be plain digits', () {
+      expect(unscaledFromString('-1.25', 2), BigInt.from(-125));
+      expect(unscaledFromString('+3', 1), BigInt.from(30));
+      for (final text in ['0x10', '--5', '1e3', '1_000', '1.2.3', '']) {
+        expect(
+          () => unscaledFromString(text, 2),
+          throwsFormatException,
+          reason: text,
+        );
+      }
+    });
+
+    test('statistics of an unexpected width give no bounds', () {
+      for (final width in [3, 5, 6, 7, 9]) {
+        expect(
+          ColumnBounds.decode(Uint8List(width), DataType.int64),
+          isNull,
+          reason: '$width',
+        );
+      }
+      for (final width in [1, 2, 3, 5, 9]) {
+        expect(
+          ColumnBounds.decode(Uint8List(width), DataType.float64),
+          isNull,
+          reason: '$width',
+        );
+      }
+    });
+
+    test('malformed UTF-8 statistics give no bounds', () {
+      // A truncated bound decoded with replacement characters could rank
+      // above real values and prune a matching unit.
+      expect(
+        ColumnBounds.decode(
+          Uint8List.fromList([0x61, 0xe2, 0x82]),
+          DataType.string,
+        ),
+        isNull,
+      );
+      expect(
+        ColumnBounds.decode(Uint8List.fromList([0x61, 0x62]), DataType.string),
+        'ab',
+      );
+    });
+  });
+
+  group('reader boundaries report failures as Err', () {
+    late Directory dir;
+    setUp(() => dir = Directory.systemTemp.createTempSync('readers_'));
+    tearDown(() => dir.deleteSync(recursive: true));
+
+    test('a missing path is Kind.missing for every reader', () async {
+      final none = '${dir.path}/none';
+      final reads = <String, Future<Result<Object?, ErrorDetails>>>{
+        'ParquetReader': ParquetReader('$none.parquet').read(),
+        'CsvReader': CsvReader().readFile('$none.csv'),
+        'JsonReader': JsonReader().readFile('$none.json'),
+        'DeltaTable': DeltaTable(none).read(),
+        'IcebergTable': IcebergTable(none).read(),
+        'Dataset': Dataset(none).read(),
+      };
+      for (final MapEntry(:key, :value) in reads.entries) {
+        await expectLater(value, failsWith(Kind.missing), reason: key);
+      }
+    });
+
+    test('a corrupt file is Kind.corrupt', () async {
+      final parquet = File('${dir.path}/bad.parquet')
+        ..writeAsBytesSync(List.filled(64, 0));
+      final csv = File('${dir.path}/bad.csv')..writeAsStringSync('a\n"open');
+      final json = File('${dir.path}/bad.json')..writeAsStringSync('[{],');
+      await expectLater(
+        ParquetReader(parquet.path).read(),
+        failsWith(Kind.corrupt),
+      );
+      await expectLater(
+        CsvReader().readFile(csv.path),
+        failsWith(Kind.corrupt),
+      );
+      await expectLater(
+        JsonReader().readFile(json.path),
+        failsWith(Kind.corrupt),
+      );
+    });
+
+    test('an over-cap read is Kind.limit', () async {
+      final csv = File('${dir.path}/big.csv')
+        ..writeAsStringSync('a\n1\n2\n3\n');
+      await expectLater(
+        CsvReader().readFile(csv.path, maxRows: 1),
+        failsWith(Kind.limit),
+      );
+    });
+  });
+
+  group('writer boundaries report failures as Err', () {
+    late Directory dir;
+    setUp(() => dir = Directory.systemTemp.createTempSync('writers_'));
+    tearDown(() => dir.deleteSync(recursive: true));
+
+    final table = Table.fromRows('t', [
+      {'id': 1},
+    ]);
+
+    test('an unwritable destination is Kind.io and leaves no file', () async {
+      // A directory where the file should go cannot be replaced by the write.
+      final target = Directory('${dir.path}/out')..createSync();
+      final writes = <String, Future<Result<void, ErrorDetails>>>{
+        'ParquetWriter': ParquetWriter(target.path).write(table),
+        'CsvWriter': CsvWriter().writeTable(table, target.path),
+        'JsonWriter': JsonWriter().writeTable(table, target.path),
+        'DataFrame.writeCsv': DataFrame.fromTable(table).writeCsv(target.path),
+      };
+      for (final MapEntry(:key, :value) in writes.entries) {
+        await expectLater(value, failsWith(Kind.io), reason: key);
+      }
+      final leftovers = dir
+          .listSync()
+          .where((f) => f.path.endsWith('.tmp'))
+          .toList();
+      expect(leftovers, isEmpty);
+    });
+
+    test('a value its column type would truncate is Kind.invalid', () async {
+      final wide = Table(
+        name: 't',
+        columns: [
+          // Boxed, so the declared int32 is not checked against the values.
+          ListColumn<int>(
+            name: 'n',
+            dataType: DataType.int32,
+            data: [1 << 40],
+            nullable: false,
+          ),
+        ],
+        schema: Schema(
+          fields: [Field(name: 'n', dataType: DataType.int32, nullable: false)],
+        ),
+      );
+      final path = '${dir.path}/wide.parquet';
+      await expectLater(
+        ParquetWriter(path).write(wide),
+        failsWith(Kind.invalid),
+      );
+      expect(File(path).existsSync(), isFalse);
+    });
+  });
+
+  group('unexpected errors are reported, preconditions still throw', () {
+    late Directory dir;
+    setUp(() => dir = Directory.systemTemp.createTempSync('escape_'));
+    tearDown(() => dir.deleteSync(recursive: true));
+
+    final table = Table.fromRows('t', [
+      {'id': 1},
+      {'id': 2},
+    ]);
+
+    test('an error in a caller-supplied predicate is an Err', () async {
+      final path = '${dir.path}/delta';
+      await DeltaWriter(path).write(table).ok;
+      final error = await DeltaWriter(
+        path,
+      ).delete((row) => throw StateError('predicate bug')).err;
+      expect(error.kind, Kind.invalid);
+      expect(error.cause, isA<StateError>());
+    });
+
+    test('an error in a custom commit coordinator is an Err', () async {
+      final error = await DeltaWriter(
+        '${dir.path}/delta',
+        coordinator: _Throwing(),
+      ).write(table).err;
+      expect(error.cause, isA<RangeError>());
+      // The staged data file was cleaned up: nothing referenced it.
+      final staged = Directory(
+        '${dir.path}/delta',
+      ).listSync().where((f) => f.path.endsWith('.parquet'));
+      expect(staged, isEmpty);
+    });
+
+    test('an error in a source stream is an Err with no file left', () async {
+      final path = '${dir.path}/out.parquet';
+      Stream<Table> source() async* {
+        yield table;
+        throw RangeError('source bug');
+      }
+
+      final error = await ParquetWriter(path).writeBatches(source()).err;
+      expect(error.cause, isA<RangeError>());
+      expect(File(path).existsSync(), isFalse);
+    });
+
+    test('argument preconditions throw', () async {
+      final writer = ParquetWriter('${dir.path}/x.parquet');
+      await writer.open(table.schema).ok;
+      expect(() => writer.open(table.schema), throwsStateError);
+      await writer.abort();
+      expect(
+        () => IcebergWriter('${dir.path}/ice').expireSnapshots(retain: 0),
+        throwsArgumentError,
+      );
+      expect(
+        () => CsvReader().readBatches('${dir.path}/x.csv', batchSize: 0),
+        throwsArgumentError,
+      );
+    });
+  });
+
+  group('shared pruning helpers', () {
+    test('exact bounds describe a unit holding one value', () {
+      final bounds = ColumnBounds.exact(5, rows: 10);
+      expect(
+        (bounds.min, bounds.max, bounds.nullCount, bounds.rowCount),
+        (5, 5, 0, 10),
+      );
+      expect(ColumnBounds.exact(null).nullCount, 1);
+      expect(
+        RowFilter.compare('a', FilterOp.eq, 6).keep({'a': bounds}),
+        isFalse,
+      );
+    });
+
+    test('only unambiguous types are judged, read in their own type', () {
+      expect(ColumnBounds.judged(DataType.int32), isTrue);
+      expect(ColumnBounds.judged(DataType.string), isTrue);
+      expect(ColumnBounds.judged(DataType.decimal), isFalse);
+      expect(ColumnBounds.judged(DataType.date), isFalse);
+      expect(ColumnBounds.typed(3, DataType.float64), 3.0);
+      expect(ColumnBounds.typed('3', DataType.int64), isNull);
+      expect(ColumnBounds.typed(true, DataType.boolean), isTrue);
+    });
+  });
+
+  group('atomic publish', () {
+    late Directory dir;
+    setUp(() => dir = Directory.systemTemp.createTempSync('publish_'));
+    tearDown(() => dir.deleteSync(recursive: true));
+
+    List<String> names() =>
+        [for (final f in dir.listSync()) p.basename(f.path)]..sort();
+
+    test('a write replaces the destination and leaves no temp', () async {
+      final dest = '${dir.path}/out.txt';
+      File(dest).writeAsStringSync('old');
+      await publish(dest, (temp) => File(temp).writeAsString('new'));
+      expect(File(dest).readAsStringSync(), 'new');
+      await publishSink(dest, (sink) async => sink.write('streamed'));
+      expect(File(dest).readAsStringSync(), 'streamed');
+      expect(names(), ['out.txt']);
+    });
+
+    test('a failed write keeps the destination and leaves no temp', () async {
+      final dest = '${dir.path}/out.txt';
+      File(dest).writeAsStringSync('old');
+      await expectLater(
+        publish(dest, (temp) async {
+          File(temp).writeAsStringSync('partial');
+          throw const FileSystemException('disk full');
+        }),
+        throwsA(isA<FileSystemException>()),
+      );
+      await expectLater(
+        publishSink(dest, (sink) async {
+          sink.write('partial');
+          throw StateError('encoder');
+        }),
+        throwsStateError,
+      );
+      expect(File(dest).readAsStringSync(), 'old');
+      expect(names(), ['out.txt']);
+    });
+  });
+
+  group('parseUtc', () {
+    test('out-of-range fields are rejected, not rolled over', () {
+      for (final text in [
+        '2024-13-45',
+        '2024-02-30',
+        '2023-02-29',
+        '2024-00-10',
+        '2024-01-00',
+        '2024-01-01 24:00:00',
+        '2024-01-01 10:60:00',
+        '2024-01-01 10:00:60',
+        '2024-01-01T25:00:00Z',
+      ]) {
+        expect(parseUtc(text), isNull, reason: text);
+      }
+    });
+
+    test('valid text still parses, an offset keeping its instant', () {
+      expect(parseUtc('2024-02-29'), DateTime.utc(2024, 2, 29));
+      expect(
+        parseUtc('2024-12-31 23:59:59.5'),
+        DateTime.utc(2024, 12, 31, 23, 59, 59, 500),
+      );
+      expect(
+        parseUtc('2024-01-01T23:30:00-02:00'),
+        DateTime.utc(2024, 1, 2, 1, 30),
+      );
+    });
+  });
+
+  group('varint', () {
+    Uint8List encode(int value) {
+      final out = BytesBuilder();
+      writeVarint(out, value);
+      return out.toBytes();
+    }
+
+    test('round-trips every int64, negatives as 10 unsigned bytes', () {
+      for (final value in [0, 1, 127, 128, 300, 1 << 62, -1, -(1 << 63)]) {
+        final bytes = encode(value);
+        expect(readVarint(bytes, 0, label: 'test'), (
+          value: value,
+          next: bytes.length,
+        ));
+      }
+      // The old RLE writer stopped at once on a negative value and wrote one
+      // wrong byte.
+      expect(encode(-1), hasLength(10));
+    });
+
+    test('zigzag maps small magnitudes to small codes and back', () {
+      for (final value in [0, -1, 1, -2, 1 << 62, -(1 << 63)]) {
+        expect(unzigzag(zigzag(value)), value);
+      }
+      expect(
+        [
+          for (final v in [0, -1, 1, -2]) zigzag(v),
+        ],
+        [0, 1, 2, 3],
+      );
+    });
+
+    test('a truncated or overlong varint is a format error naming it', () {
+      expect(
+        () => readVarint(Uint8List.fromList([0x80]), 0, label: 'Thrift'),
+        throwsA(
+          isA<FormatException>().having(
+            (e) => e.message,
+            'message',
+            contains('Thrift'),
+          ),
+        ),
+      );
+      expect(
+        () => readVarint(
+          Uint8List.fromList(List.filled(6, 0x80)),
+          0,
+          maxBytes: 5,
+          label: 'RLE',
+        ),
+        throwsFormatException,
+      );
+    });
+  });
+
+  group('result', () {
+    test('Ok and Err compare by value', () {
+      // Not const: canonicalized constants are identical anyway.
+      Ok<int, String> ok(int value) => Ok(value);
+      Err<int, String> err(String error) => Err(error);
+      expect(ok(1), ok(1));
+      expect(ok(1).hashCode, ok(1).hashCode);
+      expect(ok(1), isNot(ok(2)));
+      expect(err('a'), err('a'));
+      expect(Ok<int, int>(1), isNot(Err<int, int>(1)));
+    });
+
+    test('map transforms an Ok and passes an Err through', () {
+      const Result<int, String> ok = Ok(2);
+      const Result<int, String> err = Err('bad');
+      expect(ok.map((v) => '$v!'), Ok<String, String>('2!'));
+      expect(err.map((v) => '$v!'), Err<String, String>('bad'));
+    });
+
+    // An exhaustive switch over the sealed Result needs no default: a missing
+    // case is a compile error, so this test compiling is half the check.
+    String describe(Result<int, ErrorDetails> result) => switch (result) {
+      Ok(:final value) => 'ok $value',
+      Err(:final error) => 'err ${error.kind.name}: ${error.message}',
+    };
+
+    test('Ok carries a value and Err carries ErrorDetails', () {
+      expect(describe(const Ok(3)), 'ok 3');
+      expect(
+        describe(
+          const Err(ErrorDetails(Kind.conflict, 'version 4 already claimed')),
+        ),
+        'err conflict: version 4 already claimed',
+      );
+    });
+
+    test('ErrorDetails keeps its cause', () {
+      final cause = StateError('underlying');
+      final details = ErrorDetails(Kind.io, 'read failed', cause);
+      expect(details.cause, same(cause));
+      expect(details.toString(), contains('io'));
+      expect(details.toString(), contains('read failed'));
+    });
+
+    test('Kind covers every category of expected failure', () {
+      expect(Kind.values.map((kind) => kind.name), [
+        'conflict',
+        'indeterminate',
+        'limit',
+        'schema',
+        'corrupt',
+        'denied',
+        'invalid',
+        'missing',
+        'unsupported',
+        'io',
+        'timeout',
+      ]);
+    });
+  });
+
+  group('stats bounds', () {
+    test('strings order by code point, as UTF-8 bytes do', () {
+      // U+1F600 is a surrogate pair (0xD83D...) in UTF-16, which sorts below
+      // U+FF01 by code unit but above it by code point.
+      final stats = StatsAccumulator()
+        ..addColumn(
+          ListColumn<String>(
+            name: 's',
+            dataType: DataType.string,
+            data: ['\uFF01', '\u{1F600}', 'a'],
+          ),
+        );
+      expect(stats.min, 'a');
+      expect(stats.max, '\u{1F600}');
+      expect(compareCodePoints('\uFF01', '\u{1F600}'), lessThan(0));
+    });
+
+    test('infinity is a bound and only NaN is counted as NaN', () {
+      final stats = StatsAccumulator()
+        ..addColumn(
+          NumericColumn.float64(
+            name: 'x',
+            values: [1.0, double.infinity, double.negativeInfinity, double.nan],
+            nullable: false,
+          ),
+        );
+      expect(stats.min, double.negativeInfinity);
+      expect(stats.max, double.infinity);
+      expect(stats.nans, 1);
+    });
+  });
+
+  group('decimal consistency', () {
+    Table decimals() => Table(
+      name: 't',
+      schema: Schema(
+        fields: [
+          Field(name: 'd', dataType: DataType.decimal, precision: 10, scale: 2),
+        ],
+      ),
+      columns: [
+        ListColumn<BigInt>(
+          name: 'd',
+          dataType: DataType.decimal,
+          data: [BigInt.from(150), BigInt.from(-25), null, BigInt.from(150)],
+        ),
+      ],
+    );
+
+    test('a decimal reports BigInt as its Dart type', () {
+      expect(DataType.decimal.dartType, BigInt);
+    });
+
+    test('Table.statistics scales a decimal column by its field', () {
+      final stats = decimals().statistics['d']!;
+      expect(stats.min, -0.25);
+      expect(stats.max, 1.5);
+      expect(stats.nullCount, 1);
+      expect(stats.distinctCount, 2);
+      expect(stats.mean, closeTo(0.9166, 1e-3));
+    });
+
+    test('a decimal column alone has no stats, rather than a crash', () {
+      expect(decimals().columns.single.stats, isNull);
+    });
+  });
+
   group('column immutability', () {
     NumericColumn<int> intCol() =>
         NumericColumn.int64(name: 'v', values: [1, 2, null, 4], nullable: true);
@@ -84,7 +595,7 @@ void main() {
 
     test('an astral bound keeps a BMP value inside its byte range', () {
       // "\uE000" < "\uF000" < "\u{10000}" by UTF-8 bytes. In UTF-16 order the
-      // max reads as its lead surrogate D800, putting F000 above it — and the
+      // max reads as its lead surrogate D800, putting F000 above it, and the
       // row group gets pruned away.
       expect(
         probe('\uF000').keep({'s': bounds('\uE000', '\u{10000}')}),
@@ -135,13 +646,11 @@ void main() {
       expect(() => strings(['a', null], nullable: false), throwsArgumentError);
     });
 
-    // KNOWN DIVERGENCE, pinned so it cannot drift further: NumericColumn
-    // allocates its null bitmap whenever the column is nullable and answers
-    // `_nullBitmap != null`, so it reports "is nullable" where ListColumn
-    // reports "holds a null". Every consumer only ever WIDENS nullability on a
-    // true (concat, the Parquet reader's promotion, the writer's required-leaf
-    // choice), so this over-declares rather than corrupts.
-    test('a nullable numeric column reports nullability, not actual nulls', () {
+    // NumericColumn allocates its null bitmap whenever the column is
+    // nullable, but answers whether a null is actually present, like every
+    // other column (answering "is nullable" made a table refuse the default
+    // factory column under a non-nullable field).
+    test('a nullable numeric column reports actual nulls', () {
       expect(
         NumericColumn.int64(
           name: 'v',
@@ -152,7 +661,7 @@ void main() {
       );
       expect(
         NumericColumn.int64(name: 'v', values: [1, 2], nullable: true).hasNulls,
-        isTrue, // no null present; ListColumn would answer false here
+        isFalse,
       );
       expect(
         NumericColumn.int64(
@@ -177,7 +686,7 @@ void main() {
 
   group('numeric edges', () {
     SqlEngine engine() {
-      final e = SqlEngine();
+      final e = SqlEngine.open().ok;
       e.registerTable(
         't',
         Table(
@@ -208,23 +717,23 @@ void main() {
     test(
       'CAST of an out-of-range / non-finite double to int is NULL (no crash)',
       () async {
-        final t = await engine().execute(
-          'SELECT CAST(x AS BIGINT) AS r FROM t',
-        );
+        final t = await engine()
+            .execute('SELECT CAST(x AS BIGINT) AS r FROM t')
+            .ok;
         final r = t.toRows().map((row) => row['r']).toList();
-        expect(r[0], isNull); // 1e30 — out of int64 range
+        expect(r[0], isNull); // 1e30: out of int64 range
         expect(r[1], isNull); // Infinity
         expect(r[2], isNull); // NaN
-        expect(r[3], 1); // 1.5 → 1 (in range)
+        expect(r[3], 2); // 1.5 → 2 (in range; rounds half away from zero)
       },
     );
 
     test(
       'ROUND with an extreme exponent does not return Infinity/NaN',
       () async {
-        final t = await engine().execute(
-          'SELECT ROUND(x, 400) AS r FROM t WHERE id = 4',
-        );
+        final t = await engine()
+            .execute('SELECT ROUND(x, 400) AS r FROM t WHERE id = 4')
+            .ok;
         final v = t.toRows().single['r'] as double;
         expect(v.isFinite, isTrue);
         expect(v, closeTo(1.5, 1e-9));
@@ -236,7 +745,7 @@ void main() {
       () async {
         expect(
           engine().execute('SELECT id FROM t LIMIT -1'),
-          throwsA(anything),
+          failsWith(Kind.invalid),
         );
       },
     );
@@ -244,7 +753,7 @@ void main() {
 
   group('sum overflow', () {
     SqlEngine engineWith(List<int> values) {
-      final e = SqlEngine();
+      final e = SqlEngine.open().ok;
       e.registerTable(
         't',
         Table(
@@ -261,12 +770,12 @@ void main() {
     }
 
     test('SUM past 2^63 does not overflow (was a silent negative)', () async {
-      // 3 × 8e18 = 2.4e19 > int64 max (~9.2e18) — would wrap to negative.
+      // 3 × 8e18 = 2.4e19 > int64 max (~9.2e18): would wrap to negative.
       final t = await engineWith([
         8000000000000000000,
         8000000000000000000,
         8000000000000000000,
-      ]).execute('SELECT SUM(v) AS s FROM t');
+      ]).execute('SELECT SUM(v) AS s FROM t').ok;
       expect(
         t.toRows().single['s'],
         Decimal(BigInt.parse('24000000000000000000'), 0),
@@ -279,7 +788,7 @@ void main() {
       final t = await engineWith([
         big,
         big,
-      ]).execute('SELECT SUM(v) AS s FROM t');
+      ]).execute('SELECT SUM(v) AS s FROM t').ok;
       expect(
         t.toRows().single['s'],
         Decimal(BigInt.from(big) + BigInt.from(big), 0),
@@ -291,17 +800,17 @@ void main() {
         1,
         2,
         3,
-      ]).execute('SELECT SUM(v) AS s FROM t');
+      ]).execute('SELECT SUM(v) AS s FROM t').ok;
       // The result column is a lossless decimal holding a BigInt. (The final
       // result *schema field* is still mislabeled by the SELECT projection's
-      // placeholder column types — a separate, pre-existing planner-binding gap
+      // placeholder column types: a separate, pre-existing planner-binding gap
       // that affects every aggregate output, not just SUM.)
       expect(t.column('s')!.dataType, DataType.decimal);
       expect(t.toRows().single['s'], Decimal(BigInt.from(6), 0));
     });
 
     test('SUM over a floating column stays float64', () async {
-      final e = SqlEngine();
+      final e = SqlEngine.open().ok;
       e.registerTable(
         'f',
         Table(
@@ -318,7 +827,7 @@ void main() {
           ),
         ),
       );
-      final t = await e.execute('SELECT SUM(x) AS s FROM f');
+      final t = await e.execute('SELECT SUM(x) AS s FROM f').ok;
       expect(t.toRows().single['s'], 4.0);
     });
   });
@@ -373,7 +882,7 @@ void main() {
       final t = Table(
         name: 't',
         columns: [
-          NumericColumn.adopt(
+          NumericVector.adopt(
             name: 'k',
             dataType: DataType.float64,
             data: Float64List.fromList([double.nan, double.nan, 1.5]),
@@ -435,23 +944,24 @@ void main() {
       addTearDown(() => dir.deleteSync(recursive: true));
       final w = DeltaWriter('${dir.path}/t');
       // Two rows whose (id1,id2) tuples both stringify to "123".
-      await w.write(mergeTbl([1, 12], [23, 3], ['a', 'b']));
+      await w.write(mergeTbl([1, 12], [23, 3], ['a', 'b'])).ok;
       // Source updates ONLY (1,23).
-      await w.merge(
-        mergeTbl([1], [23], ['UPDATED']),
-        on: ['id1', 'id2'],
-        whenMatchedUpdate: {'name': (t, s) => s['name']},
-        whenNotMatchedInsert: false,
-      );
-      final t = await (await DataFrameIO.readDelta('${dir.path}/t')).execute();
+      await w
+          .merge(
+            mergeTbl([1], [23], ['UPDATED']),
+            on: ['id1', 'id2'],
+            whenMatchedUpdate: {'name': (t, s) => s['name']},
+            whenNotMatchedInsert: false,
+          )
+          .ok;
+      final t = await (await DataFrameIO.readDelta(
+        '${dir.path}/t',
+      ).ok).execute().ok;
       final byPair = {
         for (final r in t.toRows()) '${r['id1']}_${r['id2']}': r['name'],
       };
       expect(byPair['1_23'], 'UPDATED');
-      expect(
-        byPair['12_3'],
-        'b',
-      ); // untouched — would be clobbered on collision
+      expect(byPair['12_3'], 'b'); // untouched: would be clobbered on collision
     });
   });
 
@@ -514,7 +1024,7 @@ void main() {
         final rows = [
           for (var i = 0; i < 130; i++) {'v': i < 129 ? 1 : 1000000},
         ];
-        final t = await DataFrame.fromRows(rows).execute();
+        final t = await DataFrame.fromRows(rows).execute().ok;
         expect(t.column('v')!.toList()[129], 1000000);
       });
 
@@ -523,7 +1033,7 @@ void main() {
           for (var i = 0; i < 150; i++)
             i < 120 ? {'a': i} : {'a': i, 'late': 'x'},
         ];
-        final t = await DataFrame.fromRows(rows).execute();
+        final t = await DataFrame.fromRows(rows).execute().ok;
         expect(t.schema.fieldNames, contains('late'));
       });
 
@@ -532,7 +1042,7 @@ void main() {
           for (var i = 0; i < 130; i++) {'v': i < 125 ? i : 'oops'},
         ];
         // Must not throw a CastError during column build.
-        final t = await DataFrame.fromRows(rows).execute();
+        final t = await DataFrame.fromRows(rows).execute().ok;
         expect(t.column('v')!.dataType, DataType.string);
       });
     });
@@ -571,7 +1081,7 @@ void main() {
 
     // An explicit schema is a CONTRACT. Column validation only checks a
     // column's declared dtype, not its values, so a boxed column would happily
-    // hold a value of the wrong runtime type — the table then claims a type its
+    // hold a value of the wrong runtime type: the table then claims a type its
     // data contradicts, and the mismatch only surfaces far downstream (a writer,
     // a comparison, an isolate transfer).
     group('an explicit schema rejects values of the wrong type', () {
@@ -643,7 +1153,7 @@ void main() {
       test('an inferred schema widens and coerces rather than throwing', () {
         // Types come from the values there, so mixed input widens to the common
         // type (string) rather than throwing. The value is COERCED to that type
-        // ('9', not raw int 9) so the column's data matches its declared dtype —
+        // ('9', not raw int 9) so the column's data matches its declared dtype:
         // an inferred string column holding an int would be a dtype lie the
         // Parquet/Arrow writers and the compare kernel later trip on.
         final t = Table.fromRows('t', [
@@ -733,7 +1243,7 @@ void main() {
         ]);
       });
 
-      test('Column.toList stays raw — a Column carries no scale', () {
+      test('Column.toList stays raw: a Column carries no scale', () {
         // The scale lives on the Field, so only Table can render one. This is
         // the internal representation the kernels operate on.
         expect(decimals([150], 2).column('v')!.toList(), [BigInt.from(150)]);
@@ -801,7 +1311,7 @@ void main() {
             ),
           ],
         );
-        // 7.00 IS 7 — normalizing first means this is exact, not a rounding.
+        // 7.00 IS 7: normalizing first means this is exact, not a rounding.
         final t = Table.fromRows('t', [
           {'v': Decimal(BigInt.from(700), 2)},
         ], schema: schema);
@@ -993,8 +1503,8 @@ void main() {
         final b = Directory('${root.path}/b')..createSync();
         // Back-to-back writes; both are version 0, so the only differing part of
         // the filename is the random UUID segment.
-        await DeltaWriter(a.path).write(t());
-        await DeltaWriter(b.path).write(t());
+        await DeltaWriter(a.path).write(t()).ok;
+        await DeltaWriter(b.path).write(t()).ok;
         expect(part(a), isNot(equals(part(b))));
       } finally {
         root.deleteSync(recursive: true);
@@ -1079,9 +1589,8 @@ void main() {
         0,
         0,
       ]);
-      // boolean is a single byte
-      expect(icebergBound(true, DataType.boolean)!.toList(), [1]);
-      expect(icebergBound(false, DataType.boolean)!.toList(), [0]);
+      // A boolean has no bound: the stats order no booleans.
+      expect(icebergBound(true, DataType.boolean), isNull);
       // string is UTF-8
       expect(icebergBound('AB', DataType.string)!.toList(), [65, 66]);
       // double 1.0 = 0x3FF0000000000000, little-endian
@@ -1125,7 +1634,7 @@ void main() {
           'file:///abs/data.parquet',
           allowExternal: true,
         ),
-        'file:///abs/data.parquet',
+        '/abs/data.parquet',
       );
       expect(
         resolveDataFile('/root', '/abs/data.parquet', allowExternal: true),
@@ -1137,12 +1646,46 @@ void main() {
       );
     });
 
+    test('every file: URI form is its decoded path', () {
+      for (final uri in [
+        'file:/abs/a%20b.parquet',
+        'file:///abs/a%20b.parquet',
+        'file://localhost/abs/a%20b.parquet',
+      ]) {
+        expect(embeddedPath('/root', uri), '/abs/a b.parquet', reason: uri);
+      }
+    });
+
+    test('plain paths are percent-decoded, relative ones under the root', () {
+      expect(embeddedPath('/root', '/abs/a%20b.parquet'), '/abs/a b.parquet');
+      expect(embeddedPath('/root', 'p%3D1/x.parquet'), '/root/p=1/x.parquet');
+    });
+
+    test('an Iceberg path is not percent-decoded', () {
+      expect(
+        embeddedPath('/root', 'file:/abs/a%20b.parquet', encoded: false),
+        '/abs/a%20b.parquet',
+      );
+    });
+
+    test('another scheme or host is not a local path', () {
+      expect(embeddedPath('/root', 's3://bucket/x.parquet'), isNull);
+      expect(embeddedPath('/root', 'file://server/x.parquet'), isNull);
+    });
+
+    test('a malformed escape is corrupt', () {
+      expect(
+        () => embeddedPath('/root', 'part%zz.parquet'),
+        throwsFailure(Kind.corrupt),
+      );
+    });
+
     test(
       'a URI-scheme path outside the root is rejected without allowExternal',
       () {
         expect(
           () => resolveDataFile('/root', 's3://bucket/data.parquet'),
-          throwsA(isA<ArgumentError>()),
+          throwsFailure(Kind.denied),
         );
       },
     );
@@ -1230,7 +1773,7 @@ void main() {
       final dir = Directory.systemTemp.createTempSync('csvfid_');
       try {
         final path = '${dir.path}/o.csv';
-        await CsvWriter().writeTable(t(), path);
+        await CsvWriter().writeTable(t(), path).ok;
         final csv = File(path).readAsStringSync();
         expect(csv, contains('123.45'));
         expect(csv, isNot(contains('12345')));
@@ -1295,7 +1838,7 @@ void main() {
       Link('${dir.path}/link').createSync('${outside.path}/f');
       expect(
         () => confine(dir.path, '${dir.path}/link'),
-        throwsA(isA<ArgumentError>()),
+        throwsFailure(Kind.denied),
       );
       outside.deleteSync(recursive: true);
     });
@@ -1417,7 +1960,7 @@ void main() {
       final schema = Schema(
         fields: [Field(name: 'v', dataType: DataType.float64, nullable: true)],
       );
-      // Integer literal 10 then double 10.5 — cast<double?> would throw.
+      // Integer literal 10 then double 10.5: cast<double?> would throw.
       final chunk = DataChunk.fromRows([
         {'v': 10},
         {'v': 10.5},
@@ -1501,7 +2044,7 @@ void main() {
         nullable: false,
       );
       // Old code: 100 * fixedSize(8) = 800. Now ≥ one ref (8) + heap payload
-      // per row, so materially larger — a boxed column can't slip the budget.
+      // per row, so materially larger: a boxed column can't slip the budget.
       expect(col.memoryUsage, greaterThan(100 * 8));
     });
 
@@ -1604,7 +2147,7 @@ void main() {
         {'v': big},
         {'v': 0.5},
       ], schema: schema);
-      // Unscaled BigInt at scale 1: big*10 and 5 — the integer is preserved
+      // Unscaled BigInt at scale 1: big*10 and 5. The integer is preserved
       // exactly (float64 would have rounded 2^53+1 to 2^53).
       expect(t.column('v')!.toList(), [
         BigInt.from(big) * BigInt.from(10),
@@ -1639,7 +2182,7 @@ void main() {
       ]).fields.single;
       expect(f.dataType, DataType.decimal);
       expect(f.scale, 2);
-      expect(f.precision! >= f.scale!, isTrue); // was decimal(1,2) — invalid
+      expect(f.precision! >= f.scale!, isTrue); // was decimal(1,2): invalid
     });
 
     test('an int mixed with a non-finite double stays float64 (no throw)', () {
@@ -1737,7 +2280,7 @@ void main() {
     });
 
     test('GROUP BY on an int16 column returns an int16 key', () async {
-      final engine = SqlEngine();
+      final engine = SqlEngine.open().ok;
       engine.registerTable(
         't',
         Table(
@@ -1756,19 +2299,19 @@ void main() {
           ],
         ),
       );
-      final r = await engine.execute(
-        'SELECT v, COUNT(*) AS c FROM t GROUP BY v',
-      );
+      final r = await engine
+          .execute('SELECT v, COUNT(*) AS c FROM t GROUP BY v')
+          .ok;
       expect(typeOf(r, 'v'), DataType.int16);
       expect(r.rowCount, 2);
     });
   });
 
-  // ---- Relocated: review_defects (#5 NumericColumn.adopt validates buffer) --
-  group('#5 NumericColumn.adopt validates its buffer', () {
+  // ---- Relocated: review_defects (#5 NumericVector.adopt validates buffer) --
+  group('#5 NumericVector.adopt validates its buffer', () {
     test('a buffer whose type mismatches the dataType throws', () {
       expect(
-        () => NumericColumn.adopt(
+        () => NumericVector.adopt(
           name: 'v',
           dataType: DataType.int8,
           data: Int64List(1),
@@ -1779,7 +2322,7 @@ void main() {
 
     test('a wrong-length null bitmap throws', () {
       expect(
-        () => NumericColumn.adopt(
+        () => NumericVector.adopt(
           name: 'v',
           dataType: DataType.int64,
           data: Int64List(2),
@@ -2069,6 +2612,25 @@ void main() {
       expect(counter, 2);
     });
 
+    test('paths through a symlink share one lock', () async {
+      // fcntl locks belong to the process, so within one isolate only the
+      // in-isolate mutex separates these; keyed lexically, the two paths
+      // took different keys and both bodies ran at once.
+      Directory('${dir.path}/real').createSync();
+      Link('${dir.path}/alias').createSync('${dir.path}/real');
+      var counter = 0;
+      Future<void> increment(String path) => withFileLock(path, () async {
+        final seen = counter;
+        await Future<void>.delayed(Duration.zero);
+        counter = seen + 1;
+      });
+      await Future.wait([
+        increment('${dir.path}/real/t.lock'),
+        increment('${dir.path}/alias/t.lock'),
+      ]);
+      expect(counter, 2);
+    });
+
     test('a timeout fails loud while a holder runs', () async {
       final lock = '${dir.path}/b.lock';
       final holderEntered = Completer<void>();
@@ -2110,7 +2672,7 @@ void main() {
 
     test('a timed-out waiter does not release the next waiter early', () async {
       // Regression: a waiter that times out must NOT complete its queue barrier
-      // while the real holder still runs — doing so lets the next waiter enter
+      // while the real holder still runs: doing so lets the next waiter enter
       // the body concurrently with the holder, breaking mutual exclusion.
       final lock = '${dir.path}/e.lock';
       var active = 0;
@@ -2213,8 +2775,8 @@ void main() {
           ),
         );
         const invariants = SqlInvariantEvaluator();
-        expect(await invariants.violations(t, 'v >= 0'), 1); // only -1
-        expect(await invariants.violations(t, 'v >= -10'), 0);
+        expect(await invariants.violations(t, 'v >= 0').ok, 1); // only -1
+        expect(await invariants.violations(t, 'v >= -10').ok, 0);
       },
     );
   });
@@ -2245,6 +2807,60 @@ void main() {
     test('encodePartition escapes; null keeps the Hive marker', () {
       expect(encodePartition('50%'), '50%25');
       expect(encodePartition(null), hiveDefaultPartition);
+    });
+
+    test('a date partition is its calendar day in any time zone', () {
+      // A local DateTime names its own wall-clock day, as the Parquet path
+      // stores it; converting to UTC first moved it a day east or west.
+      for (final value in [
+        DateTime(2024, 1, 1),
+        DateTime(2024, 1, 1, 23, 59),
+        DateTime.utc(2024, 1, 1),
+      ]) {
+        expect(encodePartitionValue(value, DataType.date), '2024-01-01');
+      }
+    });
+
+    test('date partitions do not depend on the host time zone', () async {
+      final dir = Directory.systemTemp.createTempSync('tz_');
+      addTearDown(() => dir.deleteSync(recursive: true));
+      final script = File('${dir.path}/tz.dart')
+        ..writeAsStringSync('''
+import 'package:libbigdata/src/core/data_type.dart';
+import 'package:libbigdata/src/core/partitions.dart';
+
+void main() {
+  print(encodePartitionValue(DateTime(2024, 1, 1), DataType.date));
+  print(encodePartitionValue(DateTime(2024, 1, 1, 23, 59), DataType.date));
+}
+''');
+      final packages = File('.dart_tool/package_config.json').absolute.path;
+      for (final zone in ['Pacific/Kiritimati', 'America/Los_Angeles']) {
+        final result = await Process.run(
+          Platform.resolvedExecutable,
+          ['--packages=$packages', script.path],
+          environment: {'TZ': zone},
+        );
+        expect(result.stdout, '2024-01-01\n2024-01-01\n', reason: zone);
+      }
+    });
+
+    test('binary and decimal partitions round-trip; paths use their text', () {
+      final bytes = Uint8List.fromList([1, 2, 255]);
+      final binary = encodePartitionValue(bytes, DataType.binary);
+      expect(decodePartitionValue(binary, DataType.binary), bytes);
+      expect(
+        () => decodePartitionValue(r'\u00zz', DataType.binary),
+        throwsFormatException,
+      );
+      expect(
+        encodePartition(BigInt.from(150), type: DataType.decimal, scale: 2),
+        '1.50',
+      );
+      expect(
+        encodePartition(DateTime.utc(2024, 1, 1), type: DataType.date),
+        '2024-01-01',
+      );
     });
   });
 
@@ -2291,6 +2907,524 @@ void main() {
       }
     });
   });
+
+  group('column contract', () {
+    _contract(
+      'ListColumn',
+      (values, nullable) => ListColumn<String>(
+        name: 'c',
+        dataType: DataType.string,
+        data: values.cast<String?>(),
+        nullable: nullable,
+      ),
+      ['a', 'bb', null, '', 'ccc', null, 'd'],
+    );
+    _contract(
+      'NumericColumn',
+      (values, nullable) => NumericColumn.int64(
+        name: 'c',
+        values: values.cast<int?>(),
+        nullable: nullable,
+      ),
+      [1, -2, null, 0, 1 << 40, null, 7],
+    );
+    _contract(
+      'BoolColumn',
+      (values, nullable) => BoolColumn(
+        name: 'c',
+        values: values.cast<bool?>(),
+        nullable: nullable,
+      ),
+      [true, false, null, true, false, null, true],
+    );
+    _contract(
+      'StringColumn',
+      (values, nullable) => StringColumn(
+        name: 'c',
+        values: values.cast<String?>(),
+        nullable: nullable,
+      ),
+      ['a', 'h\u00e9llo', null, '', '\u65e5\u672c', null, '\u{1F600}x'],
+    );
+  });
+
+  group('concat of byte-aligned pieces', () {
+    // Pieces of 16 and 8 rows start on byte boundaries, so their bitmaps copy
+    // a byte at a time; the 5-row tail and a piece after it do not.
+    List<int?> ints(int from, int count) => [
+      for (var i = from; i < from + count; i++) i % 3 == 0 ? null : i,
+    ];
+    final sizes = [16, 8, 5, 11];
+
+    test('numeric', () {
+      var from = 0;
+      final pieces = <Column>[];
+      for (final size in sizes) {
+        pieces.add(NumericColumn.int64(name: 'c', values: ints(from, size)));
+        from += size;
+      }
+      expect(Column.concat(pieces).toList(), ints(0, from));
+    });
+
+    test('string', () {
+      var from = 0;
+      final pieces = <Column>[];
+      for (final size in sizes) {
+        pieces.add(
+          StringColumn(
+            name: 'c',
+            values: [for (final v in ints(from, size)) v?.toString()],
+          ),
+        );
+        from += size;
+      }
+      expect(Column.concat(pieces).toList(), [
+        for (final v in ints(0, from)) v?.toString(),
+      ]);
+    });
+
+    test('bool', () {
+      var from = 0;
+      final pieces = <Column>[];
+      for (final size in sizes) {
+        pieces.add(
+          BoolColumn(
+            name: 'c',
+            values: [for (final v in ints(from, size)) v?.isEven],
+          ),
+        );
+        from += size;
+      }
+      expect(Column.concat(pieces).toList(), [
+        for (final v in ints(0, from)) v?.isEven,
+      ]);
+    });
+  });
+
+  group('BoolColumn', () {
+    test('costs at most 2 bits a value, nulls included', () {
+      final column = BoolColumn(
+        name: 'b',
+        values: [for (var i = 0; i < 10000; i++) i % 3 == 0 ? null : i.isEven],
+      );
+      expect(column.memoryUsage * 8 / column.length, lessThanOrEqualTo(2));
+    });
+
+    test('concatenating bool columns stays a BoolColumn', () {
+      final joined = Column.concat([
+        BoolColumn(name: 'b', values: [true, null, false]),
+        BoolColumn(name: 'b', values: [false, true], nullable: false),
+      ]);
+      expect(joined, isA<BoolColumn>());
+      expect(joined.toList(), [true, null, false, false, true]);
+    });
+
+    test('gather reads a negative index as null', () {
+      final column = BoolColumn(name: 'b', values: [true, null, false]);
+      expect(column.gather(Int32List.fromList([2, -1, 0, 1])).toList(), [
+        false,
+        null,
+        true,
+        null,
+      ]);
+    });
+
+    test('rows are built as BoolColumn', () {
+      final table = Table.fromRows('t', [
+        {'b': true},
+        {'b': null},
+        {'b': false},
+      ]);
+      expect(table.column('b'), isA<BoolColumn>());
+      expect(table.column('b')!.toList(), [true, null, false]);
+    });
+  });
+
+  group('validUtf8', () {
+    bool valid(List<int> bytes) =>
+        validUtf8(Uint8List.fromList(bytes), 0, bytes.length);
+
+    test('accepts ASCII and well-formed multibyte sequences', () {
+      expect(valid([]), isTrue);
+      expect(valid('plain'.codeUnits), isTrue);
+      expect(valid([0xc3, 0xa9]), isTrue); // U+00E9
+      expect(valid([0xe6, 0x97, 0xa5]), isTrue); // U+65E5
+      expect(valid([0xf0, 0x9f, 0x98, 0x80]), isTrue); // U+1F600
+      expect(valid([0xf4, 0x8f, 0xbf, 0xbf]), isTrue); // U+10FFFF
+    });
+
+    test('rejects what a strict decoder rejects', () {
+      expect(valid([0xff]), isFalse); // never a lead byte
+      expect(valid([0x80]), isFalse); // stray continuation
+      expect(valid([0xc3]), isFalse); // truncated
+      expect(valid([0xc3, 0x41]), isFalse); // bad continuation
+      expect(valid([0xc0, 0x80]), isFalse); // overlong
+      expect(valid([0xe0, 0x80, 0x80]), isFalse); // overlong
+      expect(valid([0xed, 0xa0, 0x80]), isFalse); // surrogate
+      expect(valid([0xf4, 0x90, 0x80, 0x80]), isFalse); // past U+10FFFF
+    });
+
+    test('checks only the given range', () {
+      final bytes = Uint8List.fromList([0xff, 0x41, 0x42, 0xff]);
+      expect(validUtf8(bytes, 1, 3), isTrue);
+      expect(validUtf8(bytes, 0, 3), isFalse);
+    });
+  });
+
+  group('StringColumn', () {
+    StringColumn of(List<String?> values) =>
+        StringColumn(name: 's', values: values);
+
+    test('an 8-character ASCII value costs under 14 bytes', () {
+      final column = of([for (var i = 0; i < 10000; i++) 'v${i + 1000000}']);
+      expect(column.memoryUsage / column.length, lessThan(14));
+    });
+
+    test('concatenating string columns stays a StringColumn', () {
+      final joined = Column.concat([
+        of(['a', null]),
+        of(['\u00e9', 'bc']),
+      ]);
+      expect(joined, isA<StringColumn>());
+      expect(joined.toList(), ['a', null, '\u00e9', 'bc']);
+      expect(joined.hasNulls, isTrue);
+    });
+
+    test('has no numeric statistics', () {
+      expect(of(['a', 'b']).stats, isNull);
+    });
+
+    test('a lone surrogate is stored as U+FFFD', () {
+      expect(of(['a\ud800b', 'c\udc00']).toList(), ['a\ufffdb', 'c\ufffd']);
+      // A pair is one code point and survives.
+      expect(of(['\ud83d\ude00']).toList(), ['\ud83d\ude00']);
+      final table = Table.fromRows('t', [
+        {'s': 'x\ud800'},
+      ]);
+      expect(table.column('s'), isA<StringColumn>());
+      expect(table.column('s')!.toList(), ['x\ufffd']);
+    });
+
+    test('compares in the order String.compareTo gives', () {
+      // U+E000..U+FFFF sorts after a surrogate pair in UTF-16 but before it in
+      // UTF-8 byte order; the comparison follows UTF-16, as SQL does.
+      final values = [
+        '',
+        'a',
+        'ab',
+        'b',
+        'Z',
+        '\u00e9',
+        '\u65e5',
+        '\ue000',
+        '\ufffd',
+        '\u{10000}',
+        '\u{1F600}',
+        '\u{1F600}a',
+      ];
+      final column = of(values);
+      for (var i = 0; i < values.length; i++) {
+        for (var j = 0; j < values.length; j++) {
+          final expected = values[i].compareTo(values[j]).sign;
+          expect(
+            column.compareAt(i, column, j).sign,
+            expected,
+            reason: '${values[i]} vs ${values[j]}',
+          );
+          expect(
+            column.compareBytes(i, utf8.encode(values[j])).sign,
+            expected,
+            reason: '${values[i]} vs bytes of ${values[j]}',
+          );
+        }
+      }
+    });
+
+    test('encode gives equal values one code, null included', () {
+      final column = of(['b', null, 'a', 'b', null, '', 'a', '']);
+      final (:codes, :firsts) = (column as StringVector).encode();
+      expect(codes, [0, 1, 2, 0, 1, 3, 2, 3]);
+      expect(firsts, [0, 1, 2, 5]);
+      final wide = of([for (var i = 0; i < 5000; i++) 'v${i % 1234}']);
+      final encoded = (wide as StringVector).encode();
+      expect(encoded.firsts.length, 1234);
+      for (var i = 0; i < 5000; i++) {
+        expect(encoded.codes[i], i % 1234);
+      }
+    });
+
+    test('interned shares one String per distinct value', () {
+      final values = of(['x', 'y', 'x', null]).interned();
+      expect(values, ['x', 'y', 'x', null]);
+      expect(identical(values[0], values[2]), isTrue);
+    });
+
+    test('gather reads a negative index as null', () {
+      final column = of(['a', null, 'c']);
+      final gathered = column.gather(Int32List.fromList([2, -1, 0, 1, 2]));
+      expect(gathered.toList(), ['c', null, 'a', null, 'c']);
+      final required = StringColumn(
+        name: 's',
+        values: ['a', 'b'],
+        nullable: false,
+      );
+      expect(required.gather(Int32List.fromList([1, 0])).nullable, isFalse);
+      expect(required.gather(Int32List.fromList([1, -1])).toList(), [
+        'b',
+        null,
+      ]);
+    });
+
+    test('adopt rejects offsets that run past the bytes', () {
+      expect(
+        () => StringVector.adopt(
+          name: 's',
+          offsets: Int32List.fromList([0, 2, 5]),
+          bytes: Uint8List(4),
+        ),
+        throwsArgumentError,
+      );
+      expect(
+        () => StringVector.adopt(
+          name: 's',
+          offsets: Int32List.fromList([0, 3, 2]),
+          bytes: Uint8List(4),
+        ),
+        throwsArgumentError,
+      );
+    });
+  });
+
+  group('column and table robustness', () {
+    Field field(String name, DataType type, {bool nullable = true}) =>
+        Field(name: name, dataType: type, nullable: nullable);
+
+    test('a nullable numeric column without nulls has none', () {
+      final column = NumericColumn.int64(name: 'id', values: [1, 2]);
+      expect(column.hasNulls, isFalse);
+      final table = Table(
+        name: 't',
+        columns: [column],
+        schema: Schema(fields: [field('id', DataType.int64, nullable: false)]),
+      );
+      expect(table.rowCount, 2);
+    });
+
+    test(
+      'union of frames with different column counts is a schema error',
+      () async {
+        final left = DataFrame.fromTable(
+          Table.fromRows('l', [
+            {'a': 1, 'b': 2},
+          ]),
+        );
+        final right = DataFrame.fromTable(
+          Table.fromRows('r', [
+            {'a': 1},
+          ]),
+        );
+        await expectLater(
+          left.union(right).execute(),
+          failsWith(Kind.schema, contains('(2 vs 1)')),
+        );
+        await expectLater(
+          right.union(left).execute(),
+          failsWith(Kind.schema, contains('(1 vs 2)')),
+        );
+      },
+    );
+
+    test('an unwritable log file does not crash the process', () async {
+      await LoggingConfig.shutdown();
+      LoggingConfig.initialize(
+        logToFile:
+            '/nonexistent-${DateTime.now().microsecondsSinceEpoch}/x.log',
+      );
+      addTearDown(LoggingConfig.shutdown);
+      LoggingConfig.getLogger('robustness').info('a record');
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      LoggingConfig.getLogger('robustness').info('another record');
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    });
+
+    test('lake writes take the materialization caps', () async {
+      final dir = Directory.systemTemp.createTempSync('caps_');
+      addTearDown(() => dir.deleteSync(recursive: true));
+      final frame = DataFrame.fromTable(
+        Table.fromRows('t', [
+          {'a': 1},
+          {'a': 2},
+        ]),
+      );
+      await expectLater(
+        frame.writeDelta('${dir.path}/delta', maxRows: 1),
+        failsWith(Kind.limit),
+      );
+      await expectLater(
+        frame.writeIceberg('${dir.path}/iceberg', maxRows: 1),
+        failsWith(Kind.limit),
+      );
+      await expectLater(
+        frame.writeArrow('${dir.path}/t.arrow', maxRows: 1),
+        failsWith(Kind.limit),
+      );
+    });
+
+    test('gathered strings past the 32-bit offsets are refused', () {
+      final column = StringColumn(name: 's', values: ['x' * (1 << 20)]);
+      final refused = throwsA(
+        isA<ArgumentError>().having(
+          (e) => e.message,
+          'message',
+          contains('holds more than'),
+        ),
+      );
+      expect(() => column.gather(Int32List(2100)), refused);
+      expect(() => column.filter(List.filled(2100, 0)), refused);
+    });
+
+    test('chunks of different integer widths make a promoted table', () {
+      DataChunk chunk(Column column) => DataChunk(
+        columns: [column],
+        schema: Schema(fields: [field('a', column.dataType)]),
+      );
+      final table = Table.fromChunks('t', [
+        chunk(NumericColumn.int32(name: 'a', values: [1])),
+        chunk(NumericColumn.int64(name: 'a', values: [1 << 40])),
+      ]);
+      expect(table.schema.fields.single.dataType, DataType.int64);
+      expect(table.column('a')!.toList(), [1, 1 << 40]);
+    });
+
+    test('fields that need a cast to combine are not compatible', () {
+      bool compatible(DataType a, DataType b) =>
+          field('a', a).isCompatibleWith(field('a', b));
+      expect(compatible(DataType.int32, DataType.int64), isTrue);
+      expect(compatible(DataType.float32, DataType.float64), isTrue);
+      expect(compatible(DataType.null_, DataType.string), isTrue);
+      expect(compatible(DataType.int64, DataType.string), isFalse);
+      expect(compatible(DataType.int64, DataType.decimal), isFalse);
+      expect(compatible(DataType.int64, DataType.float64), isFalse);
+      expect(compatible(DataType.date, DataType.timestamp), isFalse);
+    });
+
+    test('sample rejects a fraction outside 0 to 1', () async {
+      final frame = DataFrame.fromTable(
+        Table.fromRows('t', [
+          {'a': 1},
+        ]),
+      );
+      for (final fraction in [-0.1, 1.5, double.nan]) {
+        await expectLater(
+          frame.sample(fraction).execute(),
+          failsWith(Kind.invalid, contains('fraction')),
+          reason: '$fraction',
+        );
+      }
+    });
+
+    test('typed and boxed integer pieces concatenate', () {
+      final column = Column.concat([
+        NumericColumn.int32(name: 'a', values: [1]),
+        ListColumn<int>(name: 'a', dataType: DataType.int64, data: [2]),
+      ]);
+      expect(column.dataType, DataType.int64);
+      expect(column.toList(), [1, 2]);
+    });
+  });
+}
+
+/// The behaviour every [Column] implementation shares, checked against
+/// [values] (which hold at least one null) built by [make].
+void _contract(
+  String label,
+  Column Function(List<Object?> values, bool nullable) make,
+  List<Object?> values,
+) {
+  group(label, () {
+    final present = [for (final v in values) ?v];
+
+    test('reads back what it was built from', () {
+      final column = make(values, true);
+      expect(column.length, values.length);
+      expect(column.toList(), values);
+      for (var i = 0; i < values.length; i++) {
+        expect(column[i], values[i], reason: '$i');
+      }
+      expect(column.hasNulls, isTrue);
+      expect(make(present, true).toList(), present);
+    });
+
+    test('a non-nullable column has no nulls and rejects one', () {
+      final column = make(present, false);
+      expect(column.nullable, isFalse);
+      expect(column.hasNulls, isFalse);
+      expect(() => make(values, false), throwsArgumentError);
+    });
+
+    test('indexing out of range is a RangeError', () {
+      final column = make(values, true);
+      expect(() => column[-1], throwsRangeError);
+      expect(() => column[values.length], throwsRangeError);
+    });
+
+    test('slice', () {
+      final column = make(values, true);
+      expect(column.slice(2, 5).toList(), values.sublist(2, 5));
+      expect(column.slice(3).toList(), values.sublist(3));
+      expect(column.slice(4, 4).length, 0);
+      expect(column.slice(1, 3).name, 'c');
+      expect(() => column.slice(5, 3), throwsRangeError);
+      expect(() => column.slice(0, values.length + 1), throwsRangeError);
+    });
+
+    test('filter', () {
+      final column = make(values, true);
+      expect(column.filter([6, 0, 2, 0]).toList(), [
+        values[6],
+        values[0],
+        values[2],
+        values[0],
+      ]);
+      expect(column.filter([]).length, 0);
+      expect(() => column.filter([values.length]), throwsRangeError);
+    });
+
+    test('concat of its slices is the whole column', () {
+      final column = make(values, true);
+      final joined = Column.concat([
+        column.slice(0, 3),
+        column.slice(3, 3),
+        column.slice(3),
+      ]);
+      expect(joined.toList(), values);
+      expect(joined.dataType, column.dataType);
+    });
+
+    test('toList returns a copy', () {
+      final column = make(values, true);
+      column.toList()[0] = null;
+      expect(column[0], values[0]);
+    });
+
+    test('copy, withName and map', () {
+      final column = make(values, true);
+      expect(column.copy().toList(), values);
+      final renamed = column.withName('d');
+      expect(renamed.name, 'd');
+      expect(renamed.toList(), values);
+      final mapped = column.map((v) => v == null, DataType.boolean);
+      expect(mapped.toList(), [for (final v in values) v == null]);
+    });
+
+    test('memory usage grows with the data', () {
+      expect(make(values, true).memoryUsage, greaterThan(0));
+      expect(
+        make([...values, ...values], true).memoryUsage,
+        greaterThan(make(values, true).memoryUsage),
+      );
+    });
+  });
 }
 
 NumericColumn _num(DataType t, List<int> v) {
@@ -2298,4 +3432,14 @@ NumericColumn _num(DataType t, List<int> v) {
     return NumericColumn.int32(name: 'n', values: v, nullable: false);
   }
   return NumericColumn.int64(name: 'n', values: v, nullable: false);
+}
+
+/// A commit coordinator with a bug: it throws instead of returning a Result.
+class _Throwing implements DeltaCommitCoordinator {
+  @override
+  Future<Result<int, ErrorDetails>> commit({
+    required DeltaLog log,
+    required Future<List<Map<String, dynamic>>> Function(int version) build,
+    String label = 'commit',
+  }) async => throw RangeError('coordinator bug');
 }

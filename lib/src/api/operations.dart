@@ -5,64 +5,121 @@ part of 'dataframe.dart';
 abstract class Operation {
   const Operation();
 
-  /// Imperative application (fallback / unfusible ops). Most ops also implement
-  /// [toPhysical] so they fuse into a single streamed plan. [ctx] bounds any
-  /// intermediate this op materializes (by bytes) — see [ExecutionContext].
-  Future<Table> apply(Table table, ExecutionContext ctx);
+  /// This op as a logical node over [input], lowered with the rest of the
+  /// plan by [QueryPlanner.lower], or null for an op that has none: join and
+  /// union, which [DataFrame] combines with the other frame's plan
+  /// ([JoinOperation.combine], [UnionOperation.combine]).
+  logical.LogicalPlan? lower(logical.LogicalPlan input) => null;
 
-  /// Contribute this op to a fused physical plan over [input], or return null if
-  /// it can't be expressed as a plan node (then the caller materializes + uses
-  /// [apply]). [groupKeys] carries a preceding GROUP BY's keys to an aggregate.
-  ///
-  /// [ctx] is the CALLER's resource policy and must be threaded into any nested
-  /// plan an op builds (join/union build one for their right side). Without it
-  /// those nested builds fell back to a hard-coded default: a caller's tighter
-  /// cap was silently discarded, and `executeStream` — which asks for no cap —
-  /// had one imposed on it.
-  Future<PhysicalPlan?> toPhysical(
-    PhysicalPlan input,
-    List<String> groupKeys,
-    ExecutionContext ctx,
-  ) async => null;
-
-  /// The schema this op produces given [input] (`null` = unknown). Reshaping ops
-  /// (withColumn/join/aggregate) OVERRIDE this so the DataFrame's cached schema
-  /// reflects the transform instead of silently retaining the source schema.
-  /// The default passes [input] through unchanged. [groupKeys] carries a
-  /// preceding GROUP BY's keys to an aggregate.
-  Schema? outputSchema(Schema? input, List<String> groupKeys) => input;
+  /// The schema this op produces given [input] (`null` = unknown), its fields
+  /// still qualified by join side ([DataFrame.schema] reports them as a result
+  /// names them). Reshaping ops (select/drop/rename/withColumn/join/aggregate/
+  /// union) OVERRIDE this so the DataFrame's cached schema reflects the
+  /// transform instead of silently retaining the source schema. The default
+  /// passes [input] through unchanged.
+  Schema? outputSchema(Schema? input) => input;
 }
 
 /// A lazy file source at the root of a DataFrame built by an I/O factory
-/// (readParquet/…). Rooted at a streaming [PhysicalFileScan] in [_buildPlan] so a
-/// chained `.filter().head(n)` streams and stops early rather than decoding the
-/// whole file. It is ALWAYS the plan root, so its [apply]/[toPhysical] are never
-/// invoked (the root is built directly from it).
+/// (readParquet/…). [_buildPlan] roots the plan at a logical scan of it, which
+/// lowers to a streaming [PhysicalFileScan] carrying the pushed filter and
+/// projection, so a chained `.filter().head(n)` streams and stops early rather
+/// than decoding the whole file. It is ALWAYS the plan root, so its [lower]
+/// is never invoked.
 class ScanOperation extends Operation {
   final String path;
   final Schema tableSchema;
-  const ScanOperation(this.path, this.tableSchema);
 
-  @override
-  Future<Table> apply(Table table, ExecutionContext ctx) =>
-      throw StateError('ScanOperation is a plan root, never applied');
+  /// Opens the scan with the options its reader was called with; null opens
+  /// `openScan(path)` ([LazySource.open]).
+  final Scan Function()? open;
 
-  @override
-  Future<PhysicalPlan?> toPhysical(
-    PhysicalPlan input,
-    List<String> groupKeys,
-    ExecutionContext ctx,
-  ) async => throw StateError('ScanOperation is a plan root, never folded');
+  /// The caps the reader was called with (null: none). A materializing
+  /// terminal bounds the frame's result by the tighter of these and its own.
+  final int? maxRows;
+  final int? maxBytes;
+
+  const ScanOperation(
+    this.path,
+    this.tableSchema, {
+    this.open,
+    this.maxRows,
+    this.maxBytes,
+  });
 }
 
-/// dtype of [name] in [schema] (placeholder string if absent — resolved at eval).
-DataType _dtypeOf(Schema schema, String name) =>
-    schema.field(name)?.dataType ?? DataType.string;
+/// A logical reference to [field], under its qualifier when it has one.
+logical.ColumnExpression _logical(Field field) => logical.ColumnExpression(
+  name: field.name,
+  table: field.qualifier,
+  columnType: field.dataType,
+  isNullable: field.nullable,
+);
 
-/// A schema-only physical scan, so an op's `.schema` getter can be reused to
-/// derive its output schema without touching data.
-PhysicalTableScan _schemaScan(Schema schema) =>
-    PhysicalTableScan(tableName: 'df', table: Table.empty('df', schema));
+/// The names [schema]'s fields are reported under, in a result and in
+/// [DataFrame.columns]: a name more than one side of a join has is qualified
+/// by its side, `p.name` ([Kernels.disambiguate]).
+List<String> _names(Schema schema) =>
+    Kernels.disambiguate(Table.empty('names', schema)).schema.fieldNames;
+
+/// The index of the field of [schema] that [name] refers to, or -1 when
+/// there is none. [name] is a name as [_names] reports it, so `p.name` is
+/// the `name` of side `p` and a field named `a.b` is `a.b`. A bare name that
+/// more than one side has is [Kind.invalid], naming the qualified choices.
+int _find(Schema schema, String name) {
+  final names = _names(schema);
+  final at = names.indexOf(name);
+  if (at >= 0) return at;
+  final choices = [
+    for (var i = 0; i < names.length; i++)
+      if (schema.fields[i].name == name) names[i],
+  ];
+  if (choices.isEmpty) return -1;
+  final rest = choices.sublist(0, choices.length - 1).join(', ');
+  throw Failure.of(
+    Kind.invalid,
+    'Ambiguous column "$name": use $rest or ${choices.last}',
+  );
+}
+
+/// A logical reference to [name] in [schema], resolved by [_find]
+/// (unresolved if absent, which fails when the plan is lowered or
+/// evaluated).
+logical.ColumnExpression _named(Schema schema, String name) =>
+    switch (_find(schema, name)) {
+      -1 => logical.ColumnExpression(name: name, columnType: DataType.string),
+      final at => _logical(schema.fields[at]),
+    };
+
+/// [text], a SQL scalar expression, as a logical expression. A malformed
+/// expression or an aggregate is a [FormatException], a subquery an
+/// [UnsupportedError]; columns are bound when the plan is lowered.
+logical.LogicalExpression _parse(String text) =>
+    QueryPlanner(TableCatalog()).convert(SqlParser().parseExpression(text));
+
+/// The schema [build] lowers to over scans of empty tables with [schemas],
+/// its fields still qualified by side: how an op derives the schema of its
+/// frame, through the physical builder that runs it, without touching data.
+/// The optimizer rules, which leave the schema as it is, are not run: a scan
+/// of a joined schema holds `name` twice, which a projection by name cannot
+/// narrow.
+Schema _shape(
+  List<Schema> schemas,
+  logical.LogicalPlan Function(List<logical.LogicalPlan> scans) build,
+) {
+  final catalog = TableCatalog();
+  final scans = <logical.LogicalPlan>[];
+  for (int i = 0; i < schemas.length; i++) {
+    catalog.registerTable('input$i', Table.empty('input$i', schemas[i]));
+    scans.add(logical.TableScan(tableName: 'input$i', tableSchema: schemas[i]));
+  }
+  return build(scans).accept(PhysicalPlanBuilder(catalog)).schema;
+}
+
+/// The schema [operation] lowers to over [input] (see [_shape]).
+Schema? _over(Schema? input, Operation operation) => input == null
+    ? null
+    : _shape([input], (scans) => operation.lower(scans.single)!);
 
 /// Select columns operation
 class SelectOperation extends Operation {
@@ -71,54 +128,26 @@ class SelectOperation extends Operation {
   const SelectOperation(this.columns);
 
   @override
-  Future<Table> apply(Table table, ExecutionContext ctx) async {
-    return table.select(columns);
-  }
-
-  @override
-  Future<PhysicalPlan?> toPhysical(
-    PhysicalPlan input,
-    List<String> groupKeys,
-    ExecutionContext ctx,
-  ) async => PhysicalProjection(
+  logical.LogicalPlan lower(logical.LogicalPlan input) => logical.Projection(
     input: input,
-    expressions: [
-      for (final c in columns)
-        PhysicalColumnExpression(c, _dtypeOf(input.schema, c)),
-    ],
+    expressions: [for (final c in columns) _named(input.schema, c)],
     aliases: columns,
   );
+
+  @override
+  Schema? outputSchema(Schema? input) => _over(input, this);
 }
 
-/// Filter operation. The predicate keeps the lenient DataFrame syntax (column
-/// names may contain spaces; `==`/`=`/`!=`/`<>`/`<`/`<=`/`>`/`>=`, optional
-/// `[brackets]`) and now also supports `AND`/`OR`. It compiles to the shared
-/// vectorized engine ([PhysicalFilter]) rather than per-row evaluation.
+/// Filter operation. The predicate is a SQL expression, as in a WHERE
+/// clause; a non-boolean one is cast to BOOLEAN when the plan is lowered.
 class FilterOperation extends Operation {
   final String predicate;
 
   const FilterOperation(this.predicate);
 
   @override
-  Future<Table> apply(Table table, ExecutionContext ctx) async {
-    final compiled = _PredicateCompiler.compile(predicate, table.schema);
-    final scan = PhysicalTableScan(tableName: table.name, table: table);
-    return _runPlan(
-      PhysicalFilter(input: scan, predicate: compiled),
-      table.name,
-      maxBytes: ctx.maxBytes,
-    );
-  }
-
-  @override
-  Future<PhysicalPlan?> toPhysical(
-    PhysicalPlan input,
-    List<String> groupKeys,
-    ExecutionContext ctx,
-  ) async => PhysicalFilter(
-    input: input,
-    predicate: _PredicateCompiler.compile(predicate, input.schema),
-  );
+  logical.LogicalPlan lower(logical.LogicalPlan input) =>
+      logical.Filter(input: input, predicate: _parse(predicate));
 }
 
 /// Limit operation
@@ -129,21 +158,11 @@ class LimitOperation extends Operation {
   const LimitOperation(this.n, this.offset);
 
   @override
-  Future<Table> apply(Table table, ExecutionContext ctx) async {
-    final start = offset;
-    final end = (offset + n).clamp(0, table.rowCount);
-    return table.slice(start, end);
-  }
-
-  @override
-  Future<PhysicalPlan?> toPhysical(
-    PhysicalPlan input,
-    List<String> groupKeys,
-    ExecutionContext ctx,
-  ) async => PhysicalLimit(input: input, limit: n, offset: offset);
+  logical.LogicalPlan lower(logical.LogicalPlan input) =>
+      logical.Limit(input: input, limit: n, offset: offset);
 }
 
-/// Order by operation
+/// Order by operation. NULLs sort last in both directions, as SQL's default.
 class OrderByOperation extends Operation {
   final String column;
   final bool ascending;
@@ -151,279 +170,155 @@ class OrderByOperation extends Operation {
   const OrderByOperation(this.column, this.ascending);
 
   @override
-  Future<Table> apply(Table table, ExecutionContext ctx) async {
-    final column = table.column(this.column);
-    if (column == null) {
-      throw ArgumentError('Column not found: ${this.column}');
-    }
-
-    final indices = List.generate(table.rowCount, (i) => i);
-    indices.sort((a, b) {
-      final aVal = column[a];
-      final bVal = column[b];
-
-      if (aVal == null && bVal == null) return 0;
-      if (aVal == null) return ascending ? -1 : 1;
-      if (bVal == null) return ascending ? 1 : -1;
-
-      if (aVal is Comparable && bVal is Comparable) {
-        final result = aVal.compareTo(bVal);
-        return ascending ? result : -result;
-      }
-
-      return 0;
-    });
-
-    return table.filter(indices);
-  }
-
-  @override
-  Future<PhysicalPlan?> toPhysical(
-    PhysicalPlan input,
-    List<String> groupKeys,
-    ExecutionContext ctx,
-  ) async => PhysicalSort(
+  logical.LogicalPlan lower(logical.LogicalPlan input) => logical.Sort(
     input: input,
     sortExpressions: [
-      SortExpression(
-        expression: PhysicalColumnExpression(
-          column,
-          _dtypeOf(input.schema, column),
-        ),
+      logical.SortExpression(
+        expression: _named(input.schema, column),
         ascending: ascending,
-        // Match apply()'s ordering: nulls first ascending, last descending.
-        nullsFirst: ascending,
+        nullsFirst: false,
       ),
     ],
-    options: ctx.options,
   );
 }
 
-/// Group by operation
+/// Group by operation. It is never part of the plan: its [columns] are the
+/// group keys of the [AggregateOperation] that must follow it.
 class GroupByOperation extends Operation {
   final List<String> columns;
 
   const GroupByOperation(this.columns);
-
-  /// Metadata key used to carry grouping keys to a following [AggregateOperation].
-  static const groupKeysMeta = '__group_keys';
-
-  @override
-  Future<Table> apply(Table table, ExecutionContext ctx) async {
-    for (final c in columns) {
-      if (table.column(c) == null) {
-        throw ArgumentError('Group-by column not found: $c');
-      }
-    }
-    // groupBy() on its own does not reshape data; it records the keys so a
-    // following agg() can aggregate within each group.
-    return Table(
-      name: table.name,
-      columns: table.columns,
-      schema: table.schema,
-      metadata: {...table.metadata, groupKeysMeta: columns},
-    );
-  }
 }
 
-/// Join operation
+/// Join operation: a SQL `USING (on)` join (a cross join ignores [on]), so the
+/// key is one coalesced column. Each side's columns that carry no qualifier
+/// are qualified by the side's name, [name] for this frame and
+/// [DataFrame._name] for [other], or `left` and `right` when the two are the
+/// same; a colliding non-key column then comes out as `p.name` and `d.name`,
+/// as SQL names it. [on] is a name the frames report: a side that reports
+/// it qualified (`d.name`, from an earlier join) is joined under the names it
+/// reports.
 class JoinOperation extends Operation {
   final DataFrame other;
   final String on;
   final JoinType type;
 
-  const JoinOperation(this.other, this.on, this.type);
+  /// The name of the frame this joins [other] to.
+  final String name;
 
-  @override
-  Future<Table> apply(Table table, ExecutionContext ctx) async {
-    // Materialize the build side WITHOUT the result caps — it's an intermediate
-    // feeding the join, not the user-facing result (which _runPlan bounds).
-    final otherTable = await other.execute(
-      maxRows: null,
-      maxBytes: ctx.maxBytes,
-    );
-    final left = PhysicalTableScan(tableName: table.name, table: table);
-    final right = PhysicalTableScan(
-      tableName: otherTable.name,
-      table: otherTable,
-    );
-    final join = PhysicalHashJoin(
-      left: left,
-      right: right,
-      leftKeys: [on],
-      rightKeys: [on],
+  const JoinOperation(this.other, this.on, this.type, this.name);
+
+  /// The join of [input] with [branch], the logical plan of [other].
+  logical.LogicalPlan combine(
+    logical.LogicalPlan input,
+    logical.LogicalPlan branch,
+  ) {
+    final right = other._name;
+    final same = name.toLowerCase() == right.toLowerCase();
+    final cross = type == JoinType.cross;
+    return logical.Join(
+      left: cross ? input : _flat(input),
+      right: cross ? branch : _flat(branch),
       joinType: _planJoin(type),
-      options: ctx.options,
+      usingColumns: cross ? null : [on],
+      sides: same ? ('left', 'right') : (name, right),
     );
-    return _runPlan(join, table.name, maxBytes: ctx.maxBytes);
+  }
+
+  /// [plan], or a projection of it under the names it reports when it
+  /// reports [on] under a qualified name, so the key is one column of that
+  /// name on each side.
+  logical.LogicalPlan _flat(logical.LogicalPlan plan) {
+    final schema = plan.schema;
+    final at = _find(schema, on);
+    if (at < 0 || schema.fields[at].name == on) return plan;
+    return logical.Projection(
+      input: plan,
+      expressions: [for (final f in schema.fields) _logical(f)],
+      aliases: _names(schema),
+    );
   }
 
   @override
-  Future<PhysicalPlan?> toPhysical(
-    PhysicalPlan input,
-    List<String> groupKeys,
-    ExecutionContext ctx,
-  ) async => PhysicalHashJoin(
-    left: input,
-    // The caller's policy, not a hard-coded default: a tighter cap must apply
-    // to the right side too, and an unbounded stream must not acquire one.
-    right: await other._buildPlan(ctx),
-    leftKeys: [on],
-    rightKeys: [on],
-    joinType: _planJoin(type),
-    options: ctx.options,
-  );
-
-  @override
-  Schema? outputSchema(Schema? input, List<String> groupKeys) {
-    final otherSchema = other.schema;
+  Schema? outputSchema(Schema? input) {
+    final otherSchema = other._schema;
     if (input == null || otherSchema == null) return null;
-    // Reuse the physical join's exact output-schema logic (left fields + right
-    // fields, de-duping the collided key) rather than re-deriving it here.
-    return PhysicalHashJoin(
-      left: _schemaScan(input),
-      right: _schemaScan(otherSchema),
-      leftKeys: [on],
-      rightKeys: [on],
-      joinType: _planJoin(type),
-    ).schema;
+    return _shape([input, otherSchema], (scans) => combine(scans[0], scans[1]));
   }
 
-  static plan.JoinType _planJoin(JoinType t) {
+  static logical.JoinType _planJoin(JoinType t) {
     switch (t) {
       case JoinType.inner:
-        return plan.JoinType.inner;
+        return logical.JoinType.inner;
       case JoinType.left:
-        return plan.JoinType.left;
+        return logical.JoinType.left;
       case JoinType.right:
-        return plan.JoinType.right;
+        return logical.JoinType.right;
       case JoinType.full:
-        return plan.JoinType.full;
+        return logical.JoinType.full;
       case JoinType.cross:
-        return plan.JoinType.cross;
+        return logical.JoinType.cross;
     }
   }
 }
 
-/// Aggregate operation
+/// Aggregate operation: one SQL aggregate, grouped by [keys], whose outputs
+/// are the keys and then each aggregated column under its input column's
+/// name (`{'salary': 'sum'}` gives `salary`), each under the name given
+/// (`groupBy(['d.name'])` gives `d.name`).
 class AggregateOperation extends Operation {
   final Map<String, String> aggregations;
 
-  const AggregateOperation(this.aggregations);
+  /// The columns of the [GroupByOperation] before this one (none for a
+  /// global aggregate).
+  final List<String> keys;
+
+  const AggregateOperation(this.aggregations, this.keys);
 
   @override
-  Future<Table> apply(Table table, ExecutionContext ctx) async {
-    final keys =
-        (table.metadata[GroupByOperation.groupKeysMeta] as List?)
-            ?.cast<String>() ??
-        const <String>[];
-    DataType typeOf(String name) {
-      for (final f in table.schema.fields) {
-        if (f.name == name) return f.dataType;
-      }
-      return DataType.string;
-    }
-
-    final groupBy = [
-      for (final k in keys) PhysicalColumnExpression(k, typeOf(k)),
-    ];
-    final aggregates = <PhysicalAggregateExpression>[];
-    final aliases = <String>[];
-    aggregations.forEach((column, func) {
-      aggregates.add(
-        _aggExpr(func, PhysicalColumnExpression(column, typeOf(column))),
-      );
-      aliases.add(column); // output column name matches the input (legacy)
-    });
-
-    final scan = PhysicalTableScan(tableName: table.name, table: table);
-    final agg = PhysicalAggregate(
-      input: scan,
-      groupBy: groupBy,
-      aggregates: aggregates,
-      aliases: aliases,
-      options: ctx.options,
-    );
-    return _runPlan(agg, table.name, maxBytes: ctx.maxBytes);
-  }
-
-  @override
-  Future<PhysicalPlan?> toPhysical(
-    PhysicalPlan input,
-    List<String> groupKeys,
-    ExecutionContext ctx,
-  ) async {
+  logical.LogicalPlan lower(logical.LogicalPlan input) {
     final schema = input.schema;
-    final groupBy = [
-      for (final k in groupKeys)
-        PhysicalColumnExpression(k, _dtypeOf(schema, k)),
-    ];
-    final aggregates = <PhysicalAggregateExpression>[];
-    final aliases = <String>[];
-    aggregations.forEach((column, func) {
-      aggregates.add(
-        _aggExpr(
-          func,
-          PhysicalColumnExpression(column, _dtypeOf(schema, column)),
-        ),
-      );
-      aliases.add(column);
-    });
-    return PhysicalAggregate(
+    final references = [for (final k in keys) _named(schema, k)];
+    final aggregate = logical.Aggregate(
       input: input,
-      groupBy: groupBy,
-      aggregates: aggregates,
-      aliases: aliases,
-      options: ctx.options,
+      groupBy: references,
+      aggregates: [
+        for (final MapEntry(key: column, value: function)
+            in aggregations.entries)
+          logical.AggregateExpression(
+            function: _function(function),
+            argument: _named(schema, column),
+          ),
+      ],
+      aliases: [...aggregations.keys],
+    );
+    // A key named by its side (`d.name`) comes out of the aggregate as its
+    // bare name: the projection keeps the name given.
+    if (keys.indexed.every((key) => references[key.$1].name == key.$2)) {
+      return aggregate;
+    }
+    return logical.Projection(
+      input: aggregate,
+      expressions: [for (final f in aggregate.schema.fields) _logical(f)],
+      aliases: [...keys, ...aggregations.keys],
     );
   }
 
   @override
-  Schema? outputSchema(Schema? input, List<String> groupKeys) {
-    if (input == null) return null;
-    final groupBy = [
-      for (final k in groupKeys)
-        PhysicalColumnExpression(k, _dtypeOf(input, k)),
-    ];
-    final aggregates = <PhysicalAggregateExpression>[];
-    final aliases = <String>[];
-    aggregations.forEach((column, func) {
-      aggregates.add(
-        _aggExpr(
-          func,
-          PhysicalColumnExpression(column, _dtypeOf(input, column)),
-        ),
-      );
-      aliases.add(column);
-    });
-    return PhysicalAggregate(
-      input: _schemaScan(input),
-      groupBy: groupBy,
-      aggregates: aggregates,
-      aliases: aliases,
-    ).schema;
-  }
+  Schema? outputSchema(Schema? input) => _over(input, this);
 
-  static PhysicalAggregateExpression _aggExpr(
-    String func,
-    PhysicalColumnExpression arg,
-  ) {
-    switch (func.toLowerCase()) {
-      case 'count':
-        return PhysicalCount(argument: arg);
-      case 'sum':
-        return PhysicalSum(argument: arg);
-      case 'avg':
-      case 'mean':
-        return PhysicalAvg(argument: arg);
-      case 'min':
-        return PhysicalMin(argument: arg);
-      case 'max':
-        return PhysicalMax(argument: arg);
-      default:
-        throw ArgumentError('Unsupported aggregation function: $func');
-    }
-  }
+  /// The SQL aggregate [function] names (`mean` is `AVG`). The type is the
+  /// placeholder SQL's planner gives one; the physical builder types it from
+  /// its argument.
+  static logical.AggregateFunction _function(String function) =>
+      logical.AggregateFunction(switch (function.toLowerCase()) {
+        'count' => 'COUNT',
+        'sum' => 'SUM',
+        'avg' || 'mean' => 'AVG',
+        'min' => 'MIN',
+        'max' => 'MAX',
+        _ => throw ArgumentError('Unsupported aggregation function: $function'),
+      }, DataType.float64);
 }
 
 /// With column operation
@@ -433,56 +328,25 @@ class WithColumnOperation extends Operation {
 
   const WithColumnOperation(this.name, this.expression);
 
+  /// A projection of every input column under the name it reports, with the
+  /// column [name] replaced in place by [expression], or appended when there
+  /// is none.
   @override
-  Future<Table> apply(Table table, ExecutionContext ctx) async {
-    final fields = table.schema.fields;
-    final expressions = <PhysicalExpression>[];
-    final aliases = <String>[];
-    for (final f in fields) {
-      expressions.add(PhysicalColumnExpression(f.name, f.dataType));
-      aliases.add(f.name);
-    }
-    final computed = _ExprCompiler.compile(expression.trim(), table.schema);
-    final at = aliases.indexOf(name);
-    if (at >= 0) {
-      expressions[at] = computed; // replace an existing column in place
-    } else {
-      expressions.add(computed);
-      aliases.add(name);
-    }
-    final scan = PhysicalTableScan(tableName: table.name, table: table);
-    return _runPlan(
-      PhysicalProjection(
-        input: scan,
-        expressions: expressions,
-        aliases: aliases,
-      ),
-      table.name,
-      maxBytes: ctx.maxBytes,
-    );
-  }
-
-  @override
-  Future<PhysicalPlan?> toPhysical(
-    PhysicalPlan input,
-    List<String> groupKeys,
-    ExecutionContext ctx,
-  ) async {
-    final expressions = <PhysicalExpression>[];
-    final aliases = <String>[];
-    for (final f in input.schema.fields) {
-      expressions.add(PhysicalColumnExpression(f.name, f.dataType));
-      aliases.add(f.name);
-    }
-    final computed = _ExprCompiler.compile(expression.trim(), input.schema);
-    final at = aliases.indexOf(name);
+  logical.LogicalPlan lower(logical.LogicalPlan input) {
+    final schema = input.schema;
+    final expressions = <logical.LogicalExpression>[
+      for (final f in schema.fields) _logical(f),
+    ];
+    final aliases = _names(schema);
+    final computed = _parse(expression);
+    final at = _find(schema, name);
     if (at >= 0) {
       expressions[at] = computed;
     } else {
       expressions.add(computed);
       aliases.add(name);
     }
-    return PhysicalProjection(
+    return logical.Projection(
       input: input,
       expressions: expressions,
       aliases: aliases,
@@ -490,223 +354,90 @@ class WithColumnOperation extends Operation {
   }
 
   @override
-  Schema? outputSchema(Schema? input, List<String> groupKeys) {
-    if (input == null) return null;
-    final expressions = <PhysicalExpression>[];
-    final aliases = <String>[];
-    for (final f in input.fields) {
-      expressions.add(PhysicalColumnExpression(f.name, f.dataType));
-      aliases.add(f.name);
-    }
-    final computed = _ExprCompiler.compile(expression.trim(), input);
-    final at = aliases.indexOf(name);
-    if (at >= 0) {
-      expressions[at] = computed;
-    } else {
-      expressions.add(computed);
-      aliases.add(name);
-    }
-    return PhysicalProjection(
-      input: _schemaScan(input),
-      expressions: expressions,
-      aliases: aliases,
-    ).schema;
-  }
+  Schema? outputSchema(Schema? input) => _over(input, this);
 }
 
-/// Drop columns operation
+/// Drop columns operation: the others keep the names they report.
 class DropOperation extends Operation {
   final List<String> columns;
 
   const DropOperation(this.columns);
 
   @override
-  Future<Table> apply(Table table, ExecutionContext ctx) async {
-    Table result = table;
-    for (final column in columns) {
-      result = result.removeColumn(column);
-    }
-    return result;
+  logical.LogicalPlan lower(logical.LogicalPlan input) {
+    final schema = input.schema;
+    final names = _names(schema);
+    final dropped = {for (final c in columns) _find(schema, c)};
+    final keep = [
+      for (var i = 0; i < names.length; i++)
+        if (!dropped.contains(i)) i,
+    ];
+    return logical.Projection(
+      input: input,
+      expressions: [for (final i in keep) _logical(schema.fields[i])],
+      aliases: [for (final i in keep) names[i]],
+    );
   }
 
   @override
-  Future<PhysicalPlan?> toPhysical(
-    PhysicalPlan input,
-    List<String> groupKeys,
-    ExecutionContext ctx,
-  ) async {
-    final keep = [
-      for (final f in input.schema.fields)
-        if (!columns.contains(f.name)) f.name,
-    ];
-    return PhysicalProjection(
-      input: input,
-      expressions: [
-        for (final c in keep)
-          PhysicalColumnExpression(c, _dtypeOf(input.schema, c)),
-      ],
-      aliases: keep,
-    );
-  }
+  Schema? outputSchema(Schema? input) => _over(input, this);
 }
 
-/// Rename operation
+/// Rename operation: the columns not renamed keep the names they report.
 class RenameOperation extends Operation {
   final Map<String, String> renames;
 
   const RenameOperation(this.renames);
 
   @override
-  Future<Table> apply(Table table, ExecutionContext ctx) async {
-    return table.renameColumns(renames);
+  logical.LogicalPlan lower(logical.LogicalPlan input) {
+    final schema = input.schema;
+    final names = _names(schema);
+    final targets = {
+      for (final MapEntry(:key, :value) in renames.entries)
+        _find(schema, key): value,
+    };
+    return logical.Projection(
+      input: input,
+      expressions: [for (final f in schema.fields) _logical(f)],
+      aliases: [for (var i = 0; i < names.length; i++) targets[i] ?? names[i]],
+    );
   }
 
   @override
-  Future<PhysicalPlan?> toPhysical(
-    PhysicalPlan input,
-    List<String> groupKeys,
-    ExecutionContext ctx,
-  ) async => PhysicalProjection(
-    input: input,
-    expressions: [
-      for (final f in input.schema.fields)
-        PhysicalColumnExpression(f.name, f.dataType),
-    ],
-    aliases: [for (final f in input.schema.fields) renames[f.name] ?? f.name],
-  );
+  Schema? outputSchema(Schema? input) => _over(input, this);
 }
 
-/// Distinct operation: deduplicate rows over all columns. Implemented as a
-/// group-by over every column on the shared engine, which uses typed
-/// value-equality keys (no lossy stringification) and preserves first-seen order.
+/// Distinct operation: deduplicate rows over all columns, as SQL's DISTINCT
+/// (a group-by over every column, with typed value-equality keys, keeping
+/// first-seen order).
 class DistinctOperation extends Operation {
   const DistinctOperation();
 
   @override
-  Future<Table> apply(Table table, ExecutionContext ctx) async {
-    // precision/scale, like the SQL planner's column expressions: a group key
-    // built without them binds a decimal at scale 0, so DISTINCT renders 1.5 as
-    // "15" and compares it as 15.
-    final groupBy = [
-      for (final f in table.schema.fields)
-        PhysicalColumnExpression(
-          f.name,
-          f.dataType,
-          precision: f.precision,
-          scale: f.scale,
-        ),
-    ];
-    final scan = PhysicalTableScan(tableName: table.name, table: table);
-    final agg = PhysicalAggregate(
-      input: scan,
-      groupBy: groupBy,
-      aggregates: const [],
-      aliases: const [],
-      options: ctx.options,
-    );
-    return _runPlan(agg, table.name, maxBytes: ctx.maxBytes);
-  }
-
-  @override
-  Future<PhysicalPlan?> toPhysical(
-    PhysicalPlan input,
-    List<String> groupKeys,
-    ExecutionContext ctx,
-  ) async => PhysicalAggregate(
-    input: input,
-    groupBy: [
-      for (final f in input.schema.fields)
-        PhysicalColumnExpression(
-          f.name,
-          f.dataType,
-          precision: f.precision,
-          scale: f.scale,
-        ),
-    ],
-    aggregates: const [],
-    aliases: const [],
-    options: ctx.options,
-  );
+  logical.LogicalPlan lower(logical.LogicalPlan input) =>
+      logical.Distinct(input);
 }
 
-/// Union operation
+/// Union operation: SQL `UNION ALL`, matched by position. The result has
+/// this frame's names and, per position, the common type of the two sides; a
+/// different column count is a [Kind.schema] failure.
 class UnionOperation extends Operation {
   final DataFrame other;
 
   const UnionOperation(this.other);
 
-  @override
-  Future<Table> apply(Table table, ExecutionContext ctx) async {
-    // Intermediate (union input), not the user-facing result — don't cap it.
-    final otherTable = await other.execute(
-      maxRows: null,
-      maxBytes: ctx.maxBytes,
-    );
-    return table.append(otherTable);
-  }
+  /// The union of [input] with [branch], the logical plan of [other].
+  logical.LogicalPlan combine(
+    logical.LogicalPlan input,
+    logical.LogicalPlan branch,
+  ) => logical.Union([input, branch]);
 
   @override
-  Future<PhysicalPlan?> toPhysical(
-    PhysicalPlan input,
-    List<String> groupKeys,
-    ExecutionContext ctx,
-  ) async {
-    // The caller's policy, not a hard-coded default (see JoinOperation).
-    final right = await other._buildPlan(ctx);
-    // Reconcile the two branches on their real types (per-position commonType,
-    // left names) so int-width / int-float unions promote instead of crashing.
-    final lf = input.schema.fields;
-    final rf = right.schema.fields;
-    final fields = [
-      for (int i = 0; i < lf.length; i++)
-        () {
-          final ct =
-              DataType.commonType(lf[i].dataType, rf[i].dataType) ??
-              (throw ArgumentError(
-                'union column ${i + 1}: incompatible types '
-                '(${lf[i].dataType} vs ${rf[i].dataType})',
-              ));
-          // A decimal's scale is on the Field, so two branches can share
-          // `decimal` yet store a value as different unscaled BigInts. Reconcile
-          // to the wider scale (the iterator restates each branch to it), or the
-          // concatenated column mixes representations.
-          final ls = lf[i].dataType == DataType.decimal ? lf[i].scale : null;
-          final rs = rf[i].dataType == DataType.decimal ? rf[i].scale : null;
-          final scale = ct == DataType.decimal && ls != null && rs != null
-              ? (ls > rs ? ls : rs)
-              : null;
-          final lp = lf[i].precision, rp = rf[i].precision;
-          // Result precision = widest integer-digit count (precision − scale) +
-          // result scale; rescaling the narrower branch UP adds unscaled digits,
-          // so plain max(precision) understates it (see physical builder).
-          final precision =
-              ct == DataType.decimal &&
-                  lp != null &&
-                  rp != null &&
-                  ls != null &&
-                  rs != null &&
-                  scale != null
-              ? ((lp - ls) > (rp - rs) ? (lp - ls) : (rp - rs)) + scale
-              : null;
-          return Field(
-            name: lf[i].name,
-            dataType: ct,
-            nullable: lf[i].nullable || rf[i].nullable,
-            precision: precision,
-            scale: scale,
-          );
-        }(),
-    ];
-    return PhysicalSetOperation(
-      left: input,
-      right: right,
-      type: plan.SetOpType.union,
-      all: true, // UNION ALL — matches table.append (no dedup)
-      schema: Schema(fields: fields),
-      leftSchema: input.schema,
-      rightSchema: right.schema,
-      options: ctx.options,
-    );
+  Schema? outputSchema(Schema? input) {
+    final otherSchema = other._schema;
+    if (input == null || otherSchema == null) return null;
+    return _shape([input, otherSchema], (scans) => combine(scans[0], scans[1]));
   }
 }
 
@@ -714,12 +445,12 @@ class UnionOperation extends Operation {
 /// Takes EXACTLY `round(rowCount * fraction)` rows, uniformly and (with a
 /// [seed]) reproducibly.
 ///
-/// The exact count is why this is the one operator with no [toPhysical]: it
-/// cannot know how many rows to keep until it knows how many there are, so the
-/// upstream plan is materialized first. A streaming sampler would have to be
-/// Bernoulli (keep each row with probability [fraction] independently), which
-/// yields only an APPROXIMATE count — a different contract. The materialization
-/// is bounded by the caller's [ExecutionContext].
+/// The exact count needs the row count, so the sample operator buffers its
+/// whole input, under the memory budget and the byte cap on a materialized
+/// intermediate. A streaming sampler would have to be Bernoulli (keep each
+/// row with probability [fraction] independently), which yields only an
+/// APPROXIMATE count, a different contract. A fraction outside [0, 1] is
+/// [Kind.invalid].
 class SampleOperation extends Operation {
   final double fraction;
   final int? seed;
@@ -727,21 +458,6 @@ class SampleOperation extends Operation {
   const SampleOperation(this.fraction, this.seed);
 
   @override
-  Future<Table> apply(Table table, ExecutionContext ctx) async {
-    final n = (table.rowCount * fraction).round();
-    // Typed, so the index scratch is 4 bytes/row instead of a boxed word.
-    final indices = Int32List(table.rowCount);
-    for (var i = 0; i < indices.length; i++) {
-      indices[i] = i;
-    }
-    // Partial Fisher-Yates: only the n indices actually kept need shuffling.
-    final random = seed != null ? math.Random(seed) : math.Random();
-    for (var i = 0; i < n; i++) {
-      final j = i + random.nextInt(indices.length - i);
-      final t = indices[i];
-      indices[i] = indices[j];
-      indices[j] = t;
-    }
-    return table.filter(indices.take(n).toList());
-  }
+  logical.LogicalPlan lower(logical.LogicalPlan input) =>
+      logical.Sample(input: input, fraction: fraction, seed: seed);
 }

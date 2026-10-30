@@ -2,8 +2,8 @@ import 'dart:io';
 
 import 'package:libbigdata/libbigdata.dart';
 // CompressionCodec isn't re-exported by the barrel.
-import 'package:libbigdata/src/formats/parquet/thrift/parquet_thrift.dart'
-    show CompressionCodec;
+
+import 'results.dart';
 
 /// Intra-library format comparison: round-trip a dataset through CSV, JSON,
 /// JSON Lines, Arrow IPC (real Apache Arrow binary) and Parquet, measuring
@@ -17,8 +17,8 @@ Future<void> main(List<String> args) async {
   if (!dir.existsSync()) dir.createSync(recursive: true);
 
   // Source data: load the generated CSV once.
-  final df = await DataFrameIO.readCsv(csvPath);
-  final table = await df.execute();
+  final df = await DataFrameIO.readCsv(csvPath).ok;
+  final table = await df.execute().ok;
   final rows = table.rowCount;
   stderr.writeln('loaded $rows rows from $csvPath');
 
@@ -59,16 +59,18 @@ Future<void> main(List<String> args) async {
   await bench(
     'CSV',
     csv,
-    () => CsvWriter().writeFile(df.executeStream(), csv),
-    () async => (await (await DataFrameIO.readCsv(csv)).execute()).rowCount,
+    () => CsvWriter().writeFile(df.executeStream().ok, csv),
+    () async =>
+        (await (await DataFrameIO.readCsv(csv).ok).execute().ok).rowCount,
   );
 
   final json = '${dir.path}/d.json';
   await bench(
     'JSON (array)',
     json,
-    () => JsonWriter().writeFile(df.executeStream(), json),
-    () async => (await (await DataFrameIO.readJson(json)).execute()).rowCount,
+    () => JsonWriter().writeFile(df.executeStream().ok, json),
+    () async =>
+        (await (await DataFrameIO.readJson(json).ok).execute().ok).rowCount,
   );
 
   final jsonl = '${dir.path}/d.jsonl';
@@ -77,9 +79,10 @@ Future<void> main(List<String> args) async {
     jsonl,
     () => JsonWriter(
       JsonOptions.jsonLines(),
-    ).writeFile(df.executeStream(), jsonl),
-    () async =>
-        (await (await DataFrameIO.readJsonLines(jsonl)).execute()).rowCount,
+    ).writeFile(df.executeStream().ok, jsonl),
+    () async => (await (await DataFrameIO.readJsonLines(
+      jsonl,
+    ).ok).execute().ok).rowCount,
   );
 
   for (final ac in [
@@ -94,16 +97,16 @@ Future<void> main(List<String> args) async {
     await bench(
       label,
       arrow,
-      () => df.toArrow(arrow, compression: ac),
+      () => df.writeArrow(arrow, compression: ac),
       () async =>
-          (await (await DataFrameIO.readArrow(arrow)).execute()).rowCount,
+          (await (await DataFrameIO.readArrow(arrow).ok).execute().ok).rowCount,
     );
   }
 
   for (final codec in [
-    CompressionCodec.uncompressed,
-    CompressionCodec.snappy,
-    CompressionCodec.zstd,
+    ParquetCompression.none,
+    ParquetCompression.snappy,
+    ParquetCompression.zstd,
   ]) {
     final path = '${dir.path}/d.${codec.name}.parquet';
     await bench(
@@ -113,7 +116,7 @@ Future<void> main(List<String> args) async {
         path,
         options: ParquetWriterOptions(compression: codec),
       ).write(table),
-      () async => (await ParquetReader(path).read()).rowCount,
+      () async => (await ParquetReader(path).read().ok).rowCount,
     );
   }
 

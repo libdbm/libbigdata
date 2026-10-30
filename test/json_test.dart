@@ -1,10 +1,84 @@
 import 'dart:io';
 import 'dart:convert';
 import 'package:test/test.dart';
+
+import 'support/results.dart';
 import 'package:libbigdata/libbigdata.dart';
 import 'package:libbigdata/src/formats/scan.dart';
 
 void main() {
+  group('JSON values and shapes', () {
+    late Directory dir;
+    setUp(() => dir = Directory.systemTemp.createTempSync('json_shapes_'));
+    tearDown(() => dir.deleteSync(recursive: true));
+
+    String write(String name, String content) {
+      final path = '${dir.path}/$name';
+      File(path).writeAsStringSync(content);
+      return path;
+    }
+
+    test('integers beyond int64 read exactly', () async {
+      const array = '[{"id":12345678901234567890},{"id":1}]';
+      const lines = '{"id":12345678901234567890}\n{"id":1}\n';
+      final tables = [
+        await JsonReader().readString(array).ok,
+        await JsonReader().readFile(write('a.json', array)).ok,
+        await JsonReader().readFile(write('a.jsonl', lines)).ok,
+      ];
+      for (final table in tables) {
+        expect(table.schema.field('id')!.dataType, DataType.decimal);
+        expect(
+          [for (final row in table.toRows()) '${row['id']}'],
+          ['12345678901234567890', '1'],
+        );
+      }
+    });
+
+    test('NaN and infinities write as null', () async {
+      final table = Table.fromRows('t', [
+        {'x': 1.5},
+        {'x': double.nan},
+        {'x': double.infinity},
+      ]);
+      expect(table.toJson(), contains('null'));
+      final path = '${dir.path}/x.json';
+      await table.writeJson(path).ok;
+      final back = await JsonReader().readFile(path).ok;
+      expect(back.column('x')!.toList(), [1.5, null, null]);
+    });
+
+    test('a .jsonl destination is written as JSON Lines', () async {
+      final path = '${dir.path}/t.jsonl';
+      await Table.fromRows('t', [
+        {'a': 1},
+        {'a': 2},
+      ]).writeJson(path).ok;
+      expect(File(path).readAsStringSync(), '{"a":1}\n{"a":2}');
+      expect((await JsonReader().readFile(path).ok).rowCount, 2);
+    });
+
+    test('a single top-level object reads through every path', () async {
+      const object = '{"a":1,"b":"x"}';
+      for (final table in [
+        await JsonReader().readString(object).ok,
+        await JsonReader().readFile(write('o.json', object)).ok,
+        await JsonReader().readFile(write('p.json', object), maxRows: null).ok,
+      ]) {
+        expect(table.toRows(), [
+          {'a': 1, 'b': 'x'},
+        ]);
+      }
+    });
+
+    test('a stray closing brace is not the end of the array', () async {
+      await expectLater(
+        JsonReader().readFile(write('bad.json', '[{"a":1}}')),
+        failsWith(Kind.corrupt),
+      );
+    });
+  });
+
   group('decimal JSON encoding is an exact string (pinned tradeoff)', () {
     test(
       'a decimal value is written as a quoted string, not a lossy number',
@@ -42,7 +116,7 @@ void main() {
     test(
       'a field mixing int and string resolves to string, values coerced',
       () async {
-        final t = await JsonReader().readString('[{"x": 1}, {"x": "a"}]');
+        final t = await JsonReader().readString('[{"x": 1}, {"x": "a"}]').ok;
         expect(t.schema.field('x')!.dataType, DataType.string);
         expect(t.toRows().map((r) => r['x']).toList(), ['1', 'a']);
         expect(t.toRows().every((r) => r['x'] is String), isTrue);
@@ -50,7 +124,7 @@ void main() {
     );
 
     test('bool then int, reversed key order, also coerces to string', () async {
-      final t = await JsonReader().readString('[{"y": true}, {"y": 2}]');
+      final t = await JsonReader().readString('[{"y": true}, {"y": 2}]').ok;
       expect(t.schema.field('y')!.dataType, DataType.string);
       expect(t.toRows().map((r) => r['y']).toList(), ['true', '2']);
     });
@@ -58,7 +132,7 @@ void main() {
     test('inferTypes:false renders every scalar as its string form', () async {
       final t = await JsonReader(
         const JsonOptions(inferTypes: false),
-      ).readString('[{"x": 1}, {"x": true}]');
+      ).readString('[{"x": 1}, {"x": true}]').ok;
       expect(t.toRows().map((r) => r['x']).toList(), ['1', 'true']);
     });
 
@@ -67,7 +141,7 @@ void main() {
       () async {
         final t = await JsonReader(
           const JsonOptions(jsonLines: true),
-        ).readString('{"x": 1}\n{"x": "a"}');
+        ).readString('{"x": 1}\n{"x": "a"}').ok;
         expect(t.schema.field('x')!.dataType, DataType.string);
         expect(t.toRows().map((r) => r['x']).toList(), ['1', 'a']);
       },
@@ -81,7 +155,7 @@ void main() {
       final rows = <Object?>[];
       await for (final batch in JsonReader(
         const JsonOptions(jsonLines: true),
-      ).readBatches(file.path, size: 2)) {
+      ).readBatches(file.path, batchSize: 2).ok) {
         rows.addAll(batch.toRows().map((r) => r['x']));
       }
       expect(rows, ['1', 'a', '3']);
@@ -110,8 +184,8 @@ void main() {
           {"id": 3, "name": "Charlie", "age": 35}
         ]''');
 
-        final df = await DataFrameIO.readJson(jsonFile.path);
-        final table = await df.execute();
+        final df = await DataFrameIO.readJson(jsonFile.path).ok;
+        final table = await df.execute().ok;
 
         expect(table.rowCount, equals(3));
         expect(table.columnCount, equals(3));
@@ -131,8 +205,8 @@ void main() {
 {"id": 3, "product": "Widget C", "price": 15.00}''',
         );
 
-        final df = await DataFrameIO.readJson(jsonlFile.path);
-        final table = await df.execute();
+        final df = await DataFrameIO.readJson(jsonlFile.path).ok;
+        final table = await df.execute().ok;
 
         expect(table.rowCount, equals(3));
         final rows = table.toRows();
@@ -144,9 +218,9 @@ void main() {
       // Flattening joins nested keys with '.', so a literal key that already
       // contains '.' can land on the same name as a nested path. The result
       // used to depend on JSON key ORDER, silently discarding one of the two
-      // values — valid input, no error, data gone.
+      // values: valid input, no error, data gone.
       group('flatten name collisions', () {
-        Future<Table> read(String body) async {
+        Future<Result<Table, ErrorDetails>> read(String body) {
           final file = File('${tempDir.path}/collide.json');
           file.writeAsStringSync(body);
           return JsonReader().readFile(file.path);
@@ -157,37 +231,31 @@ void main() {
           () async {
             await expectLater(
               read('[{"a.b": 1, "a": {"b": 2}}]'),
-              throwsA(isA<FormatException>()),
+              failsWith(Kind.corrupt),
             );
           },
         );
 
         test('the reverse key order throws too (not order-dependent)', () async {
-          // Previously this kept 1 while the other order kept 2 — the surviving
+          // Previously this kept 1 while the other order kept 2: the surviving
           // value depended purely on source key order.
           await expectLater(
             read('[{"a": {"b": 2}, "a.b": 1}]'),
-            throwsA(isA<FormatException>()),
+            failsWith(Kind.corrupt),
           );
         });
 
         test('the error names the colliding field', () async {
           await expectLater(
             read('[{"a.b": 1, "a": {"b": 2}}]'),
-            throwsA(
-              isA<FormatException>().having(
-                (e) => e.message,
-                'message',
-                contains('a.b'),
-              ),
-            ),
+            failsWith(Kind.corrupt, contains('a.b')),
           );
         });
 
         test('two nested paths colliding on one name throw', () async {
           await expectLater(
             read('[{"a": {"b": {"c": 1}}, "a.b": {"c": 2}}]'),
-            throwsA(isA<FormatException>()),
+            failsWith(Kind.corrupt),
           );
         });
 
@@ -196,14 +264,14 @@ void main() {
           file.writeAsStringSync('[{"a.b": 1, "a": {"b": 2}}]');
           final t = await JsonReader(
             const JsonOptions(flattenNested: false),
-          ).readFile(file.path);
+          ).readFile(file.path).ok;
           final row = t.toRows().single;
           expect(row['a.b'], 1);
           expect(row['a'], {'b': 2});
         });
 
         test('distinct flattened names are unaffected', () async {
-          final t = await read('[{"a": {"b": 1, "c": 2}, "d": 3}]');
+          final t = await read('[{"a": {"b": 1, "c": 2}, "d": 3}]').ok;
           final row = t.toRows().single;
           expect(row['a.b'], 1);
           expect(row['a.c'], 2);
@@ -233,8 +301,8 @@ void main() {
         ]''');
 
         // Default behavior flattens nested objects
-        final df = await DataFrameIO.readJson(jsonFile.path);
-        final table = await df.execute();
+        final df = await DataFrameIO.readJson(jsonFile.path).ok;
+        final table = await df.execute().ok;
 
         expect(table.rowCount, equals(2));
         final rows = table.toRows();
@@ -265,9 +333,9 @@ void main() {
         // Disable flattening to preserve nested structure
         final df = await DataFrameIO.readJson(
           jsonFile.path,
-          const JsonOptions(flattenNested: false),
-        );
-        final table = await df.execute();
+          options: const JsonOptions(flattenNested: false),
+        ).ok;
+        final table = await df.execute().ok;
 
         final rows = table.toRows();
 
@@ -287,8 +355,8 @@ void main() {
           {"id": 4, "name": "David"}
         ]''');
 
-        final df = await DataFrameIO.readJson(jsonFile.path);
-        final table = await df.execute();
+        final df = await DataFrameIO.readJson(jsonFile.path).ok;
+        final table = await df.execute().ok;
 
         final rows = table.toRows();
         expect(rows[1]['name'], isNull);
@@ -323,9 +391,9 @@ void main() {
         // Use flattenNested: false to preserve objects
         final df = await DataFrameIO.readJson(
           jsonFile.path,
-          const JsonOptions(flattenNested: false),
-        );
-        final table = await df.execute();
+          options: const JsonOptions(flattenNested: false),
+        ).ok;
+        final table = await df.execute().ok;
 
         final rows = table.toRows();
         expect(rows[0]['int'], equals(42));
@@ -342,8 +410,8 @@ void main() {
         final jsonFile = File('${tempDir.path}/empty.json');
         jsonFile.writeAsStringSync('[]');
 
-        final df = await DataFrameIO.readJson(jsonFile.path);
-        final table = await df.execute();
+        final df = await DataFrameIO.readJson(jsonFile.path).ok;
+        final table = await df.execute().ok;
 
         expect(table.rowCount, equals(0));
         expect(table.isEmpty, isTrue);
@@ -356,8 +424,8 @@ void main() {
 {"id": 3, "age": 35}
 {"id": 4, "name": "David", "age": 28, "city": "NYC"}''');
 
-        final df = await DataFrameIO.readJson(jsonFile.path);
-        final table = await df.execute();
+        final df = await DataFrameIO.readJson(jsonFile.path).ok;
+        final table = await df.execute().ok;
 
         expect(table.rowCount, equals(4));
         expect(table.columnCount, equals(4)); // id, name, age, city
@@ -374,16 +442,16 @@ void main() {
         final jsonFile = File('${tempDir.path}/data.json');
         jsonFile.writeAsStringSync('[{"id": 1}, {"id": 2}]');
 
-        final df1 = await DataFrameIO.readJson(jsonFile.path);
-        final table1 = await df1.execute();
+        final df1 = await DataFrameIO.readJson(jsonFile.path).ok;
+        final table1 = await df1.execute().ok;
         expect(table1.rowCount, equals(2));
 
         // Test .jsonl extension (should read as lines)
         final jsonlFile = File('${tempDir.path}/data.jsonl');
         jsonlFile.writeAsStringSync('{"id": 1}\n{"id": 2}');
 
-        final df2 = await DataFrameIO.readJson(jsonlFile.path);
-        final table2 = await df2.execute();
+        final df2 = await DataFrameIO.readJson(jsonlFile.path).ok;
+        final table2 = await df2.execute().ok;
         expect(table2.rowCount, equals(2));
       });
 
@@ -399,8 +467,8 @@ void main() {
           }
         ]''');
 
-        final df = await DataFrameIO.readJson(jsonFile.path);
-        final table = await df.execute();
+        final df = await DataFrameIO.readJson(jsonFile.path).ok;
+        final table = await df.execute().ok;
 
         final rows = table.toRows();
         expect(rows[0]['small_int'], equals(42));
@@ -432,7 +500,7 @@ void main() {
 
         final df = DataFrame.fromRows(data);
         final outputFile = '${tempDir.path}/output.json';
-        await df.writeJson(outputFile);
+        await df.writeJson(outputFile).ok;
 
         final content = File(outputFile).readAsStringSync();
         final parsed = jsonDecode(content) as List;
@@ -451,7 +519,7 @@ void main() {
 
         final df = DataFrame.fromRows(data);
         final outputFile = '${tempDir.path}/output.jsonl';
-        await df.writeJson(outputFile, JsonOptions.jsonLines());
+        await df.writeJson(outputFile, options: JsonOptions.jsonLines()).ok;
 
         final lines = File(outputFile).readAsLinesSync();
         expect(lines.length, equals(2));
@@ -471,7 +539,7 @@ void main() {
 
         final df = DataFrame.fromRows(data);
         final outputFile = '${tempDir.path}/pretty.json';
-        await df.writeJson(outputFile, JsonOptions.prettyArray());
+        await df.writeJson(outputFile, options: JsonOptions.prettyArray()).ok;
 
         final content = File(outputFile).readAsStringSync();
         expect(content, contains('[\n'));
@@ -489,7 +557,7 @@ void main() {
 
         final df = DataFrame.fromRows(data);
         final outputFile = '${tempDir.path}/nulls.json';
-        await df.writeJson(outputFile);
+        await df.writeJson(outputFile).ok;
 
         final content = File(outputFile).readAsStringSync();
         final parsed = jsonDecode(content) as List;
@@ -516,7 +584,7 @@ void main() {
 
         final df = DataFrame.fromRows(data);
         final outputFile = '${tempDir.path}/complex.json';
-        await df.writeJson(outputFile);
+        await df.writeJson(outputFile).ok;
 
         final content = File(outputFile).readAsStringSync();
         final parsed = jsonDecode(content) as List;
@@ -536,14 +604,14 @@ void main() {
 
         // .json should write as array
         final jsonFile = '${tempDir.path}/data.json';
-        await df.writeJson(jsonFile);
+        await df.writeJson(jsonFile).ok;
         final jsonContent = File(jsonFile).readAsStringSync();
         expect(jsonContent.startsWith('['), isTrue);
         expect(jsonContent.endsWith(']'), isTrue);
 
         // .jsonl should write as lines
         final jsonlFile = '${tempDir.path}/data.jsonl';
-        await df.writeJson(jsonlFile);
+        await df.writeJson(jsonlFile).ok;
         final jsonlLines = File(jsonlFile).readAsLinesSync();
         expect(jsonlLines.length, equals(2));
         expect(jsonlLines[0].startsWith('{'), isTrue);
@@ -560,11 +628,11 @@ void main() {
 
         // Write to JSON
         final jsonFile = '${tempDir.path}/roundtrip.json';
-        await df1.writeJson(jsonFile);
+        await df1.writeJson(jsonFile).ok;
 
         // Read back
-        final df2 = await DataFrameIO.readJson(jsonFile);
-        final table = await df2.execute();
+        final df2 = await DataFrameIO.readJson(jsonFile).ok;
+        final table = await df2.execute().ok;
 
         expect(table.rowCount, equals(3));
         final rows = table.toRows();
@@ -600,15 +668,15 @@ void main() {
 3,Charlie,35,92.0''');
 
           // Read CSV
-          final df = await DataFrameIO.readCsv(csvFile.path);
+          final df = await DataFrameIO.readCsv(csvFile.path).ok;
 
           // Write to JSON array
           final jsonFile = '${tempDir.path}/output.json';
-          await df.writeJson(jsonFile);
+          await df.writeJson(jsonFile).ok;
 
           // Read JSON back
-          final df2 = await DataFrameIO.readJson(jsonFile);
-          final table2 = await df2.execute();
+          final df2 = await DataFrameIO.readJson(jsonFile).ok;
+          final table2 = await df2.execute().ok;
 
           // Verify data integrity
           expect(table2.rowCount, equals(3));
@@ -637,14 +705,14 @@ void main() {
 
           final df = await DataFrameIO.readCsv(
             csvFile.path,
-            CsvOptions(nullValues: const {'', 'NULL', 'null', 'NA'}),
-          );
+            options: CsvOptions(nullValues: const {'', 'NULL', 'null', 'NA'}),
+          ).ok;
 
           final jsonFile = '${tempDir.path}/nulls.json';
-          await df.writeJson(jsonFile);
+          await df.writeJson(jsonFile).ok;
 
-          final df2 = await DataFrameIO.readJson(jsonFile);
-          final table2 = await df2.execute();
+          final df2 = await DataFrameIO.readJson(jsonFile).ok;
+          final table2 = await df2.execute().ok;
 
           final rows = table2.toRows();
           expect(rows[1]['name'], isNull);
@@ -659,12 +727,12 @@ void main() {
 100,2.718,false,world
 -5,0.0,true,test''');
 
-          final df = await DataFrameIO.readCsv(csvFile.path);
+          final df = await DataFrameIO.readCsv(csvFile.path).ok;
           final jsonFile = '${tempDir.path}/types.json';
-          await df.writeJson(jsonFile);
+          await df.writeJson(jsonFile).ok;
 
-          final df2 = await DataFrameIO.readJson(jsonFile);
-          final table2 = await df2.execute();
+          final df2 = await DataFrameIO.readJson(jsonFile).ok;
+          final table2 = await df2.execute().ok;
 
           final rows = table2.toRows();
           expect(rows[0]['int_col'], equals(42));
@@ -683,11 +751,11 @@ void main() {
 2,Bob,87.3
 3,Charlie,92.0''');
 
-          final df = await DataFrameIO.readCsv(csvFile.path);
+          final df = await DataFrameIO.readCsv(csvFile.path).ok;
 
           // Write to JSON Lines (auto-detected by extension)
           final jsonlFile = '${tempDir.path}/output.jsonl';
-          await df.writeJson(jsonlFile);
+          await df.writeJson(jsonlFile).ok;
 
           // Verify it's JSON Lines format
           final content = File(jsonlFile).readAsStringSync();
@@ -698,8 +766,8 @@ void main() {
           expect(lines[0], isNot(contains('[')));
 
           // Read JSON Lines back
-          final df2 = await DataFrameIO.readJson(jsonlFile);
-          final table2 = await df2.execute();
+          final df2 = await DataFrameIO.readJson(jsonlFile).ok;
+          final table2 = await df2.execute().ok;
 
           expect(table2.rowCount, equals(3));
           final rows = table2.toRows();
@@ -714,11 +782,11 @@ Widget A,10.99,100
 Widget B,25.50,50
 Widget C,15.00,75''');
 
-          final df = await DataFrameIO.readCsv(csvFile.path);
+          final df = await DataFrameIO.readCsv(csvFile.path).ok;
 
           // Explicitly use JSON Lines format
           final jsonFile = '${tempDir.path}/products.json';
-          await df.writeJson(jsonFile, JsonOptions.jsonLines());
+          await df.writeJson(jsonFile, options: JsonOptions.jsonLines()).ok;
 
           // Verify format
           final content = File(jsonFile).readAsStringSync();
@@ -734,8 +802,8 @@ Widget C,15.00,75''');
           }
 
           // Read back with JSON Lines
-          final df2 = await DataFrameIO.readJsonLines(jsonFile);
-          final table2 = await df2.execute();
+          final df2 = await DataFrameIO.readJsonLines(jsonFile).ok;
+          final table2 = await df2.execute().ok;
 
           expect(table2.rowCount, equals(3));
           final rows = table2.toRows();
@@ -753,14 +821,14 @@ Widget C,15.00,75''');
   {"id": 3, "name": "Charlie", "age": 35}
 ]''');
 
-          final df = await DataFrameIO.readJson(jsonFile.path);
+          final df = await DataFrameIO.readJson(jsonFile.path).ok;
 
           final csvFile = '${tempDir.path}/output.csv';
-          await df.writeCsv(csvFile);
+          await df.writeCsv(csvFile).ok;
 
           // Read CSV back
-          final df2 = await DataFrameIO.readCsv(csvFile);
-          final table2 = await df2.execute();
+          final df2 = await DataFrameIO.readCsv(csvFile).ok;
+          final table2 = await df2.execute().ok;
 
           expect(table2.rowCount, equals(3));
           final rows = table2.toRows();
@@ -781,13 +849,13 @@ Widget C,15.00,75''');
 {"id": 3, "product": "Widget C", "price": 15.00}''',
           );
 
-          final df = await DataFrameIO.readJson(jsonlFile.path);
+          final df = await DataFrameIO.readJson(jsonlFile.path).ok;
 
           final csvFile = '${tempDir.path}/output.csv';
-          await df.writeCsv(csvFile);
+          await df.writeCsv(csvFile).ok;
 
-          final df2 = await DataFrameIO.readCsv(csvFile);
-          final table2 = await df2.execute();
+          final df2 = await DataFrameIO.readCsv(csvFile).ok;
+          final table2 = await df2.execute().ok;
 
           expect(table2.rowCount, equals(3));
           final rows = table2.toRows();
@@ -802,8 +870,8 @@ Widget C,15.00,75''');
 {"id": 3, "age": 35}
 {"id": 4, "name": "David", "age": 28, "city": "NYC"}''');
 
-          final df = await DataFrameIO.readJson(jsonlFile.path);
-          final table = await df.execute();
+          final df = await DataFrameIO.readJson(jsonlFile.path).ok;
+          final table = await df.execute().ok;
 
           expect(table.rowCount, equals(4));
           expect(table.columnCount, equals(4)); // id, name, age, city
@@ -815,14 +883,14 @@ Widget C,15.00,75''');
 
           // Convert to CSV
           final csvFile = '${tempDir.path}/sparse.csv';
-          await df.writeCsv(csvFile);
+          await df.writeCsv(csvFile).ok;
 
           // Read back and verify
           final df2 = await DataFrameIO.readCsv(
             csvFile,
-            CsvOptions(nullValues: const {'', 'NULL', 'null'}),
-          );
-          final table2 = await df2.execute();
+            options: CsvOptions(nullValues: const {'', 'NULL', 'null'}),
+          ).ok;
+          final table2 = await df2.execute().ok;
 
           final rows2 = table2.toRows();
           expect(rows2[1]['age'], isNull);
@@ -840,15 +908,15 @@ Widget C,15.00,75''');
           }
           csvFile.writeAsStringSync(buffer.toString());
 
-          final df = await DataFrameIO.readCsv(csvFile.path);
+          final df = await DataFrameIO.readCsv(csvFile.path).ok;
 
           // Convert to JSON array
           final jsonFile = '${tempDir.path}/large.json';
-          await df.writeJson(jsonFile);
+          await df.writeJson(jsonFile).ok;
 
           // Read back
-          final df2 = await DataFrameIO.readJson(jsonFile);
-          final table2 = await df2.execute();
+          final df2 = await DataFrameIO.readJson(jsonFile).ok;
+          final table2 = await df2.execute().ok;
 
           expect(table2.rowCount, equals(10000));
           final rows = table2.toRows();
@@ -866,19 +934,19 @@ Widget C,15.00,75''');
           }
           csvFile.writeAsStringSync(buffer.toString());
 
-          final df = await DataFrameIO.readCsv(csvFile.path);
+          final df = await DataFrameIO.readCsv(csvFile.path).ok;
 
           // Convert to JSON Lines
           final jsonlFile = '${tempDir.path}/large.jsonl';
-          await df.writeJson(jsonlFile);
+          await df.writeJson(jsonlFile).ok;
 
           // Verify file size is reasonable
           final fileSize = File(jsonlFile).lengthSync();
           expect(fileSize, greaterThan(100000)); // Should be > 100KB
 
           // Read back
-          final df2 = await DataFrameIO.readJson(jsonlFile);
-          final table2 = await df2.execute();
+          final df2 = await DataFrameIO.readJson(jsonlFile).ok;
+          final table2 = await df2.execute().ok;
 
           expect(table2.rowCount, equals(10000));
           final rows = table2.toRows();
@@ -898,7 +966,7 @@ Widget C,15.00,75''');
 
           // Save with .jsonl extension
           final jsonlFile = '${tempDir.path}/data.jsonl';
-          await df.writeJson(jsonlFile);
+          await df.writeJson(jsonlFile).ok;
 
           // Verify it's JSON Lines format
           final content = File(jsonlFile).readAsStringSync();
@@ -906,8 +974,8 @@ Widget C,15.00,75''');
           expect(content, isNot(contains('[')));
 
           // Should be readable as JSON Lines
-          final df2 = await DataFrameIO.readJson(jsonlFile);
-          final table2 = await df2.execute();
+          final df2 = await DataFrameIO.readJson(jsonlFile).ok;
+          final table2 = await df2.execute().ok;
           expect(table2.rowCount, equals(2));
         });
 
@@ -921,7 +989,7 @@ Widget C,15.00,75''');
 
           // Save with .json extension
           final jsonFile = '${tempDir.path}/data.json';
-          await df.writeJson(jsonFile);
+          await df.writeJson(jsonFile).ok;
 
           // Verify it's JSON array format
           final content = File(jsonFile).readAsStringSync();
@@ -929,8 +997,8 @@ Widget C,15.00,75''');
           expect(content, contains(']'));
 
           // Should be readable as JSON array
-          final df2 = await DataFrameIO.readJson(jsonFile);
-          final table2 = await df2.execute();
+          final df2 = await DataFrameIO.readJson(jsonFile).ok;
+          final table2 = await df2.execute().ok;
           expect(table2.rowCount, equals(2));
         });
       });
@@ -956,10 +1024,10 @@ Widget C,15.00,75''');
 
         final batches = await DataFrameIO.readJsonBatches(
           path,
-          size: 100,
-        ).toList();
+          batchSize: 100,
+        ).ok.toList();
         expect(batches.length, 3);
-        final tables = [for (final b in batches) await b.execute()];
+        final tables = [for (final b in batches) await b.execute().ok];
         expect(tables.map((t) => t.rowCount).toList(), [100, 100, 50]);
 
         final schemas = tables
@@ -983,14 +1051,8 @@ Widget C,15.00,75''');
       () async {
         final path = write('bad.jsonl', '{"a":1}\nnotjson\n{"a":2}');
         expect(
-          () => DataFrameIO.readJsonBatches(path, size: 10).toList(),
-          throwsA(
-            isA<FormatException>().having(
-              (e) => e.message,
-              'message',
-              contains('line 2'),
-            ),
-          ),
+          DataFrameIO.readJsonBatches(path, batchSize: 10).last,
+          failsWith(Kind.corrupt, contains('line 2')),
         );
       },
     );
@@ -999,7 +1061,7 @@ Widget C,15.00,75''');
       final path = write('p.jsonl', '{"a":1}\nnotjson\n5\n{"a":2}');
       final r = JsonReader(const JsonOptions(jsonLines: true, strict: false));
       final rows = <Map<String, dynamic>>[];
-      await for (final t in r.readBatches(path, size: 10)) {
+      await for (final t in r.readBatches(path, batchSize: 10).ok) {
         rows.addAll(t.toRows());
       }
       expect(rows.map((m) => m['a']).toList(), [1, 2]);
@@ -1012,21 +1074,23 @@ Widget C,15.00,75''');
       );
       final t = await (await DataFrameIO.readJsonBatches(
         path,
-        size: 10,
-      ).first).execute();
+        batchSize: 10,
+      ).ok.first).execute().ok;
       expect(t.column('u.name')!.toList(), ['a', 'b']);
     });
 
     test('matches whole-file readJsonLines on values', () async {
       final lines = [for (int i = 0; i < 120; i++) '{"id":$i,"v":"x$i"}'];
       final path = write('m.jsonl', lines.join('\n'));
-      final whole = await (await DataFrameIO.readJsonLines(path)).execute();
+      final whole = await (await DataFrameIO.readJsonLines(
+        path,
+      ).ok).execute().ok;
       final streamed = [
         for (final b in await DataFrameIO.readJsonBatches(
           path,
-          size: 40,
-        ).toList())
-          ...(await b.execute()).column('v')!.toList(),
+          batchSize: 40,
+        ).ok.toList())
+          ...(await b.execute().ok).column('v')!.toList(),
       ];
       expect(streamed, whole.column('v')!.toList());
     });
@@ -1036,7 +1100,7 @@ Widget C,15.00,75''');
       final rows = [
         for (final b in await JsonReader(
           const JsonOptions(),
-        ).readBatches(path).toList())
+        ).readBatches(path).ok.toList())
           ...b.toRows(),
       ];
       expect(rows.map((r) => r['a']), [1, 2, 3]);
@@ -1046,8 +1110,8 @@ Widget C,15.00,75''');
       Future<void> expectThrows(String content) async {
         final path = write('trunc.json', content);
         await expectLater(
-          JsonReader(const JsonOptions()).readBatches(path).toList(),
-          throwsA(isA<FormatException>()),
+          JsonReader(const JsonOptions()).readBatches(path).last,
+          failsWith(Kind.corrupt),
         );
       }
 
@@ -1063,14 +1127,14 @@ Widget C,15.00,75''');
           [
             for (final b in await JsonReader(
               const JsonOptions(),
-            ).readBatches(ok).toList())
+            ).readBatches(ok).ok.toList())
               ...b.toRows(),
           ].map((r) => r['a']),
           [1, 2],
         );
         final empty = write('empty.json', '[]');
         expect(
-          await JsonReader(const JsonOptions()).readBatches(empty).toList(),
+          await JsonReader(const JsonOptions()).readBatches(empty).ok.toList(),
           isEmpty,
         );
       });
@@ -1093,7 +1157,7 @@ Widget C,15.00,75''');
           // Both caps null reads the whole file and infers from ALL records.
           final t = await JsonReader(
             const JsonOptions(jsonLines: true, typeInferenceSampleSize: 2),
-          ).readFile(path, maxRows: null, maxBytes: null);
+          ).readFile(path, maxRows: null, maxBytes: null).ok;
           expect(t.schema.field('extra'), isNotNull);
           expect(t.column('extra')!.toList()[3], 'late');
         },
@@ -1107,17 +1171,17 @@ Widget C,15.00,75''');
           JsonReader(
             const JsonOptions(jsonLines: true, typeInferenceSampleSize: 2),
           ).readFile(path),
-          throwsA(isA<FormatException>()),
+          failsWith(Kind.corrupt),
         );
       });
 
       test('streaming readBatches fails closed on a late field', () async {
         final path = write('late.jsonl', lines.join('\n'));
         expect(
-          () => JsonReader(
+          JsonReader(
             const JsonOptions(jsonLines: true, typeInferenceSampleSize: 2),
-          ).readBatches(path, size: 2).toList(),
-          throwsA(isA<FormatException>()),
+          ).readBatches(path, batchSize: 2).last,
+          failsWith(Kind.corrupt),
         );
       });
     });
@@ -1135,8 +1199,8 @@ Widget C,15.00,75''');
         const JsonOptions(jsonLines: true, typeInferenceSampleSize: 1),
       );
       await expectLater(
-        reader.readBatches(p, size: 1).toList(),
-        throwsA(isA<FormatException>()),
+        reader.readBatches(p, batchSize: 1).last,
+        failsWith(Kind.corrupt),
       );
     });
 
@@ -1152,7 +1216,8 @@ Widget C,15.00,75''');
           fields: [Field(name: 'a', dataType: DataType.int64, nullable: true)],
         );
         final batches = await reader
-            .readBatches(p, size: 1, schema: schema)
+            .readBatches(p, batchSize: 1, schema: schema)
+            .ok
             .toList();
         final all = [for (final t in batches) ...t.toRows()];
         expect(all.map((r) => r['a']).toList(), [1, 2, 3]);
@@ -1180,7 +1245,7 @@ Widget C,15.00,75''');
       );
       final batches = await JsonReader(
         const JsonOptions(jsonLines: true),
-      ).readBatches(path, size: 7).toList();
+      ).readBatches(path, batchSize: 7).ok.toList();
       final rows = [for (final b in batches) ...b.toRows()];
       expect(rows.length, 50);
       expect(rows.first['id'], 0);
@@ -1193,8 +1258,8 @@ Widget C,15.00,75''');
       expect(
         JsonReader(
           const JsonOptions(jsonLines: true, maxRecordBytes: 1024),
-        ).readBatches(path).toList(),
-        throwsA(isA<FormatException>()),
+        ).readBatches(path).last,
+        failsWith(Kind.corrupt),
       );
     });
 
@@ -1203,7 +1268,7 @@ Widget C,15.00,75''');
       final rows = [
         for (final b in await JsonReader(
           const JsonOptions(jsonLines: true),
-        ).readBatches(path).toList())
+        ).readBatches(path).ok.toList())
           ...b.toRows(),
       ];
       expect(rows.map((r) => r['id']), [1, 2]);
@@ -1214,7 +1279,7 @@ Widget C,15.00,75''');
       final rows = [
         for (final b in await JsonReader(
           const JsonOptions(jsonLines: true),
-        ).readBatches(path).toList())
+        ).readBatches(path).ok.toList())
           ...b.toRows(),
       ];
       expect(rows.length, 3);
@@ -1229,12 +1294,9 @@ Widget C,15.00,75''');
     test('strict readString names the bad element', () async {
       await expectLater(
         JsonReader().readString(content),
-        throwsA(
-          isA<FormatException>().having(
-            (e) => e.message,
-            'message',
-            allOf(contains('element 1'), contains('object')),
-          ),
+        failsWith(
+          Kind.corrupt,
+          allOf(contains('element 1'), contains('object')),
         ),
       );
     });
@@ -1242,24 +1304,24 @@ Widget C,15.00,75''');
     test('permissive readString skips it', () async {
       final table = await JsonReader(
         const JsonOptions(strict: false),
-      ).readString(content);
+      ).readString(content).ok;
       expect(table.rowCount, 2);
       expect(table.column('a')!.toList(), [1, 3]);
     });
 
     test('an all-object array is unaffected', () async {
-      final table = await JsonReader().readString('[{"a":1},{"a":2}]');
+      final table = await JsonReader().readString('[{"a":1},{"a":2}]').ok;
       expect(table.column('a')!.toList(), [1, 2]);
     });
 
     test('a bare object is still accepted', () async {
-      final table = await JsonReader().readString('{"a":1}');
+      final table = await JsonReader().readString('{"a":1}').ok;
       expect(table.column('a')!.toList(), [1]);
     });
   });
 
   // readString documents maxRows/maxBytes as bounding the PARSED RESULT, and
-  // expandArrays turns one record into as many rows as its longest array — so
+  // expandArrays turns one record into as many rows as its longest array, so
   // the cap has to survive the expansion, not just the parse.
   group('expandArrays cap', () {
     final reader = JsonReader(const JsonOptions(expandArrays: true));
@@ -1276,17 +1338,17 @@ Widget C,15.00,75''');
     test('expansion past maxRows throws', () async {
       await expectLater(
         reader.readString(content, maxRows: 5),
-        throwsA(isA<StateError>()),
+        failsWith(Kind.limit),
       );
     });
 
     test('expansion up to maxRows is allowed', () async {
-      final table = await reader.readString(content, maxRows: 20);
+      final table = await reader.readString(content, maxRows: 20).ok;
       expect(table.rowCount, 20);
     });
 
     test('maxRows: null opts out', () async {
-      final table = await reader.readString(content, maxRows: null);
+      final table = await reader.readString(content, maxRows: null).ok;
       expect(table.rowCount, 20);
       expect(table.column('v')!.toList().first, 0);
     });
@@ -1294,7 +1356,7 @@ Widget C,15.00,75''');
     test('the pre-expansion record count is still capped', () async {
       await expectLater(
         reader.readString(content, maxRows: 1),
-        throwsA(isA<StateError>()),
+        failsWith(Kind.limit),
       );
     });
   });
@@ -1311,7 +1373,7 @@ Widget C,15.00,75''');
         },
       ];
       final df = DataFrame.fromRows(rows);
-      final json = await df.toJsonString();
+      final json = await df.toJsonString().ok;
 
       // Must be parseable and equal to the original values.
       final decoded = jsonDecode(json) as List;
@@ -1328,7 +1390,7 @@ Widget C,15.00,75''');
       final df = DataFrame.fromRows([
         {'we"ird': 1},
       ]);
-      final decoded = jsonDecode(await df.toJsonString()) as List;
+      final decoded = jsonDecode(await df.toJsonString().ok) as List;
       expect((decoded.first as Map)['we"ird'], 1);
     });
   });
@@ -1348,17 +1410,17 @@ Widget C,15.00,75''');
 
       test('JSON Lines export streams and round-trips', () async {
         final path = '${dir.path}/out.jsonl';
-        await frame(5000).writeJsonLines(path);
+        await frame(5000).writeJsonLines(path).ok;
         final lines = await File(path).readAsLines();
         expect(lines.length, 5000);
       });
 
       test('compact JSON array export streams a valid array', () async {
         final path = '${dir.path}/out.json';
-        await frame(2000).writeJson(path);
+        await frame(2000).writeJson(path).ok;
         final back = await (await DataFrameIO.readJson(
           path,
-        )).execute(maxRows: null);
+        ).ok).execute(maxRows: null).ok;
         expect(back.rowCount, 2000);
       });
     });
@@ -1373,16 +1435,16 @@ Widget C,15.00,75''');
     });
 
     group('#5 JSON array grammar', () {
-      Future<void> read(String content) async {
+      Future<Result<DataFrame, ErrorDetails>> read(String content) {
         final f = File('${dir.path}/x.json')..writeAsStringSync(content);
-        await (await DataFrameIO.readJson(f.path)).execute();
+        return DataFrameIO.readJson(f.path);
       }
 
       test('malformed arrays are rejected', () async {
         for (final bad in ['[{},]', '[,{}]', '[{}] junk', '', '  ']) {
           await expectLater(
             read(bad),
-            throwsA(isA<FormatException>()),
+            failsWith(Kind.corrupt),
             reason: 'should reject: "$bad"',
           );
         }
@@ -1401,36 +1463,27 @@ Widget C,15.00,75''');
       () async {
         final r = JsonReader(JsonOptions.jsonLines());
         expect(
-          () => r.readString('{"a":1}\nnotjson\n{"a":2}'),
-          throwsA(
-            isA<FormatException>().having(
-              (e) => e.message,
-              'message',
-              contains('line 2'),
-            ),
-          ),
+          r.readString('{"a":1}\nnotjson\n{"a":2}'),
+          failsWith(Kind.corrupt, contains('line 2')),
         );
       },
     );
 
     test('strict rejects non-object lines', () async {
       final r = JsonReader(JsonOptions.jsonLines());
-      expect(
-        () => r.readString('{"a":1}\n5\n{"a":2}'),
-        throwsA(isA<FormatException>()),
-      );
+      expect(r.readString('{"a":1}\n5\n{"a":2}'), failsWith(Kind.corrupt));
     });
 
     test('permissive mode skips bad lines and keeps the rest', () async {
       final r = JsonReader(const JsonOptions(jsonLines: true, strict: false));
-      final t = await r.readString('{"a":1}\nnotjson\n{"a":2}\n5');
+      final t = await r.readString('{"a":1}\nnotjson\n{"a":2}\n5').ok;
       expect(t.column('a')!.toList(), [1, 2]);
     });
 
     test('valid input is unaffected', () async {
       final df = await JsonReader(
         JsonOptions.jsonLines(),
-      ).readString('{"a":1}\n{"a":2}\n{"a":3}');
+      ).readString('{"a":1}\n{"a":2}\n{"a":3}').ok;
       expect(df.rowCount, 3);
     });
   });
@@ -1448,13 +1501,20 @@ Widget C,15.00,75''');
       ),
     );
 
-    Table withNan() => Table(
+    // A value JSON cannot encode, so the write fails mid-way. (NaN used to
+    // serve; it now writes as null.)
+    Table unencodable() => Table(
       name: 't',
       columns: [
-        NumericColumn.float64(name: 'x', values: [double.nan], nullable: false),
+        ListColumn<Object>(
+          name: 'x',
+          dataType: DataType.string,
+          data: [Object()],
+          nullable: false,
+        ),
       ],
       schema: Schema(
-        fields: [Field(name: 'x', dataType: DataType.float64, nullable: false)],
+        fields: [Field(name: 'x', dataType: DataType.string, nullable: false)],
       ),
     );
 
@@ -1465,9 +1525,12 @@ Widget C,15.00,75''');
       'a failed JSON write preserves the previous file and leaves no temp',
       () async {
         final path = '${dir.path}/out.json';
-        await ints([1, 2, 3]).writeJson(path);
+        await ints([1, 2, 3]).writeJson(path).ok;
         final good = File(path).readAsStringSync();
-        await expectLater(withNan().writeJson(path), throwsA(anything));
+        await expectLater(
+          unencodable().writeJson(path),
+          failsWith(Kind.invalid),
+        );
         expect(File(path).readAsStringSync(), good);
         expect(temps(), isEmpty);
       },
@@ -1478,10 +1541,10 @@ Widget C,15.00,75''');
       () async {
         final csv = '${dir.path}/out.csv';
         final json = '${dir.path}/out.json';
-        await CsvWriter().writeTable(ints([1, 2]), csv);
-        await ints([1, 2]).writeJson(json);
-        await CsvWriter().writeTable(ints([9]), csv);
-        await ints([9]).writeJson(json);
+        await CsvWriter().writeTable(ints([1, 2]), csv).ok;
+        await ints([1, 2]).writeJson(json).ok;
+        await CsvWriter().writeTable(ints([9]), csv).ok;
+        await ints([9]).writeJson(json).ok;
         expect(File(csv).readAsStringSync(), contains('9'));
         expect(File(csv).readAsStringSync(), isNot(contains('1')));
         expect(File(json).readAsStringSync(), contains('9'));

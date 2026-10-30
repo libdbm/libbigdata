@@ -31,6 +31,7 @@ t.append(pa.table({"id": pa.array([4,5], pa.int64()), "name": pa.array(["d","e"]
 LOAD iceberg; SELECT * FROM iceberg_scan('<table>/metadata/<latest>.metadata.json');
 ```
 
-Note: libbigdata's Parquet writer does not emit Iceberg field-ids, so the writer
-declares `schema.name-mapping.default` in table properties (readers map columns by
-name). Unpartitioned tables only.
+Note: libbigdata's data files carry Iceberg field-ids, and the writer also
+declares `schema.name-mapping.default` in table properties so a reader can map
+columns of files without ids. Tables may be unpartitioned or partitioned by
+identity transforms (`partitionBy`).

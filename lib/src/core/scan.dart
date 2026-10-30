@@ -10,7 +10,7 @@ import 'table.dart';
 ///
 /// Capabilities are best-effort: a reader applies whichever of [projection] /
 /// [filter] it supports natively (e.g. Parquet pushes both down; CSV selects
-/// columns; JSON does neither) — the query plan still applies the exact filter
+/// columns; JSON does neither): the query plan still applies the exact filter
 /// and projection on top, so correctness never depends on pushdown.
 abstract class Scan {
   /// The source's full (unprojected) schema, discovered as cheaply as the format

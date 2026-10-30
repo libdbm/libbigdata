@@ -9,7 +9,7 @@ import 'dart:async';
 /// propagates; once any task throws, sibling workers stop pulling new items so
 /// no further work (e.g. isolates) is spawned for the abandoned batch.
 ///
-/// [onEach] runs (in completion order) as each result arrives — a caller that
+/// [onEach] runs (in completion order) as each result arrives: a caller that
 /// charges a running budget there can THROW to abort the whole run early, so an
 /// over-cap load stops after ~[concurrency] more in-flight tasks instead of
 /// materializing every item first. The returned list stays in INPUT order.

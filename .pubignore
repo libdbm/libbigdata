@@ -1,9 +1,8 @@
 # Files excluded from the published pub.dev archive.
 #
-# This is NOT redundant with .gitignore: pub only honours .gitignore inside a
-# git repository, and this project is not under version control, so without
-# this file pub packs everything (test/fixtures alone is ~900 MB, against
-# pub.dev's 100 MB limit).
+# Where this file exists, pub reads it INSTEAD of .gitignore, so every path
+# .gitignore keeps out of the repository that must also stay out of the
+# archive is listed here too.
 
 # Tests and their fixtures.
 test/
@@ -20,10 +19,19 @@ tool/
 .idea/
 build/
 
-# Agent and contributor instructions.
+# Agent and contributor instructions, and the working plan.
+SPEC*.md
 .claude/
+.junie/
 AGENTS.md
 CLAUDE.md
+tasks/
+
+# Logs written by the CLI and the logging example.
+logs/
+
+# Local toolchain pins.
+.java-version
 
 # Local build helpers.
 build.sh
@@ -32,5 +40,8 @@ Makefile
 # Resolved versions are not meaningful for a library package.
 pubspec.lock
 
-# Root-level benchmark output (.gitignore has this too, but is inert with no git repo).
+# Root-level benchmark output.
 /*.parquet
+
+# OS cruft.
+.DS_Store

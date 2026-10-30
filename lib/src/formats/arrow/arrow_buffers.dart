@@ -55,56 +55,56 @@ int bufferCount(DataType type) {
         'requires a child field describing its element',
       );
     }
-    final childField = field.children.first;
+    final child = field.children.first;
     final offsets = Int32List(n + 1);
-    final childValues = <dynamic>[];
+    final values = <dynamic>[];
     var offset = 0;
     for (int i = 0; i < n; i++) {
-      final v = column[i];
-      if (v != null) {
-        final elems = _listElements(field, v);
-        childValues.addAll(elems);
-        offset += elems.length;
+      final value = column[i];
+      if (value != null) {
+        final elements = _listElements(field, value);
+        values.addAll(elements);
+        offset += elements.length;
       }
       offsets[i + 1] = offset;
     }
-    final childEnc = encodeColumn(
+    final encoded = encodeColumn(
       ListColumn(
-        name: childField.name,
-        dataType: childField.dataType,
-        data: childValues,
-        nullable: childField.nullable,
+        name: child.name,
+        dataType: child.dataType,
+        data: values,
+        nullable: child.nullable,
       ),
-      childField,
+      child,
     );
     return (
-      nodes: [node, ...childEnc.nodes],
+      nodes: [node, ...encoded.nodes],
       buffers: [
         validity,
         offsets.buffer.asUint8List(0, (n + 1) * 4),
-        ...childEnc.buffers,
+        ...encoded.buffers,
       ],
     );
   }
   if (type == DataType.struct) {
     final nodes = <NodeInfo>[node];
     final buffers = <Uint8List>[validity];
-    for (final cf in field.children) {
-      final memberValues = [
+    for (final member in field.children) {
+      final values = [
         for (int i = 0; i < n; i++)
-          column[i] == null ? null : (column[i] as Map)[cf.name],
+          column[i] == null ? null : (column[i] as Map)[member.name],
       ];
-      final e = encodeColumn(
+      final encoded = encodeColumn(
         ListColumn(
-          name: cf.name,
-          dataType: cf.dataType,
-          data: memberValues,
-          nullable: cf.nullable,
+          name: member.name,
+          dataType: member.dataType,
+          data: values,
+          nullable: member.nullable,
         ),
-        cf,
+        member,
       );
-      nodes.addAll(e.nodes);
-      buffers.addAll(e.buffers);
+      nodes.addAll(encoded.nodes);
+      buffers.addAll(encoded.buffers);
     }
     return (nodes: nodes, buffers: buffers);
   }
@@ -116,11 +116,11 @@ int bufferCount(DataType type) {
     final data = BytesBuilder();
     var offset = 0;
     for (int i = 0; i < n; i++) {
-      final v = column[i];
-      if (v != null) {
+      final value = column[i];
+      if (value != null) {
         final bytes = type == DataType.string
-            ? utf8.encode(v as String)
-            : Uint8List.fromList((v as List).cast<int>());
+            ? utf8.encode(value as String)
+            : Uint8List.fromList((value as List).cast<int>());
         data.add(bytes);
         offset += bytes.length;
       }
@@ -133,26 +133,26 @@ int bufferCount(DataType type) {
   } else if (type == DataType.date) {
     final out = Int32List(n);
     for (int i = 0; i < n; i++) {
-      final v = column[i];
-      if (v != null) out[i] = dateToEpochDays(v as DateTime);
+      final value = column[i];
+      if (value != null) out[i] = dateToEpochDays(value as DateTime);
     }
     buffers.add(out.buffer.asUint8List(0, n * 4));
   } else if (type == DataType.timestamp) {
     final out = Int64List(n);
     for (int i = 0; i < n; i++) {
-      final v = column[i];
-      if (v != null) out[i] = timestampToEpochMicros(v as DateTime);
+      final value = column[i];
+      if (value != null) out[i] = timestampToEpochMicros(value as DateTime);
     }
     buffers.add(out.buffer.asUint8List(0, n * 8));
   } else if (type == DataType.decimal) {
     final out = Uint8List(n * 16);
     for (int i = 0; i < n; i++) {
-      final v = column[i];
-      if (v != null) {
+      final value = column[i];
+      if (value != null) {
         out.setRange(
           i * 16,
           i * 16 + 16,
-          bigIntToBytes(v as BigInt, 16, littleEndian: true),
+          bigIntToBytes(value as BigInt, 16, littleEndian: true),
         );
       }
     }
@@ -172,18 +172,18 @@ List<dynamic> _listElements(Field field, Object value) {
   final keyName = entries.children[0].name;
   final valueName = entries.children[1].name;
   return [
-    for (final e in (value as Map).entries)
-      {keyName: e.key, valueName: e.value},
+    for (final entry in (value as Map).entries)
+      {keyName: entry.key, valueName: entry.value},
   ];
 }
 
 int _nullCount(Column column, int n) {
   if (!column.hasNulls) return 0;
-  var c = 0;
+  var count = 0;
   for (int i = 0; i < n; i++) {
-    if (column[i] == null) c++;
+    if (column[i] == null) count++;
   }
-  return c;
+  return count;
 }
 
 /// Arrow validity bitmap (bit SET = valid).
@@ -205,57 +205,62 @@ Uint8List _boolData(Column column, int n) {
 
 Uint8List _numericData(Column column, DataType type, int n) {
   // Fast path: a NumericColumn whose typed buffer already matches the width.
-  if (column is NumericColumn) {
-    final b = column.rawBuffer;
+  if (column is NumericVector) {
+    final buffer = column.raw;
     final ok =
-        (type == DataType.int8 && b is Int8List) ||
-        (type == DataType.int32 && b is Int32List) ||
-        (type == DataType.int64 && b is Int64List) ||
-        (type == DataType.float32 && b is Float32List) ||
-        (type == DataType.float64 && b is Float64List);
-    if (ok) return b.buffer.asUint8List(b.offsetInBytes, b.lengthInBytes);
+        (type == DataType.int8 && buffer is Int8List) ||
+        (type == DataType.int32 && buffer is Int32List) ||
+        (type == DataType.int64 && buffer is Int64List) ||
+        (type == DataType.float32 && buffer is Float32List) ||
+        (type == DataType.float64 && buffer is Float64List);
+    if (ok) {
+      return buffer.buffer.asUint8List(
+        buffer.offsetInBytes,
+        buffer.lengthInBytes,
+      );
+    }
   }
   switch (type) {
     case DataType.int8:
       final out = Int8List(n);
       for (int i = 0; i < n; i++) {
-        final v = column[i];
-        if (v != null) out[i] = v as int;
+        final value = column[i];
+        if (value != null) out[i] = value as int;
       }
       return out.buffer.asUint8List(0, n);
     case DataType.int16:
       final out = Int16List(n);
       for (int i = 0; i < n; i++) {
-        final v = column[i];
-        if (v != null) out[i] = v as int;
+        final value = column[i];
+        if (value != null) out[i] = value as int;
       }
       return out.buffer.asUint8List(0, n * 2);
     case DataType.int32:
       final out = Int32List(n);
       for (int i = 0; i < n; i++) {
-        final v = column[i];
-        if (v != null) out[i] = v as int;
+        final value = column[i];
+        if (value != null) out[i] = value as int;
       }
       return out.buffer.asUint8List(0, n * 4);
     case DataType.int64:
       final out = Int64List(n);
       for (int i = 0; i < n; i++) {
-        final v = column[i];
-        if (v != null) out[i] = v as int;
+        final value = column[i];
+        if (value != null) out[i] = value as int;
       }
       return out.buffer.asUint8List(0, n * 8);
     case DataType.float32:
       final out = Float32List(n);
       for (int i = 0; i < n; i++) {
-        final v = column[i];
-        if (v != null) out[i] = (v as num).toDouble();
+        final value = column[i];
+        if (value != null) out[i] = (value as num).toDouble();
       }
       return out.buffer.asUint8List(0, n * 4);
     case DataType.float64:
       final out = Float64List(n);
       for (int i = 0; i < n; i++) {
-        final v = column[i];
-        if (v != null) out[i] = (v as num).toDouble();
+        final value = column[i];
+        if (value != null) out[i] = (value as num).toDouble();
       }
       return out.buffer.asUint8List(0, n * 8);
     default:
@@ -267,12 +272,12 @@ Uint8List _numericData(Column column, DataType type, int n) {
 // Decode
 // ---------------------------------------------------------------------------
 
-/// Build a [Column] from its Arrow buffers. [fieldBuffers] are this field's
+/// Build a [Column] from its Arrow buffers. [buffers] are this field's
 /// buffer slices (validity first), [body] is the whole record-batch body.
 Column decodeColumn(
   Field field,
   NodeInfo node,
-  List<BufferInfo> fieldBuffers,
+  List<BufferInfo> buffers,
   Uint8List body,
 ) {
   final type = field.dataType;
@@ -286,51 +291,52 @@ Column decodeColumn(
       nullable: true,
     );
   }
-  final validity = fieldBuffers[0];
-  final isValid = _validityReader(body, validity, node.nullCount, n);
-  final bitmap = _nullBitmap(isValid, node.nullCount, n);
+  final validity = buffers[0];
+  final valid = _validityReader(body, validity, node.nullCount, n);
+  final bitmap = _nullBitmap(valid, node.nullCount, n);
 
   switch (type) {
     case DataType.int8:
-      return NumericColumn.adopt(
+      return NumericVector.adopt(
         name: field.name,
         dataType: type,
-        data: _viewInt8(body, fieldBuffers[1], n),
+        data: _viewInt8(body, buffers[1], n),
         nullBitmap: bitmap,
       );
     case DataType.int32:
-      return NumericColumn.adopt(
+      return NumericVector.adopt(
         name: field.name,
         dataType: type,
-        data: _viewInt32(body, fieldBuffers[1], n),
+        data: _viewInt32(body, buffers[1], n),
         nullBitmap: bitmap,
       );
     case DataType.int64:
-      return NumericColumn.adopt(
+      return NumericVector.adopt(
         name: field.name,
         dataType: type,
-        data: _viewInt64(body, fieldBuffers[1], n),
+        data: _viewInt64(body, buffers[1], n),
         nullBitmap: bitmap,
       );
     case DataType.float32:
-      return NumericColumn.adopt(
+      return NumericVector.adopt(
         name: field.name,
         dataType: type,
-        data: _viewFloat32(body, fieldBuffers[1], n),
+        data: _viewFloat32(body, buffers[1], n),
         nullBitmap: bitmap,
       );
     case DataType.float64:
-      return NumericColumn.adopt(
+      return NumericVector.adopt(
         name: field.name,
         dataType: type,
-        data: _viewFloat64(body, fieldBuffers[1], n),
+        data: _viewFloat64(body, buffers[1], n),
         nullBitmap: bitmap,
       );
     case DataType.int16:
-      final bd = _byteData(body, fieldBuffers[1]);
+      _needBytes(buffers[1], n, 2);
+      final view = _byteData(body, buffers[1]);
       final data = List<int?>.filled(n, null);
       for (int i = 0; i < n; i++) {
-        if (isValid(i)) data[i] = bd.getInt16(i * 2, Endian.little);
+        if (valid(i)) data[i] = view.getInt16(i * 2, Endian.little);
       }
       return ListColumn<int>(
         name: field.name,
@@ -339,11 +345,12 @@ Column decodeColumn(
         nullable: node.nullCount > 0,
       );
     case DataType.boolean:
-      final bd = _byteData(body, fieldBuffers[1]);
+      _needBytes(buffers[1], (n + 7) >> 3, 1);
+      final view = _byteData(body, buffers[1]);
       final data = List<bool?>.filled(n, null);
       for (int i = 0; i < n; i++) {
-        if (isValid(i)) {
-          data[i] = (bd.getUint8(i >> 3) & (1 << (i & 7))) != 0;
+        if (valid(i)) {
+          data[i] = (view.getUint8(i >> 3) & (1 << (i & 7))) != 0;
         }
       }
       return ListColumn<bool>(
@@ -354,25 +361,22 @@ Column decodeColumn(
       );
     case DataType.string:
     case DataType.binary:
-      final offsets = _byteData(body, fieldBuffers[1]);
-      final dataBuf = fieldBuffers[2];
+      final offsets = _byteData(body, buffers[1]);
+      final values = buffers[2];
       if (offsets.lengthInBytes < (n + 1) * 4) {
         throw FormatException('Arrow ${field.name}: offsets buffer too short');
       }
       final data = List<dynamic>.filled(n, null);
       for (int i = 0; i < n; i++) {
-        if (!isValid(i)) continue;
+        if (!valid(i)) continue;
         final start = offsets.getInt32(i * 4, Endian.little);
         final end = offsets.getInt32((i + 1) * 4, Endian.little);
-        if (start < 0 || end < start || dataBuf.offset + end > body.length) {
+        if (start < 0 || end < start || end > values.length) {
           throw FormatException(
             'Arrow ${field.name}: invalid byte offsets [$start, $end)',
           );
         }
-        final bytes = body.sublist(
-          dataBuf.offset + start,
-          dataBuf.offset + end,
-        );
+        final bytes = body.sublist(values.offset + start, values.offset + end);
         data[i] = type == DataType.string ? utf8.decode(bytes) : bytes;
       }
       return ListColumn(
@@ -382,20 +386,21 @@ Column decodeColumn(
         nullable: node.nullCount > 0,
       );
     case DataType.date:
-      final buffer = fieldBuffers[1];
-      // date32 (days) vs date64 (ms) from the DECLARED DateUnit — inferring it
+      final buffer = buffers[1];
+      // date32 (days) vs date64 (ms) from the DECLARED DateUnit: inferring it
       // from `length ~/ n` misclassified a padded buffer. Old readers of our
       // own files never hit the fallback (we write DAY and the unit is now
       // always parsed); the heuristic remains only for a unit-less schema.
       final unit = field.metadata[dateUnitMeta] as int?;
       final wide = unit != null ? unit == 1 : n > 0 && buffer.length ~/ n == 8;
-      final bd = _byteData(body, buffer);
+      _needBytes(buffer, n, wide ? 8 : 4);
+      final view = _byteData(body, buffer);
       final data = List<DateTime?>.filled(n, null);
       for (int i = 0; i < n; i++) {
-        if (!isValid(i)) continue;
+        if (!valid(i)) continue;
         data[i] = wide
-            ? timestampFromEpochMillis(bd.getInt64(i * 8, Endian.little))
-            : dateFromEpochDays(bd.getInt32(i * 4, Endian.little));
+            ? timestampFromEpochMillis(view.getInt64(i * 8, Endian.little))
+            : dateFromEpochDays(view.getInt32(i * 4, Endian.little));
       }
       return ListColumn<DateTime>(
         name: field.name,
@@ -404,14 +409,15 @@ Column decodeColumn(
         nullable: node.nullCount > 0,
       );
     case DataType.timestamp:
-      final unit = field.metadata[tsUnitMeta] as int? ?? 2; // default MICRO
-      final bd = _byteData(body, fieldBuffers[1]);
+      final unit = field.metadata[timeUnitMeta] as int? ?? 2; // default MICRO
+      _needBytes(buffers[1], n, 8);
+      final view = _byteData(body, buffers[1]);
       final data = List<DateTime?>.filled(n, null);
       for (int i = 0; i < n; i++) {
-        if (!isValid(i)) continue;
-        final raw = bd.getInt64(i * 8, Endian.little);
+        if (!valid(i)) continue;
+        final raw = view.getInt64(i * 8, Endian.little);
         data[i] = switch (unit) {
-          0 => timestampFromEpochMicros(raw * 1000000), // SECOND
+          0 => timestampFromEpochMicros(_seconds(raw)), // SECOND
           1 => timestampFromEpochMillis(raw), // MILLISECOND
           3 => timestampFromEpochMicros(raw ~/ 1000), // NANOSECOND
           _ => timestampFromEpochMicros(raw), // MICROSECOND
@@ -424,16 +430,20 @@ Column decodeColumn(
         nullable: node.nullCount > 0,
       );
     case DataType.decimal:
-      final buffer = fieldBuffers[1];
+      final buffer = buffers[1];
       // Element width from the DECLARED bitWidth (default 128), not a byte-
       // length division that a padded buffer would skew.
       final bits = field.metadata[decimalBitsMeta] as int?;
       final width = bits != null
           ? bits ~/ 8
           : (n > 0 ? buffer.length ~/ n : 16);
+      if (width <= 0) {
+        throw FormatException('Arrow ${field.name}: decimal width $width');
+      }
+      _needBytes(buffer, n, width);
       final data = List<BigInt?>.filled(n, null);
       for (int i = 0; i < n; i++) {
-        if (!isValid(i)) continue;
+        if (!valid(i)) continue;
         final bytes = body.sublist(
           buffer.offset + i * width,
           buffer.offset + i * width + width,
@@ -457,35 +467,35 @@ class ArrowCursor {
   int buffer = 0;
 }
 
-/// Advance [cur] past one field subtree WITHOUT decoding it — for projection
+/// Advance [cursor] past one field subtree WITHOUT decoding it, for projection
 /// pushdown, so an unselected column's buffers are never materialized. Must
 /// consume exactly the nodes/buffers [decodeTree] would (incl. the `null_`
 /// early-return and the nested-child recursion) or every later column desyncs.
-void skipTree(Field field, ArrowCursor cur) {
+void skipTree(Field field, ArrowCursor cursor) {
   final type = field.dataType;
-  cur.node++;
+  cursor.node++;
   if (type == DataType.null_) return; // 1 node, 0 buffers
-  cur.buffer += bufferCount(type);
+  cursor.buffer += bufferCount(type);
   if (type == DataType.list || type == DataType.map) {
-    skipTree(field.children.first, cur);
+    skipTree(field.children.first, cursor);
   } else if (type == DataType.struct) {
-    for (final cf in field.children) {
-      skipTree(cf, cur);
+    for (final child in field.children) {
+      skipTree(child, cursor);
     }
   }
 }
 
-/// Decode one field subtree (recursing into nested children), advancing [cur]
+/// Decode one field subtree (recursing into nested children), advancing [cursor]
 /// over the shared node/buffer vectors. Scalars delegate to [decodeColumn].
 Column decodeTree(
   Field field,
   List<NodeInfo> nodes,
   List<BufferInfo> buffers,
   Uint8List body,
-  ArrowCursor cur,
+  ArrowCursor cursor,
 ) {
   final type = field.dataType;
-  final node = nodes[cur.node++];
+  final node = nodes[cursor.node++];
   final n = node.length;
   if (type == DataType.null_) {
     return ListColumn(
@@ -495,34 +505,34 @@ Column decodeTree(
       nullable: true,
     );
   }
-  final selfCount = bufferCount(type);
-  final selfBufs = buffers.sublist(cur.buffer, cur.buffer + selfCount);
-  cur.buffer += selfCount;
+  final count = bufferCount(type);
+  final slices = buffers.sublist(cursor.buffer, cursor.buffer + count);
+  cursor.buffer += count;
 
   if (type == DataType.list || type == DataType.map) {
-    final isValid = _validityReader(body, selfBufs[0], node.nullCount, n);
-    final offsets = _byteData(body, selfBufs[1]);
-    final childList = decodeTree(
+    final valid = _validityReader(body, slices[0], node.nullCount, n);
+    final offsets = _byteData(body, slices[1]);
+    final items = decodeTree(
       field.children.first,
       nodes,
       buffers,
       body,
-      cur,
+      cursor,
     ).toList();
     if (offsets.lengthInBytes < (n + 1) * 4) {
       throw FormatException('Arrow ${field.name}: offsets buffer too short');
     }
     final data = List<dynamic>.filled(n, null);
     for (int i = 0; i < n; i++) {
-      if (!isValid(i)) continue;
-      final s = offsets.getInt32(i * 4, Endian.little);
-      final e = offsets.getInt32((i + 1) * 4, Endian.little);
-      if (s < 0 || e < s || e > childList.length) {
+      if (!valid(i)) continue;
+      final start = offsets.getInt32(i * 4, Endian.little);
+      final end = offsets.getInt32((i + 1) * 4, Endian.little);
+      if (start < 0 || end < start || end > items.length) {
         throw FormatException(
-          'Arrow ${field.name}: invalid list offsets [$s, $e)',
+          'Arrow ${field.name}: invalid list offsets [$start, $end)',
         );
       }
-      final slice = childList.sublist(s, e);
+      final slice = items.sublist(start, end);
       data[i] = type == DataType.list ? slice : _toMap(field, slice);
     }
     return ListColumn(
@@ -534,17 +544,17 @@ Column decodeTree(
   }
 
   if (type == DataType.struct) {
-    final isValid = _validityReader(body, selfBufs[0], node.nullCount, n);
-    final childLists = [
-      for (final cf in field.children)
-        decodeTree(cf, nodes, buffers, body, cur).toList(),
+    final valid = _validityReader(body, slices[0], node.nullCount, n);
+    final members = [
+      for (final child in field.children)
+        decodeTree(child, nodes, buffers, body, cursor).toList(),
     ];
-    final names = [for (final cf in field.children) cf.name];
+    final names = [for (final child in field.children) child.name];
     final data = List<dynamic>.filled(n, null);
     for (int i = 0; i < n; i++) {
-      if (!isValid(i)) continue;
+      if (!valid(i)) continue;
       data[i] = {
-        for (int j = 0; j < names.length; j++) names[j]: childLists[j][i],
+        for (int j = 0; j < names.length; j++) names[j]: members[j][i],
       };
     }
     return ListColumn(
@@ -555,14 +565,14 @@ Column decodeTree(
     );
   }
 
-  return decodeColumn(field, node, selfBufs, body);
+  return decodeColumn(field, node, slices, body);
 }
 
-Map<dynamic, dynamic> _toMap(Field mapField, List<dynamic> entries) {
-  final e = mapField.children.first;
-  final keyName = e.children[0].name;
-  final valueName = e.children[1].name;
-  return {for (final m in entries) (m as Map)[keyName]: m[valueName]};
+Map<dynamic, dynamic> _toMap(Field field, List<dynamic> entries) {
+  final pair = field.children.first;
+  final keyName = pair.children[0].name;
+  final valueName = pair.children[1].name;
+  return {for (final item in entries) (item as Map)[keyName]: item[valueName]};
 }
 
 bool Function(int) _validityReader(
@@ -571,88 +581,104 @@ bool Function(int) _validityReader(
   int nullCount,
   int n,
 ) {
-  if (nullCount == 0 || validity.length == 0) return (_) => true;
-  final bd = _byteData(body, validity);
-  return (i) => (bd.getUint8(i >> 3) & (1 << (i & 7))) != 0;
+  if (nullCount == 0) return (_) => true;
+  // A field with nulls must say which rows they are, one bit per row.
+  _needBytes(validity, (n + 7) >> 3, 1);
+  final view = _byteData(body, validity);
+  return (i) => (view.getUint8(i >> 3) & (1 << (i & 7))) != 0;
 }
 
 /// libbigdata null bitmap (bit SET = null) from Arrow validity, or null.
-Uint8List? _nullBitmap(bool Function(int) isValid, int nullCount, int n) {
+Uint8List? _nullBitmap(bool Function(int) valid, int nullCount, int n) {
   if (nullCount == 0) return null;
   final out = Uint8List((n + 7) >> 3);
   for (int i = 0; i < n; i++) {
-    if (!isValid(i)) out[i >> 3] |= 1 << (i & 7);
+    if (!valid(i)) out[i >> 3] |= 1 << (i & 7);
   }
   return out;
 }
 
-ByteData _byteData(Uint8List body, BufferInfo b) =>
-    ByteData.view(body.buffer, body.offsetInBytes + b.offset, b.length);
+ByteData _byteData(Uint8List body, BufferInfo buffer) => ByteData.view(
+  body.buffer,
+  body.offsetInBytes + buffer.offset,
+  buffer.length,
+);
+
+/// [seconds] as microseconds, which must fit in 64 bits.
+int _seconds(int seconds) {
+  const limit = 9223372036854; // 2^63 / 10^6
+  if (seconds > limit || seconds < -limit) {
+    throw FormatException(
+      'Arrow timestamp of $seconds seconds is out of range',
+    );
+  }
+  return seconds * 1000000;
+}
 
 /// Reject a data buffer whose DECLARED length is shorter than the node's
 /// element count needs: the typed views below read `n * width` bytes from the
 /// buffer's offset regardless, so a corrupt batch that under-declares a
 /// buffer would silently fabricate values from the NEIGHBORING buffer's bytes.
-void _needBytes(BufferInfo b, int n, int width) {
-  if (b.length < n * width) {
+void _needBytes(BufferInfo buffer, int n, int width) {
+  if (buffer.length < n * width) {
     throw FormatException(
-      'Arrow record batch buffer holds ${b.length} bytes but the field node '
-      'declares $n ${width * 8}-bit values (${n * width} bytes) — corrupt '
+      'Arrow record batch buffer holds ${buffer.length} bytes but the field node '
+      'declares $n ${width * 8}-bit values (${n * width} bytes): corrupt '
       'batch',
     );
   }
 }
 
 // Typed numeric views (zero-copy when aligned, copy otherwise).
-Int8List _viewInt8(Uint8List body, BufferInfo b, int n) {
-  _needBytes(b, n, 1);
-  return Int8List.sublistView(body, b.offset, b.offset + n);
+Int8List _viewInt8(Uint8List body, BufferInfo buffer, int n) {
+  _needBytes(buffer, n, 1);
+  return Int8List.sublistView(body, buffer.offset, buffer.offset + n);
 }
 
-Int32List _viewInt32(Uint8List body, BufferInfo b, int n) {
-  _needBytes(b, n, 4);
-  final base = body.offsetInBytes + b.offset;
+Int32List _viewInt32(Uint8List body, BufferInfo buffer, int n) {
+  _needBytes(buffer, n, 4);
+  final base = body.offsetInBytes + buffer.offset;
   if (base % 4 == 0) return body.buffer.asInt32List(base, n);
-  final bd = _byteData(body, b);
+  final view = _byteData(body, buffer);
   final out = Int32List(n);
   for (int i = 0; i < n; i++) {
-    out[i] = bd.getInt32(i * 4, Endian.little);
+    out[i] = view.getInt32(i * 4, Endian.little);
   }
   return out;
 }
 
-Int64List _viewInt64(Uint8List body, BufferInfo b, int n) {
-  _needBytes(b, n, 8);
-  final base = body.offsetInBytes + b.offset;
+Int64List _viewInt64(Uint8List body, BufferInfo buffer, int n) {
+  _needBytes(buffer, n, 8);
+  final base = body.offsetInBytes + buffer.offset;
   if (base % 8 == 0) return body.buffer.asInt64List(base, n);
-  final bd = _byteData(body, b);
+  final view = _byteData(body, buffer);
   final out = Int64List(n);
   for (int i = 0; i < n; i++) {
-    out[i] = bd.getInt64(i * 8, Endian.little);
+    out[i] = view.getInt64(i * 8, Endian.little);
   }
   return out;
 }
 
-Float32List _viewFloat32(Uint8List body, BufferInfo b, int n) {
-  _needBytes(b, n, 4);
-  final base = body.offsetInBytes + b.offset;
+Float32List _viewFloat32(Uint8List body, BufferInfo buffer, int n) {
+  _needBytes(buffer, n, 4);
+  final base = body.offsetInBytes + buffer.offset;
   if (base % 4 == 0) return body.buffer.asFloat32List(base, n);
-  final bd = _byteData(body, b);
+  final view = _byteData(body, buffer);
   final out = Float32List(n);
   for (int i = 0; i < n; i++) {
-    out[i] = bd.getFloat32(i * 4, Endian.little);
+    out[i] = view.getFloat32(i * 4, Endian.little);
   }
   return out;
 }
 
-Float64List _viewFloat64(Uint8List body, BufferInfo b, int n) {
-  _needBytes(b, n, 8);
-  final base = body.offsetInBytes + b.offset;
+Float64List _viewFloat64(Uint8List body, BufferInfo buffer, int n) {
+  _needBytes(buffer, n, 8);
+  final base = body.offsetInBytes + buffer.offset;
   if (base % 8 == 0) return body.buffer.asFloat64List(base, n);
-  final bd = _byteData(body, b);
+  final view = _byteData(body, buffer);
   final out = Float64List(n);
   for (int i = 0; i < n; i++) {
-    out[i] = bd.getFloat64(i * 8, Endian.little);
+    out[i] = view.getFloat64(i * 8, Endian.little);
   }
   return out;
 }

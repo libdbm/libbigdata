@@ -8,17 +8,21 @@ class SimpleTable extends TableReference {
   final String? alias;
   final bool isFilePath;
 
+  /// New names for the table's leading columns (`FROM t x(p, q)`).
+  final List<String>? columns;
+
   SimpleTable({
     this.schema,
     required this.table,
     this.alias,
     this.isFilePath = false,
+    this.columns,
   });
 
   String get qualifiedName => schema != null ? '$schema.$table' : table;
 
   @override
-  R accept<R>(ASTVisitor<R> visitor) => visitor.visitSimpleTable(this);
+  R accept<R>(TableVisitor<R> visitor) => visitor.visitSimpleTable(this);
 }
 
 /// Joined tables
@@ -29,7 +33,7 @@ class JoinedTable extends TableReference {
   JoinedTable({required this.left, required this.joins});
 
   @override
-  R accept<R>(ASTVisitor<R> visitor) => visitor.visitJoinedTable(this);
+  R accept<R>(TableVisitor<R> visitor) => visitor.visitJoinedTable(this);
 }
 
 /// Join clause
@@ -61,30 +65,18 @@ class UsingCondition extends JoinCondition {
   UsingCondition(this.columns);
 }
 
-/// NATURAL join condition
-class NaturalJoin extends JoinCondition {}
-
 /// Subquery as table
 class SubqueryTable extends TableReference {
   final SelectStatement subquery;
   final String alias;
 
-  SubqueryTable({required this.subquery, required this.alias});
+  /// New names for the subquery's leading columns (`FROM (...) v(p, q)`).
+  final List<String>? columns;
+
+  SubqueryTable({required this.subquery, required this.alias, this.columns});
 
   @override
-  R accept<R>(ASTVisitor<R> visitor) => visitor.visitSubqueryTable(this);
-}
-
-/// Table function
-class TableFunction extends TableReference {
-  final String name;
-  final List<Expression> arguments;
-  final String? alias;
-
-  TableFunction({required this.name, required this.arguments, this.alias});
-
-  @override
-  R accept<R>(ASTVisitor<R> visitor) => visitor.visitTableFunction(this);
+  R accept<R>(TableVisitor<R> visitor) => visitor.visitSubqueryTable(this);
 }
 
 /// VALUES table
@@ -96,5 +88,5 @@ class ValuesTable extends TableReference {
   ValuesTable({required this.values, this.alias, this.columnAliases});
 
   @override
-  R accept<R>(ASTVisitor<R> visitor) => visitor.visitValuesTable(this);
+  R accept<R>(TableVisitor<R> visitor) => visitor.visitValuesTable(this);
 }

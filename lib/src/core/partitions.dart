@@ -1,9 +1,11 @@
+import 'dart:typed_data';
+
 import 'conversions.dart' show formatDecimal, unscaledFromString;
 import 'data_type.dart';
 
 // Partition-value encoding. There are TWO conventions here and they are NOT
-// interchangeable — conflating them under "one source of truth" is exactly why a
-// null partition value used to reach Spark as the literal text
+// interchangeable: conflating them under "one source of truth" would send a
+// null partition value to Spark as the literal text
 // "__HIVE_DEFAULT_PARTITION__":
 //
 //  * the Hive `col=value` PATH segment, shared by the Delta/Iceberg writers and
@@ -16,12 +18,21 @@ import 'data_type.dart';
 const String hiveDefaultPartition = '__HIVE_DEFAULT_PARTITION__';
 
 /// Encode a partition value for a `col=value` PATH segment: null → the Hive
-/// default marker, else the value's string form with Hive path escaping.
+/// default marker, else the value's text with Hive path escaping. Given the
+/// column's [type] (and decimal [scale]), a date, timestamp or decimal takes
+/// the same text as in [encodePartitionValue] (`2024-01-01`, `1.50`) rather
+/// than Dart's `toString` (`2024-01-01 00:00:00.000Z`, the unscaled `150`).
 ///
 /// This names a DIRECTORY. A Delta `add` action's `partitionValues` map is a
-/// different serialization — use [encodePartitionValue] for that.
-String encodePartition(Object? value) =>
-    value == null ? hiveDefaultPartition : escapePathName(value.toString());
+/// different serialization: use [encodePartitionValue] for that.
+String encodePartition(Object? value, {DataType? type, int scale = 0}) =>
+    value == null
+    ? hiveDefaultPartition
+    : escapePathName(
+        type == null
+            ? value.toString()
+            : encodePartitionValue(value, type, scale: scale),
+      );
 
 /// Characters Hive/Spark escape in a partition path segment (escapePathName):
 /// path metacharacters plus anything a filesystem or URI treats specially.
@@ -29,21 +40,21 @@ const String _pathSpecial = '"#%\'*/:=?\\{[]^';
 
 /// Hive-style path escaping for a `col=value` segment VALUE: each special or
 /// control character becomes `%XX` (uppercase hex). Without this a value like
-/// `50%` was written RAW into the directory name and the add.path — which the
+/// `50%` was written RAW into the directory name and the add.path, which the
 /// reader (and the Delta spec) treat as URL-encoded, so reading the table just
 /// written threw FormatException, and `a/b` silently became a nested directory.
 /// Matches Spark's on-disk layout; non-ASCII stays raw (legal in paths).
 String escapePathName(String value) {
-  final sb = StringBuffer();
-  for (final ch in value.split('')) {
-    final c = ch.codeUnitAt(0);
-    if (c < 0x20 || c == 0x7F || _pathSpecial.contains(ch)) {
-      sb.write('%${c.toRadixString(16).toUpperCase().padLeft(2, '0')}');
+  final buffer = StringBuffer();
+  for (final char in value.split('')) {
+    final code = char.codeUnitAt(0);
+    if (code < 0x20 || code == 0x7F || _pathSpecial.contains(char)) {
+      buffer.write('%${code.toRadixString(16).toUpperCase().padLeft(2, '0')}');
     } else {
-      sb.write(ch);
+      buffer.write(char);
     }
   }
-  return sb.toString();
+  return buffer.toString();
 }
 
 /// Inverse of [escapePathName] for READING a `col=value` segment value:
@@ -51,20 +62,20 @@ String escapePathName(String value) {
 /// were written unescaped, and they must keep reading).
 String unescapePathName(String value) {
   if (!value.contains('%')) return value;
-  final sb = StringBuffer();
+  final buffer = StringBuffer();
   for (int i = 0; i < value.length; i++) {
-    final ch = value[i];
-    if (ch == '%' &&
+    final char = value[i];
+    if (char == '%' &&
         i + 3 <= value.length &&
         _isHex(value.codeUnitAt(i + 1)) &&
         _isHex(value.codeUnitAt(i + 2))) {
-      sb.writeCharCode(int.parse(value.substring(i + 1, i + 3), radix: 16));
+      buffer.writeCharCode(int.parse(value.substring(i + 1, i + 3), radix: 16));
       i += 2;
       continue;
     }
-    sb.write(ch);
+    buffer.write(char);
   }
-  return sb.toString();
+  return buffer.toString();
 }
 
 /// Whether a raw `col=value` PATH segment [value] denotes a NULL partition
@@ -78,7 +89,7 @@ bool isNullPartition(String? value) =>
 /// Serialization.
 ///
 /// Every value is a string and the format is per-type: null → `''` ("An empty
-/// string for any type translates to a null partition value" — so a genuinely
+/// string for any type translates to a null partition value", so a genuinely
 /// empty string is not representable, which is the spec's own quirk); date →
 /// `yyyy-MM-dd`; timestamp → ISO8601 adjusted to UTC (the form the spec
 /// recommends for modern writers); boolean → `true`/`false`; numeric → the
@@ -93,10 +104,12 @@ String encodePartitionValue(Object? value, DataType type, {int scale = 0}) {
   if (value == null) return '';
   switch (type) {
     case DataType.date:
+      // The calendar day the value names, as the Parquet path stores it
+      // (dateToEpochDays): converting a local DateTime to UTC first moved it
+      // a day east or west of Greenwich, and stats then disagreed with data.
       if (value is DateTime) {
-        final date = value.toUtc();
-        return '${_pad(date.year, 4)}-${_pad(date.month, 2)}-'
-            '${_pad(date.day, 2)}';
+        return '${_pad(value.year, 4)}-${_pad(value.month, 2)}-'
+            '${_pad(value.day, 2)}';
       }
       return value.toString();
     case DataType.timestamp:
@@ -122,7 +135,7 @@ String encodePartitionValue(Object? value, DataType type, {int scale = 0}) {
 }
 
 /// A `partitionValues` MAP entry parsed into the column's declared logical
-/// type — the ONE codec for every read AND mutation path. (The reader had a
+/// type: the ONE codec for every read AND mutation path. (The reader had a
 /// private copy; the Delta `delete` path had none at all, so an int-partition
 /// predicate compared `5` against the raw string `'5'` and silently deleted
 /// nothing.)
@@ -132,7 +145,7 @@ String encodePartitionValue(Object? value, DataType type, {int scale = 0}) {
 /// data from corrupt or foreign metadata (`'tru'` read back as boolean false,
 /// `'12x'` as null) instead of rejecting the table.
 ///
-/// Every arm produces the type the schema declares — the reconstructed
+/// Every arm produces the type the schema declares: the reconstructed
 /// partition column is built with `columnFromValues(name, type, …)`, which
 /// does NOT type-check its input.
 Object? decodePartitionValue(
@@ -170,14 +183,23 @@ Object? decodePartitionValue(
     case DataType.timestamp:
       // The writer emits ISO8601-UTC. Spark may instead write an unzoned
       // `yyyy-MM-dd HH:mm:ss[.ffffff]`, which the spec says to read in the
-      // writing system's zone — which is what parsing it as local then
+      // writing system's zone, which is what parsing it as local then
       // converting does.
       return (DateTime.tryParse(raw) ?? bad()).toUtc();
     case DataType.decimal:
       // A decimal column holds an UNSCALED BigInt. Parse the partition STRING
-      // exactly — going through num/double would round a high-precision value
+      // exactly: going through num/double would round a high-precision value
       // past 2^53. Over-precise/malformed input already fails loud here.
       return unscaledFromString(raw, scale);
+    case DataType.binary:
+      // The escaped form [encodePartitionValue] writes: `\u0001\u0002`.
+      if (raw.length % 6 != 0) bad();
+      return Uint8List.fromList([
+        for (var i = 0; i < raw.length; i += 6)
+          raw.startsWith(r'\u', i)
+              ? (int.tryParse(raw.substring(i + 2, i + 6), radix: 16) ?? bad())
+              : bad(),
+      ]);
     default:
       return raw;
   }
@@ -187,7 +209,7 @@ Object? decodePartitionValue(
 ///
 /// The spec's form is the empty string. The Hive marker and the literal `'null'`
 /// are also accepted because THIS library wrote the marker into the map before
-/// the two conventions were separated — those tables must keep reading.
+/// the two conventions were separated; those tables must keep reading.
 bool isNullPartitionValue(String? value) =>
     value == null ||
     value.isEmpty ||
@@ -196,7 +218,7 @@ bool isNullPartitionValue(String? value) =>
 
 String _pad(int value, int width) => value.toString().padLeft(width, '0');
 
-bool _isHex(int c) =>
-    (c >= 0x30 && c <= 0x39) || // 0-9
-    (c >= 0x41 && c <= 0x46) || // A-F
-    (c >= 0x61 && c <= 0x66); // a-f
+bool _isHex(int code) =>
+    (code >= 0x30 && code <= 0x39) || // 0-9
+    (code >= 0x41 && code <= 0x46) || // A-F
+    (code >= 0x61 && code <= 0x66); // a-f

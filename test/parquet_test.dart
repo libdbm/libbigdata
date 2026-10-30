@@ -4,28 +4,31 @@ import 'dart:typed_data';
 
 import 'package:libcompress/libcompress.dart' hide CompressionCodec;
 import 'package:libbigdata/libbigdata.dart';
+import 'package:libbigdata/src/core/limits.dart' show defaultMaxSchemaFields;
 import 'package:libbigdata/src/formats/arrow/arrow_writer.dart';
 import 'package:libbigdata/src/formats/parquet/compression.dart';
-import 'package:libbigdata/src/formats/parquet/encoding/delta_binary_packed.dart'
-    hide ByteReader;
-import 'package:libbigdata/src/formats/parquet/encoding/delta_binary_packed.dart'
-    as dbp
-    show ByteReader;
+import 'package:libbigdata/src/formats/parquet/encoding/byte_reader.dart';
+import 'package:libbigdata/src/formats/parquet/encoding/delta_binary_packed.dart';
+import 'package:libbigdata/src/formats/parquet/encoding/delta_byte_array.dart';
 import 'package:libbigdata/src/formats/parquet/encoding/page_decoder.dart';
+import 'package:libbigdata/src/formats/parquet/reader/column_reader.dart';
 import 'package:libbigdata/src/formats/parquet/reader/dremel_assembler.dart';
 import 'package:libbigdata/src/formats/parquet/encoding/value_decoder.dart';
+import 'package:libbigdata/src/formats/parquet/encoding/value_encoder.dart'
+    show DeltaBinaryPackedEncoder;
 import 'package:libbigdata/src/formats/parquet/encoding/rle_bitpacked.dart';
 import 'package:libbigdata/src/formats/parquet/filter/row_filter.dart';
 import 'package:libbigdata/src/formats/parquet/reader/file_reader.dart';
 import 'package:libbigdata/src/formats/parquet/reader/metadata_reader.dart';
 import 'package:libbigdata/src/formats/parquet/reader/page_reader.dart';
 import 'package:libbigdata/src/formats/parquet/schema/schema_converter.dart';
+import 'package:libbigdata/src/formats/parquet/schema/schema_levels.dart';
 import 'package:libbigdata/src/formats/parquet/thrift/compact_protocol.dart';
 import 'package:libbigdata/src/formats/parquet/thrift/parquet_thrift.dart'
     as thrift;
-import 'package:libbigdata/src/formats/parquet/thrift/parquet_thrift.dart'
-    show CompressionCodec;
 import 'package:test/test.dart';
+
+import 'support/results.dart';
 
 /// ULEB128-encode [v] (test helper for crafting malformed encoder headers).
 List<int> _uleb(int v) {
@@ -39,6 +42,274 @@ List<int> _uleb(int v) {
 }
 
 void main() {
+  test('a page that decompresses to zero bytes reads as empty', () {
+    // pyarrow writes such a page for an all-null column chunk; libcompress
+    // rejects a size bound of 0, so the bound must be at least 1.
+    for (final codec in [
+      thrift.CompressionCodec.snappy,
+      thrift.CompressionCodec.gzip,
+      thrift.CompressionCodec.zstd,
+      thrift.CompressionCodec.lz4Raw,
+    ]) {
+      final empty = codecFor(codec).compress(Uint8List(0));
+      expect(
+        codecFor(codec, maxSize: 0).decompress(empty),
+        isEmpty,
+        reason: codec.name,
+      );
+    }
+  });
+
+  group('thrift container lengths', () {
+    CompactReader reader(List<int> bytes) =>
+        CompactReader(Uint8List.fromList(bytes));
+
+    test('a list longer than the bytes left is corrupt', () {
+      // 0xF5: a list of i32 whose length follows as a varint; 127 elements
+      // cannot fit in the one byte left.
+      expect(
+        () => reader([0xF5, 0x7F, 0x02]).readListBegin(),
+        throwsA(isA<FormatException>()),
+      );
+      expect(
+        () => reader([0xF5, 0xFF, 0xFF, 0xFF, 0x7F]).readSetBegin(),
+        throwsA(isA<FormatException>()),
+      );
+    });
+
+    test('a map longer than the bytes left is corrupt', () {
+      expect(
+        () => reader([0x64, 0x55, 0x02, 0x04]).readMapBegin(),
+        throwsA(isA<FormatException>()),
+      );
+    });
+
+    test('a length equal to the bytes left still reads', () {
+      final list = reader([0x35, 0x02, 0x04, 0x06])..readListBegin();
+      expect([list.readI32(), list.readI32(), list.readI32()], [1, 2, 3]);
+      final map = reader([0x01, 0x55, 0x02, 0x04]).readMapBegin();
+      expect(map.length, 1);
+    });
+  });
+
+  group('thrift LogicalType writes', () {
+    thrift.LogicalType roundTrip(thrift.LogicalType logical) {
+      final writer = CompactWriter();
+      logical.write(writer);
+      return thrift.LogicalType()..read(CompactReader(writer.takeBytes()));
+    }
+
+    test('each LogicalType round-trips through write then read', () {
+      expect(
+        roundTrip(thrift.LogicalType()..string = thrift.StringType()).string,
+        isNotNull,
+      );
+      expect(
+        roundTrip(thrift.LogicalType()..date = thrift.DateType()).date,
+        isNotNull,
+      );
+      final decimal = roundTrip(
+        thrift.LogicalType()
+          ..decimal = (thrift.DecimalType()
+            ..scale = 2
+            ..precision = 10),
+      ).decimal!;
+      expect((decimal.scale, decimal.precision), (2, 10));
+      for (final (unit, check) in [
+        (
+          thrift.TimeUnit()..millis = thrift.MilliSeconds(),
+          (thrift.TimeUnit u) => u.millis != null,
+        ),
+        (
+          thrift.TimeUnit()..micros = thrift.MicroSeconds(),
+          (thrift.TimeUnit u) => u.micros != null,
+        ),
+        (
+          thrift.TimeUnit()..nanos = thrift.NanoSeconds(),
+          (thrift.TimeUnit u) => u.nanos != null,
+        ),
+      ]) {
+        final timestamp = roundTrip(
+          thrift.LogicalType()
+            ..timestamp = (thrift.TimestampType()
+              ..isAdjustedToUTC = true
+              ..unit = unit),
+        ).timestamp!;
+        expect(timestamp.isAdjustedToUTC, isTrue);
+        expect(check(timestamp.unit!), isTrue);
+        final time = roundTrip(
+          thrift.LogicalType()
+            ..time = (thrift.TimeType()
+              ..isAdjustedToUTC = false
+              ..unit = unit),
+        ).time!;
+        expect(time.isAdjustedToUTC, isFalse);
+        expect(check(time.unit!), isTrue);
+      }
+      final integer = roundTrip(
+        thrift.LogicalType()
+          ..integer = (thrift.IntType()
+            ..bitWidth = 16
+            ..isSigned = false),
+      ).integer!;
+      expect((integer.bitWidth, integer.isSigned), (16, false));
+    });
+
+    test('footer and page structs round-trip through write then read', () {
+      T trip<T extends thrift.ParquetBase>(T value, T empty) {
+        final writer = CompactWriter();
+        value.write(writer);
+        return empty..read(CompactReader(writer.takeBytes()));
+      }
+
+      final order = trip(
+        thrift.ColumnOrder()..typeOrder = thrift.TypeDefinedOrder(),
+        thrift.ColumnOrder(),
+      );
+      expect(order.typeOrder, isNotNull);
+      expect(
+        trip(thrift.ColumnOrder(), thrift.ColumnOrder()).typeOrder,
+        isNull,
+      );
+      final sorting = trip(
+        thrift.SortingColumn()
+          ..columnIdx = 3
+          ..descending = true
+          ..nullsFirst = true,
+        thrift.SortingColumn(),
+      );
+      expect(
+        (sorting.columnIdx, sorting.descending, sorting.nullsFirst),
+        (3, true, true),
+      );
+      final stats = trip(
+        thrift.PageEncodingStats()
+          ..pageType = thrift.PageType.dictionaryPage
+          ..encoding = thrift.Encoding.rleDictionary
+          ..count = 7,
+        thrift.PageEncodingStats(),
+      );
+      expect(
+        (stats.pageType, stats.encoding, stats.count),
+        (thrift.PageType.dictionaryPage, thrift.Encoding.rleDictionary, 7),
+      );
+      final header = trip(
+        thrift.DataPageHeaderV2()
+          ..numValues = 10
+          ..numNulls = 2
+          ..numRows = 9
+          ..encoding = thrift.Encoding.deltaBinaryPacked
+          ..definitionLevelsByteLength = 4
+          ..repetitionLevelsByteLength = 5
+          ..isCompressed = false
+          ..statistics = (thrift.Statistics()..nullCount = 2),
+        thrift.DataPageHeaderV2(),
+      );
+      expect(
+        (
+          header.numValues,
+          header.numNulls,
+          header.numRows,
+          header.encoding,
+          header.definitionLevelsByteLength,
+          header.repetitionLevelsByteLength,
+          header.isCompressed,
+          header.statistics?.nullCount,
+        ),
+        (10, 2, 9, thrift.Encoding.deltaBinaryPacked, 4, 5, false, 2),
+      );
+    });
+
+    test('the writer records a type-defined order for each leaf', () async {
+      final dir = Directory.systemTemp.createTempSync('orders_');
+      addTearDown(() => dir.deleteSync(recursive: true));
+      final path = '${dir.path}/t.parquet';
+      await ParquetWriter(path)
+          .write(
+            Table.fromRows('t', [
+              {'i': 1, 's': 'a', 'd': 0.5, 'b': true},
+            ]),
+          )
+          .ok;
+      final reader = ParquetReader(path);
+      await reader.schema().ok;
+      final orders = reader.metadata.columnOrders;
+      expect(orders, hasLength(4));
+      expect(orders!.every((order) => order.typeOrder != null), isTrue);
+    });
+
+    test(
+      'the writer annotates strings, decimals, dates and timestamps',
+      () async {
+        final dir = Directory.systemTemp.createTempSync('logical_');
+        addTearDown(() => dir.deleteSync(recursive: true));
+        final path = '${dir.path}/t.parquet';
+        final instant = DateTime.utc(2024, 1, 2, 3, 4, 5);
+        await ParquetWriter(path)
+            .write(
+              Table(
+                name: 't',
+                schema: Schema(
+                  fields: [
+                    Field(name: 's', dataType: DataType.string),
+                    Field(
+                      name: 'd',
+                      dataType: DataType.decimal,
+                      precision: 10,
+                      scale: 2,
+                    ),
+                    Field(name: 'day', dataType: DataType.date),
+                    Field(name: 'ts', dataType: DataType.timestamp),
+                  ],
+                ),
+                columns: [
+                  ListColumn<String>(
+                    name: 's',
+                    dataType: DataType.string,
+                    data: ['x'],
+                  ),
+                  ListColumn<BigInt>(
+                    name: 'd',
+                    dataType: DataType.decimal,
+                    data: [BigInt.from(150)],
+                  ),
+                  ListColumn<DateTime>(
+                    name: 'day',
+                    dataType: DataType.date,
+                    data: [DateTime.utc(2024, 1, 2)],
+                  ),
+                  ListColumn<DateTime>(
+                    name: 'ts',
+                    dataType: DataType.timestamp,
+                    data: [instant],
+                  ),
+                ],
+              ),
+            )
+            .ok;
+        final reader = ParquetReader(path);
+        final table = await reader.read().ok;
+        final elements = {
+          for (final e in reader.metadata.schema.skip(1)) e.name: e,
+        };
+        expect(elements['s']!.logicalType?.string, isNotNull);
+        expect(elements['d']!.logicalType?.decimal?.scale, 2);
+        expect(elements['d']!.logicalType?.decimal?.precision, 10);
+        expect(elements['day']!.logicalType?.date, isNotNull);
+        final timestamp = elements['ts']!.logicalType?.timestamp;
+        expect(timestamp?.isAdjustedToUTC, isTrue);
+        expect(timestamp?.unit?.micros, isNotNull);
+        // The legacy annotations stay for older readers.
+        expect(
+          elements['ts']!.convertedType,
+          thrift.ConvertedType.timestampMicros,
+        );
+        expect(table.column('ts')![0], instant);
+        expect(table.row(0)['d'].toString(), '1.50');
+      },
+    );
+  });
+
   group('writer', () {
     // Round-trips a table through ParquetWriter -> ParquetReader for each codec.
     late Directory dir;
@@ -76,21 +347,15 @@ void main() {
       ),
     );
 
-    for (final codec in [
-      CompressionCodec.uncompressed,
-      CompressionCodec.snappy,
-      CompressionCodec.gzip,
-      CompressionCodec.zstd,
-      CompressionCodec.lz4Raw,
-    ]) {
+    for (final codec in ParquetCompression.values) {
       test('round-trips a table with ${codec.name} compression', () async {
         final path = '${dir.path}/out_${codec.name}.parquet';
         await ParquetWriter(
           path,
           options: ParquetWriterOptions(compression: codec),
-        ).write(sample());
+        ).write(sample()).ok;
 
-        final table = await ParquetReader(path).read();
+        final table = await ParquetReader(path).read().ok;
         expect(table.rowCount, 500);
         expect(table.column('id')!.toList().first, 1000000);
         expect(table.column('name')!.toList().first, 'item_0');
@@ -138,8 +403,8 @@ void main() {
           ),
         );
         final path = '${dir.path}/typed_nulls.parquet';
-        await ParquetWriter(path).write(table);
-        final back = await ParquetReader(path).read();
+        await ParquetWriter(path).write(table).ok;
+        final back = await ParquetReader(path).read().ok;
         expect(back.column('a')!.toList(), ints);
         expect(back.column('b')!.toList(), dbls);
         expect(back.column('c')!.toList(), shorts);
@@ -176,8 +441,8 @@ void main() {
         await ParquetWriter(
           path,
           options: ParquetWriterOptions(rowGroupSize: 100),
-        ).writeBatches(Stream.fromIterable(batches));
-        final back = await ParquetReader(path).read();
+        ).writeBatches(Stream.fromIterable(batches)).ok;
+        final back = await ParquetReader(path).read().ok;
         final expA = [for (final b in batches) ...b.column('a')!.toList()];
         final expB = [for (final b in batches) ...b.column('b')!.toList()];
         expect(back.rowCount, 270);
@@ -208,8 +473,8 @@ void main() {
         await ParquetWriter(
           path,
           options: ParquetWriterOptions(rowGroupSize: 300000),
-        ).write(table);
-        final back = await ParquetReader(path).read();
+        ).write(table).ok;
+        final back = await ParquetReader(path).read().ok;
         expect(back.rowCount, n);
         final a = back.column('a')!;
         final b = back.column('b')!;
@@ -239,8 +504,8 @@ void main() {
           ],
         ),
       );
-      await ParquetWriter(path).write(table);
-      final back = await ParquetReader(path).read();
+      await ParquetWriter(path).write(table).ok;
+      final back = await ParquetReader(path).read().ok;
       expect(back.column('s')!.toList(), values);
     });
 
@@ -262,8 +527,8 @@ void main() {
           await ParquetWriter(
             path,
             options: ParquetWriterOptions(version: v),
-          ).write(sample());
-          expect((await ParquetReader(path).read()).rowCount, 500);
+          ).write(sample()).ok;
+          expect((await ParquetReader(path).read().ok).rowCount, 500);
         }
       });
 
@@ -314,7 +579,7 @@ void main() {
           await ParquetWriter(
             off,
             options: const ParquetWriterOptions(writeStatistics: false),
-          ).write(nested());
+          ).write(nested()).ok;
           expect(
             (await leafHasStats(off)).every((h) => !h),
             isTrue,
@@ -324,7 +589,7 @@ void main() {
           final on = '${dir.path}/stats.parquet';
           await ParquetWriter(
             on,
-          ).write(nested()); // default: writeStatistics true
+          ).write(nested()).ok; // default: writeStatistics true
           expect(
             (await leafHasStats(on)).any((h) => h),
             isTrue,
@@ -337,11 +602,9 @@ void main() {
     test('open() rejects re-entry while a write is live (finding 8)', () async {
       final path = '${dir.path}/reopen.parquet';
       final writer = ParquetWriter(path);
-      await writer.open(sample().schema);
-      await expectLater(
-        writer.open(sample().schema),
-        throwsA(isA<StateError>()),
-      );
+      await writer.open(sample().schema).ok;
+      // A precondition on the caller, so it throws rather than reports.
+      expect(() => writer.open(sample().schema), throwsStateError);
       await writer.abort();
     });
 
@@ -363,8 +626,8 @@ void main() {
 
     // A fixed-width encoder must never truncate. `ByteData.setInt32` keeps only
     // the low 32 bits, so an int32-declared column carrying a wider value wrote
-    // a silently different number. Column validation cannot catch this — it
-    // checks a column's DECLARED dtype, never its values — so the encoder is the
+    // a silently different number. Column validation cannot catch this; it
+    // checks a column's DECLARED dtype, never its values, so the encoder is the
     // last line of defence and has to check.
     group('fixed-width encoders reject out-of-range values', () {
       /// A column that LIES: declared [type], holding [values] boxed. This is
@@ -390,7 +653,7 @@ void main() {
           final path = '${dir.path}/wide32.parquet';
           await expectLater(
             ParquetWriter(path).write(lying(DataType.int32, [2147483648])),
-            throwsA(isA<ArgumentError>()),
+            failsWith(Kind.invalid),
           );
         },
       );
@@ -399,7 +662,7 @@ void main() {
         final path = '${dir.path}/narrow32.parquet';
         await expectLater(
           ParquetWriter(path).write(lying(DataType.int32, [-2147483649])),
-          throwsA(isA<ArgumentError>()),
+          failsWith(Kind.invalid),
         );
       });
 
@@ -407,8 +670,8 @@ void main() {
         final path = '${dir.path}/bound32.parquet';
         await ParquetWriter(
           path,
-        ).write(lying(DataType.int32, [2147483647, -2147483648, 0]));
-        expect((await ParquetReader(path).read()).column('v')!.toList(), [
+        ).write(lying(DataType.int32, [2147483647, -2147483648, 0])).ok;
+        expect((await ParquetReader(path).read().ok).column('v')!.toList(), [
           2147483647,
           -2147483648,
           0,
@@ -419,8 +682,8 @@ void main() {
         final path = '${dir.path}/wide64.parquet';
         await ParquetWriter(
           path,
-        ).write(lying(DataType.int64, [2147483648, 9223372036854775807]));
-        expect((await ParquetReader(path).read()).column('v')!.toList(), [
+        ).write(lying(DataType.int64, [2147483648, 9223372036854775807])).ok;
+        expect((await ParquetReader(path).read().ok).column('v')!.toList(), [
           2147483648,
           9223372036854775807,
         ]);
@@ -429,7 +692,7 @@ void main() {
 
     // Integer columns default to DELTA_BINARY_PACKED, which zigzags each value
     // and delta. Zigzag maps int64 onto uint64, so any value or delta >= 2^62
-    // sets bit 63 and reads back as a negative Dart int — decoding it with an
+    // sets bit 63 and reads back as a negative Dart int: decoding it with an
     // arithmetic shift smears the sign bit and returns a different number.
     group('int64 extremes survive DELTA_BINARY_PACKED', () {
       Table ints(List<int> values) => Table(
@@ -444,8 +707,8 @@ void main() {
 
       Future<List<Object?>> roundTrip(String name, List<int> values) async {
         final path = '${dir.path}/$name.parquet';
-        await ParquetWriter(path).write(ints(values));
-        return (await ParquetReader(path).read()).column('v')!.toList();
+        await ParquetWriter(path).write(ints(values)).ok;
+        return (await ParquetReader(path).read().ok).column('v')!.toList();
       }
 
       test('a lone int64 max round-trips', () async {
@@ -471,7 +734,7 @@ void main() {
 
       test('values either side of 2^62 round-trip', () async {
         const v =
-            4611686018427387904; // 2^62 — where `n << 1` starts to overflow
+            4611686018427387904; // 2^62, where `n << 1` starts to overflow
         expect(await roundTrip('p62', [v - 1, v, v + 1]), [v - 1, v, v + 1]);
       });
 
@@ -486,7 +749,7 @@ void main() {
       // The spec makes `delta - minDelta` a uint64. Computing its bit width with
       // SIGNED arithmetic loses any block whose spread reaches 2^63: the value
       // wraps negative, the running max never sees it, the width stays 0, and
-      // the whole block encodes as ZERO BYTES — every delta then decodes as
+      // the whole block encodes as ZERO BYTES: every delta then decodes as
       // minDelta. A single value never reaches the block loop, which is why the
       // lone-max test above passes while these did not.
       test('a block whose spread exceeds 2^63 round-trips', () async {
@@ -538,27 +801,10 @@ void main() {
       () async {
         final path = '${dir.path}/reuse.parquet';
         final writer = ParquetWriter(path);
-        await writer.write(sample()); // 500 rows
-        await writer.write(sample()); // 500 rows again, NOT 1000
-        final table = await ParquetReader(path).read();
+        await writer.write(sample()).ok; // 500 rows
+        await writer.write(sample()).ok; // 500 rows again, NOT 1000
+        final table = await ParquetReader(path).read().ok;
         expect(table.rowCount, 500);
-      },
-    );
-
-    test(
-      'writing an unsupported codec fails before creating the file',
-      () async {
-        final path = '${dir.path}/lz4.parquet';
-        expect(
-          ParquetWriter(
-            path,
-            options: const ParquetWriterOptions(
-              compression: CompressionCodec.lz4,
-            ),
-          ).write(sample()),
-          throwsA(isA<ArgumentError>()),
-        );
-        expect(File(path).existsSync(), isFalse);
       },
     );
 
@@ -578,14 +824,18 @@ void main() {
                 data: data.cast<DateTime?>(),
                 nullable: true,
               );
-        await ParquetWriter(path).write(
-          Table(
-            name: 't',
-            columns: [col],
-            schema: Schema(fields: [field]),
-          ),
-        );
-        return (await ParquetReader(path).read()).column(field.name)!.toList();
+        await ParquetWriter(path)
+            .write(
+              Table(
+                name: 't',
+                columns: [col],
+                schema: Schema(fields: [field]),
+              ),
+            )
+            .ok;
+        return (await ParquetReader(
+          path,
+        ).read().ok).column(field.name)!.toList();
       }
 
       test('date round-trips as DateTime', () async {
@@ -621,21 +871,23 @@ void main() {
             precision: p,
             scale: 2,
           );
-          await ParquetWriter(path).write(
-            Table(
-              name: 't',
-              columns: [
-                ListColumn<BigInt>(
-                  name: 'v',
-                  dataType: DataType.decimal,
-                  data: vals,
-                  nullable: true,
+          await ParquetWriter(path)
+              .write(
+                Table(
+                  name: 't',
+                  columns: [
+                    ListColumn<BigInt>(
+                      name: 'v',
+                      dataType: DataType.decimal,
+                      data: vals,
+                      nullable: true,
+                    ),
+                  ],
+                  schema: Schema(fields: [field]),
                 ),
-              ],
-              schema: Schema(fields: [field]),
-            ),
-          );
-          final back = await ParquetReader(path).read();
+              )
+              .ok;
+          final back = await ParquetReader(path).read().ok;
           expect(back.column('v')!.toList(), equals(vals));
           expect(back.schema.field('v')!.scale, 2);
           expect(back.schema.field('v')!.precision, p);
@@ -649,7 +901,7 @@ void main() {
     Future<List<dynamic>> read(String name) async {
       final table = await ParquetReader(
         'test/fixtures/parquet-testing/data/$name',
-      ).read();
+      ).read().ok;
       return table.columns.first.toList();
     }
 
@@ -670,7 +922,7 @@ void main() {
       });
 
       test('zstd', () async {
-        // BYTE_STREAM_SPLIT (encoding 9): assert VALUES, not just row count — the
+        // BYTE_STREAM_SPLIT (encoding 9): assert VALUES, not just row count; the
         // encoding was previously undecoded (silent garbage). These match pyarrow.
         final f32 = (await read(
           'byte_stream_split.zstd.parquet',
@@ -700,8 +952,10 @@ void main() {
 
       test('rejects brotli', () {
         expect(
-          read('large_string_map.brotli.parquet'),
-          throwsA(isA<FormatException>()),
+          ParquetReader(
+            'test/fixtures/parquet-testing/data/large_string_map.brotli.parquet',
+          ).read(),
+          failsWith(Kind.corrupt),
         );
       });
     });
@@ -733,6 +987,23 @@ void main() {
         expect(values.take(4), [100, 99, 98, 97]);
       });
 
+      test('delta binary packed, every bit width, matches expected', () async {
+        const dir = 'test/fixtures/parquet-testing/data';
+        final table = await ParquetReader(
+          '$dir/delta_binary_packed.parquet',
+        ).read().ok;
+        final lines = File(
+          '$dir/delta_binary_packed_expect.csv',
+        ).readAsLinesSync().where((l) => l.isNotEmpty).toList();
+        final names = lines.first.split(',');
+        for (var c = 0; c < names.length; c++) {
+          final expected = [
+            for (final line in lines.skip(1)) int.parse(line.split(',')[c]),
+          ];
+          expect(table.column(names[c])!.toList(), expected, reason: names[c]);
+        }
+      });
+
       test('delta length byte array', () async {
         expect(await read('delta_length_byte_array.parquet'), hasLength(1000));
       });
@@ -745,11 +1016,11 @@ void main() {
       // BYTE_ARRAY, and it does so from the SchemaElement. DecoderFactory hands
       // that schema to PlainDecoder but not to the delta byte-array decoders, so
       // a UTF8-annotated column read through them came back as raw bytes under a
-      // `string` dtype — and validateColumns compares dtypes only, so it passed.
+      // `string` dtype, and validateColumns compares dtypes only, so it passed.
       test('a UTF8 delta byte array decodes to String', () async {
         const path =
             'test/fixtures/parquet-testing/data/delta_byte_array.parquet';
-        final table = await ParquetReader(path).read();
+        final table = await ParquetReader(path).read().ok;
         final column = table.column('c_first_name')!;
         expect(table.schema.field('c_first_name')!.dataType, DataType.string);
         expect(column.toList().first, isA<String>());
@@ -770,7 +1041,7 @@ void main() {
       test('a UTF8 delta LENGTH byte array decodes to String', () async {
         const path =
             'test/fixtures/parquet-testing/data/delta_length_byte_array.parquet';
-        final table = await ParquetReader(path).read();
+        final table = await ParquetReader(path).read().ok;
         for (final field in table.schema.fields) {
           if (field.dataType != DataType.string) continue;
           final first = table.column(field.name)!.toList().first;
@@ -801,7 +1072,7 @@ void main() {
           ParquetReader(
             'test/fixtures/parquet-testing/data/fixed_length_byte_array.parquet',
           ).read(),
-          throwsA(isA<FormatException>()),
+          failsWith(Kind.corrupt),
         );
       });
 
@@ -809,7 +1080,7 @@ void main() {
         final table = await ParquetReader(
           'test/fixtures/parquet-testing/data/fixed_length_byte_array.parquet',
           options: const ParquetReaderOptions(tolerateTruncatedPages: true),
-        ).read();
+        ).read().ok;
         final values = table.columns.first.toList();
         expect(values, hasLength(1000));
         expect(values.first, [0, 0, 0x03, 0xe8]); // 1000 as a 4-byte FLBA
@@ -822,7 +1093,7 @@ void main() {
       test('reads a flat DataPageV1 snappy file', () async {
         final table = await ParquetReader(
           '$base/alltypes_plain.snappy.parquet',
-        ).read();
+        ).read().ok;
 
         expect(table.columns, hasLength(11));
         expect(table.columns.first.length, 2);
@@ -833,7 +1104,7 @@ void main() {
       test('reads a DataPageV2 snappy file with an empty data page', () async {
         final table = await ParquetReader(
           '$base/datapage_v2_empty_datapage.snappy.parquet',
-        ).read();
+        ).read().ok;
 
         expect(table.columns, isNotEmpty);
       });
@@ -873,7 +1144,7 @@ void main() {
       // ByteData (portable on web; >2GB lengths don't go negative). Verify a
       // valid multi-block Hadoop frame still decodes correctly.
       test('decodes a multi-block Hadoop-framed LZ4 payload', () {
-        final lz4 = Lz4Codec();
+        final lz4 = Lz4Codec(format: Lz4Format.raw);
         final builder = BytesBuilder();
 
         void be32(int v) {
@@ -888,7 +1159,7 @@ void main() {
           Uint8List.fromList(List.generate(300, (i) => (i * 7) % 256)),
         ];
         for (final raw in blocks) {
-          final comp = lz4.compressBlock(raw);
+          final comp = lz4.compress(raw);
           be32(raw.length); // uncompressed size of this frame
           be32(comp.length); // compressed sub-block length
           builder.add(comp);
@@ -900,11 +1171,11 @@ void main() {
         expect(out, [...blocks[0], ...blocks[1]]);
       });
 
-      test('cumulative output over maxDecompressedSize is rejected (bomb)', () {
+      test('cumulative output over maxSize is rejected (bomb)', () {
         // Two frames summing to 1000 decompressed bytes. Under a generous cap
         // they decode; under a cap between one and two frames the bomb must be
         // rejected (no OOM / no oversized output) rather than returning 1000.
-        final lz4 = Lz4Codec();
+        final lz4 = Lz4Codec(format: Lz4Format.raw);
         Uint8List framed() {
           final builder = BytesBuilder();
           void be32(int v) => builder.add(
@@ -914,7 +1185,7 @@ void main() {
             Uint8List.fromList(List.generate(500, (i) => i % 256)),
             Uint8List.fromList(List.generate(500, (i) => (i * 3) % 256)),
           ]) {
-            final comp = lz4.compressBlock(raw);
+            final comp = lz4.compress(raw);
             be32(raw.length);
             be32(comp.length);
             builder.add(comp);
@@ -926,7 +1197,7 @@ void main() {
         expect(
           codecFor(
             thrift.CompressionCodec.lz4,
-            maxDecompressedSize: 100000,
+            maxSize: 100000,
           ).decompress(framed()).length,
           1000,
         );
@@ -934,7 +1205,7 @@ void main() {
         expect(
           () => codecFor(
             thrift.CompressionCodec.lz4,
-            maxDecompressedSize: 600,
+            maxSize: 600,
           ).decompress(framed()),
           throwsA(anything),
         );
@@ -943,7 +1214,7 @@ void main() {
   });
 
   group('checksums', () {
-    // Covers #5: optional Parquet page CRC32 — written when [writeChecksums] is
+    // Covers #5: optional Parquet page CRC32, written when [writeChecksums] is
     // set and verified when [verifyChecksums] is set; a corrupted page is
     // rejected.
     late Directory dir;
@@ -978,7 +1249,7 @@ void main() {
       await ParquetWriter(
         path,
         options: const ParquetWriterOptions(writeChecksums: true),
-      ).write(sample());
+      ).write(sample()).ok;
       return path;
     }
 
@@ -987,7 +1258,7 @@ void main() {
       final table = await ParquetReader(
         path,
         options: const ParquetReaderOptions(verifyChecksums: true),
-      ).read();
+      ).read().ok;
       expect(table.rowCount, 20000);
       expect(table.column('id')!.toList().last, 19999);
       expect(table.column('name')!.toList().first, 'item_0');
@@ -1008,14 +1279,14 @@ void main() {
           path,
           options: const ParquetReaderOptions(verifyChecksums: true),
         ).read(),
-        throwsA(isA<FormatException>()),
+        failsWith(Kind.corrupt),
       );
     });
 
     test('verifyChecksums off ignores a present CRC', () async {
       final path = await writeChecksummed();
       // Default options: verifyChecksums == false → no CRC check at all.
-      final table = await ParquetReader(path).read();
+      final table = await ParquetReader(path).read().ok;
       expect(table.rowCount, 20000);
     });
   });
@@ -1050,7 +1321,7 @@ void main() {
       test('a corrupt-checksum fixture throws by default', () async {
         const f =
             'test/fixtures/parquet-testing/data/datapage_v1-corrupt-checksum.parquet';
-        expect(() => ParquetReader(f).read(), throwsA(isA<FormatException>()));
+        expect(ParquetReader(f).read(), failsWith(Kind.corrupt));
       });
 
       test('verifyChecksums:false skips the check (decodes anyway)', () async {
@@ -1059,7 +1330,7 @@ void main() {
         final t = await ParquetReader(
           f,
           options: const ParquetReaderOptions(verifyChecksums: false),
-        ).read();
+        ).read().ok;
         expect(t.rowCount, greaterThan(0));
       });
 
@@ -1068,10 +1339,10 @@ void main() {
         final path = '${dir.path}/t.parquet';
         await ParquetWriter(
           path,
-        ).write(sample()); // writeChecksums defaults true
+        ).write(sample()).ok; // writeChecksums defaults true
         final back = await ParquetReader(
           path,
-        ).read(); // verifyChecksums defaults true
+        ).read().ok; // verifyChecksums defaults true
         expect(back.rowCount, 5000);
         expect(back.column('id')!.toList().last, 4999);
         dir.deleteSync(recursive: true);
@@ -1082,7 +1353,7 @@ void main() {
       test('a physically truncated file fails loud', () async {
         final dir = Directory.systemTemp.createTempSync('pqtrunc_');
         final path = '${dir.path}/t.parquet';
-        await ParquetWriter(path).write(sample());
+        await ParquetWriter(path).write(sample()).ok;
         final bytes = File(path).readAsBytesSync();
         // Lop off the tail of the data (keep the footer-less middle truncated):
         // chop ~40% so a page read runs past EOF.
@@ -1091,7 +1362,7 @@ void main() {
 
         // Footer is gone, so this throws regardless; the point is it never returns
         // fabricated data. Tolerant mode must not paper over a physical short read.
-        expect(() => ParquetReader(path).read(), throwsA(isA<Exception>()));
+        expect(() => ParquetReader(path).read().ok, throwsA(isA<Exception>()));
         expect(
           () => ParquetReader(
             path,
@@ -1099,7 +1370,7 @@ void main() {
               tolerateTruncatedPages: true,
               verifyChecksums: false,
             ),
-          ).read(),
+          ).read().ok,
           throwsA(isA<Exception>()),
         );
         dir.deleteSync(recursive: true);
@@ -1112,7 +1383,7 @@ void main() {
       // decoder's truncation handling rather than failing on a short file.
       Future<String> overstated(Directory dir, Table table, int extra) async {
         final path = '${dir.path}/overstated.parquet';
-        await ParquetWriter(path).write(table);
+        await ParquetWriter(path).write(table).ok;
         final bytes = File(path).readAsBytesSync();
         final length = ByteData.view(
           bytes.buffer,
@@ -1177,7 +1448,7 @@ void main() {
           final path = await overstated(dir, numbers(nullable: nullable), 3);
           await expectLater(
             ParquetReader(path).read(),
-            throwsA(isA<FormatException>()),
+            failsWith(Kind.corrupt),
           );
         });
 
@@ -1190,7 +1461,7 @@ void main() {
             final table = await ParquetReader(
               path,
               options: const ParquetReaderOptions(tolerateTruncatedPages: true),
-            ).read();
+            ).read().ok;
             // A fabricated 0/0.0 tail is indistinguishable from real data; the
             // boxed path has always padded with null, and the typed path must
             // give the same answer for the same option.
@@ -1230,16 +1501,16 @@ void main() {
           addTearDown(() => dir.deleteSync(recursive: true));
           final path = await overstated(dir, numbers(nullable: true), 3);
           const options = ParquetReaderOptions(tolerateTruncatedPages: true);
-          final eager = await ParquetReader(path, options: options).read();
+          final eager = await ParquetReader(path, options: options).read().ok;
           // A small batch size makes the null tail span a batch boundary.
           final streamed = <Map<String, dynamic>>[];
           await for (final batch in ParquetReader(
             path,
             options: options,
-          ).readBatches(size: 3)) {
+          ).readBatches(batchSize: 3).ok) {
             streamed.addAll(batch.toRows());
           }
-          // Both APIs report the DECLARED row count with a null-padded tail —
+          // Both APIs report the DECLARED row count with a null-padded tail:
           // selecting an API must never change the row count of a file.
           expect(streamed.length, eager.rowCount);
           expect(streamed.length, 8); // 5 real + 3 padded
@@ -1272,7 +1543,7 @@ void main() {
           for (var i = 0; i < 600; i++) {
             await expectLater(
               ParquetReader(bad).read(),
-              throwsA(isA<FormatException>()),
+              failsWith(Kind.corrupt),
             );
           }
           dir.deleteSync(recursive: true);
@@ -1300,7 +1571,10 @@ void main() {
             fields: [Field(name: 'l', dataType: DataType.list, nullable: true)],
           ),
         );
-        await expectLater(ParquetWriter(path).write(bad), throwsA(anything));
+        await expectLater(
+          ParquetWriter(path).write(bad),
+          failsWith(Kind.invalid),
+        );
         expect(File('$path.tmp').existsSync(), isFalse);
         expect(File(path).existsSync(), isFalse);
         dir.deleteSync(recursive: true);
@@ -1343,19 +1617,98 @@ void main() {
       });
     });
 
+    // The footer's schema is a flat list, but every reader walks it as a tree
+    // recursively, so depth and size are bounded when the footer is read.
+    group('Parquet schema limits', () {
+      late Directory dir;
+      setUp(() => dir = Directory.systemTemp.createTempSync('pq_schema_'));
+      tearDown(() => dir.deleteSync(recursive: true));
+
+      String craft(List<thrift.SchemaElement> schema) {
+        final metadata = thrift.FileMetaData()
+          ..version = 1
+          ..schema = schema
+          ..numRows = 0
+          ..rowGroups = [];
+        final writer = CompactWriter();
+        metadata.write(writer);
+        final footer = writer.takeBytes();
+        final size = ByteData(4)..setInt32(0, footer.length, Endian.little);
+        final path = '${dir.path}/crafted.parquet';
+        File(path).writeAsBytesSync([
+          ...ascii.encode('PAR1'),
+          ...footer,
+          ...size.buffer.asUint8List(),
+          ...ascii.encode('PAR1'),
+        ]);
+        return path;
+      }
+
+      thrift.SchemaElement group(String name, int children) =>
+          thrift.SchemaElement()
+            ..name = name
+            ..numChildren = children
+            ..repetitionType = thrift.FieldRepetitionType.optional;
+
+      thrift.SchemaElement leaf(String name) => thrift.SchemaElement()
+        ..name = name
+        ..type = thrift.ParquetType.int32
+        ..repetitionType = thrift.FieldRepetitionType.required;
+
+      test('a schema nested past the depth limit throws', () async {
+        final path = craft([
+          group('root', 1),
+          for (var i = 0; i < 50000; i++) group('g$i', 1),
+          leaf('x'),
+        ]);
+        await expectLater(
+          ParquetReader(path).schema(),
+          failsWith(Kind.corrupt),
+        );
+      });
+
+      test('a schema wider than the field limit throws', () async {
+        final path = craft([
+          group('root', defaultMaxSchemaFields + 1),
+          for (var i = 0; i <= defaultMaxSchemaFields; i++) leaf('c$i'),
+        ]);
+        await expectLater(
+          ParquetReader(path).schema(),
+          failsWith(Kind.corrupt),
+        );
+      });
+
+      test('a child count running past the list throws', () async {
+        final path = craft([group('root', 3), leaf('a')]);
+        await expectLater(
+          ParquetReader(path).schema(),
+          failsWith(Kind.corrupt),
+        );
+      });
+
+      test('a modest nested schema still reads', () async {
+        final path = craft([
+          group('root', 1),
+          for (var i = 0; i < 20; i++) group('g$i', 1),
+          leaf('x'),
+        ]);
+        expect(await ParquetReader(path).schema().ok, isNotNull);
+      });
+    });
+
     group('truncated ULEB128', () {
       // A varint whose continuation bit is still set at end-of-buffer is
       // truncated input; returning the bits read so far is a fabricated value.
       test('a varint running off the end throws', () {
         // 0x80 = "more bytes follow", then nothing.
-        final reader = dbp.ByteReader(Uint8List.fromList([0x80]));
+        final reader = ByteReader(Uint8List.fromList([0x80]));
         expect(
-          reader.readUleb128,
+          reader.readVarint,
           throwsA(
             isA<FormatException>().having(
               (e) => e.message,
               'message',
-              contains('ULEB128'),
+              contains('varint'),
             ),
           ),
         );
@@ -1363,19 +1716,19 @@ void main() {
 
       test('a complete varint still reads', () {
         // 0xAC 0x02 = 300.
-        final reader = dbp.ByteReader(Uint8List.fromList([0xAC, 0x02]));
-        expect(reader.readUleb128(), 300);
+        final reader = ByteReader(Uint8List.fromList([0xAC, 0x02]));
+        expect(reader.readVarint(), 300);
       });
 
       test('a single-byte varint still reads', () {
-        expect(dbp.ByteReader(Uint8List.fromList([0x7F])).readUleb128(), 127);
+        expect(ByteReader(Uint8List.fromList([0x7F])).readVarint(), 127);
       });
     });
 
     group('deprecated BIT_PACKED levels', () {
       // The level guards required Encoding.rle, so a BIT_PACKED level section
       // fell through un-read: `offset` stayed at 0 and the level bytes were
-      // decoded as VALUES — fabricated data, no exception.
+      // decoded as VALUES: fabricated data, no exception.
       thrift.PageHeader page(thrift.Encoding levelEncoding) =>
           thrift.PageHeader()
             ..type = thrift.PageType.dataPage
@@ -1450,7 +1803,7 @@ void main() {
     group('corrupt page header fails loud', () {
       test('a header larger than the chunk throws FormatException', () async {
         // A compact field header (field 1, type binary) declaring a 100-byte
-        // string, with only a few bytes following — the header parse runs off the
+        // string, with only a few bytes following: the header parse runs off the
         // chunk. It must surface as FormatException, not a raw RangeError.
         final dir = Directory.systemTemp.createTempSync('pghdr_');
         try {
@@ -1494,15 +1847,15 @@ void main() {
 
   // A nested column whose every node from the root to the leaf is REQUIRED has
   // maxDef == 0, so there are no definition levels to carry. The writer must
-  // then omit the level section entirely — emitting a zero-width one writes
+  // then omit the level section entirely: emitting a zero-width one writes
   // bytes the reader (and pyarrow) never read back, shifting every value.
   group('all-required nesting', () {
     Future<Table> roundTrip(Table table) async {
       final dir = Directory.systemTemp.createTempSync('pqreq_');
       addTearDown(() => dir.deleteSync(recursive: true));
       final path = '${dir.path}/t.parquet';
-      await ParquetWriter(path).write(table);
-      return ParquetReader(path).read();
+      await ParquetWriter(path).write(table).ok;
+      return ParquetReader(path).read().ok;
     }
 
     test('a required struct of a required leaf round-trips', () async {
@@ -1619,7 +1972,7 @@ void main() {
       await ParquetWriter(
         path,
         options: const ParquetWriterOptions(rowGroupSize: 100),
-      ).write(table); // 10 row groups
+      ).write(table).ok; // 10 row groups
 
       ParquetReader.rowGroupsPruned = 0;
       final t = await ParquetReader(
@@ -1627,7 +1980,7 @@ void main() {
         options: ParquetReaderOptions(
           filter: RowFilter.compare('id', FilterOp.ge, 500),
         ),
-      ).read();
+      ).read().ok;
       // Row groups whose id-max < 500 are pruned (5 of 10), so only the
       // surviving groups' rows (id 500..999) are decoded.
       expect(ParquetReader.rowGroupsPruned, greaterThan(0));
@@ -1642,7 +1995,7 @@ void main() {
     test('a nested-leaf filter never mis-prunes (result stays complete)', () async {
       // Filter on the nested leaf `s.a` (dotted). Row-group pruning is a
       // superset filter, so EVERY row group containing a matching value must be
-      // kept — the result must contain all rows where s.a >= 500, whether or not
+      // kept: the result must contain all rows where s.a >= 500, whether or not
       // any group is actually pruned.
       final dir = Directory.systemTemp.createTempSync('pqnestleaf_');
       addTearDown(() => dir.deleteSync(recursive: true));
@@ -1681,13 +2034,13 @@ void main() {
       await ParquetWriter(
         path,
         options: const ParquetWriterOptions(rowGroupSize: 100),
-      ).write(table);
+      ).write(table).ok;
       final t = await ParquetReader(
         path,
         options: ParquetReaderOptions(
           filter: RowFilter.compare('s.a', FilterOp.ge, 500),
         ),
-      ).read();
+      ).read().ok;
       // Every row whose s.a >= 500 survives (row-group granularity keeps whole
       // groups, so the count is a multiple of the group size, never fewer).
       final aVals = [for (final v in t.column('s')!.toList()) (v as Map)['a']];
@@ -1702,7 +2055,7 @@ void main() {
     const dir = 'test/fixtures/parquet-testing/data';
 
     test('LIST columns read back as list columns of their elements', () async {
-      final t = await ParquetReader('$dir/list_columns.parquet').read();
+      final t = await ParquetReader('$dir/list_columns.parquet').read().ok;
       final f = t.schema.field('int64_list');
       expect(f, isNotNull);
       expect(f!.dataType, DataType.list);
@@ -1718,21 +2071,25 @@ void main() {
       () async {
         final batches = await ParquetReader(
           '$dir/list_columns.parquet',
-        ).readBatches().toList();
+        ).readBatches().ok.toList();
         expect(batches, isNotEmpty);
         // Every streamed batch carries the reassembled nested schema, matching
         // read() rather than the flat leaf shape.
         for (final b in batches) {
           expect(b.schema.field('int64_list')!.dataType, DataType.list);
         }
-        final whole = await ParquetReader('$dir/list_columns.parquet').read();
+        final whole = await ParquetReader(
+          '$dir/list_columns.parquet',
+        ).read().ok;
         final streamedRows = batches.fold(0, (s, b) => s + b.rowCount);
         expect(streamedRows, whole.rowCount);
       },
     );
 
     test('STRUCT columns read back as struct (Map) columns', () async {
-      final t = await ParquetReader('$dir/nested_structs.rust.parquet').read();
+      final t = await ParquetReader(
+        '$dir/nested_structs.rust.parquet',
+      ).read().ok;
       final f = t.schema.field('roll_num');
       expect(f, isNotNull);
       expect(f!.dataType, DataType.struct);
@@ -1745,7 +2102,9 @@ void main() {
     test(
       'a deeply-nested (map-of-map) file still reads without crashing',
       () async {
-        final t = await ParquetReader('$dir/nested_maps.snappy.parquet').read();
+        final t = await ParquetReader(
+          '$dir/nested_maps.snappy.parquet',
+        ).read().ok;
         expect(
           t.rowCount,
           greaterThan(0),
@@ -1760,8 +2119,8 @@ void main() {
 
       Future<Table> roundTrip(Table t) async {
         final path = '${tmp.path}/n.parquet';
-        await ParquetWriter(path).write(t);
-        return ParquetReader(path).read();
+        await ParquetWriter(path).write(t).ok;
+        return ParquetReader(path).read().ok;
       }
 
       test('list / struct / map of scalars round-trip', () async {
@@ -1873,21 +2232,23 @@ void main() {
 
     Future<List<dynamic>> roundTrip(Field field, List<dynamic> data) async {
       final p = '${dir.path}/x.parquet';
-      await ParquetWriter(p).write(
-        Table(
-          name: 't',
-          columns: [
-            ListColumn(
-              name: field.name,
-              dataType: field.dataType,
-              data: data,
-              nullable: true,
+      await ParquetWriter(p)
+          .write(
+            Table(
+              name: 't',
+              columns: [
+                ListColumn(
+                  name: field.name,
+                  dataType: field.dataType,
+                  data: data,
+                  nullable: true,
+                ),
+              ],
+              schema: Schema(fields: [field]),
             ),
-          ],
-          schema: Schema(fields: [field]),
-        ),
-      );
-      final back = await ParquetReader(p).read();
+          )
+          .ok;
+      final back = await ParquetReader(p).read().ok;
       return back.column(field.name)!.toList();
     }
 
@@ -2045,9 +2406,9 @@ void main() {
         path,
         Stream.fromIterable(batches),
         options: const ParquetWriterOptions(rowGroupSize: 100),
-      );
+      ).ok;
 
-      final t = await ParquetReader(path).read();
+      final t = await ParquetReader(path).read().ok;
       expect(t.rowCount, 250);
       expect(t.column('id')!.toList(), List.generate(250, (i) => i));
       expect(t.column('name')!.toList().last, 'n249');
@@ -2058,8 +2419,8 @@ void main() {
       await ParquetWriter(
         path,
         options: const ParquetWriterOptions(rowGroupSize: 100),
-      ).write(ids(0, 250));
-      final t = await ParquetReader(path).read();
+      ).write(ids(0, 250)).ok;
+      final t = await ParquetReader(path).read().ok;
       expect(t.rowCount, 250);
       expect(t.column('id')!.toList().first, 0);
       expect(t.column('id')!.toList().last, 249);
@@ -2073,11 +2434,11 @@ void main() {
       final pq = '${dir.path}/out.parquet';
       await DataFrameIO.writeParquetStream(
         pq,
-        DataFrameIO.readCsvBatches(csv, size: 64),
+        DataFrameIO.readCsvBatches(csv, batchSize: 64).ok,
         options: const ParquetWriterOptions(rowGroupSize: 128),
-      );
+      ).ok;
 
-      final t = await ParquetReader(pq).read();
+      final t = await ParquetReader(pq).read().ok;
       expect(t.rowCount, 300);
       expect(t.column('id')!.toList(), List.generate(300, (i) => i));
       expect(t.column('name')!.toList()[299], 'v299');
@@ -2088,8 +2449,8 @@ void main() {
       await DataFrameIO.writeParquetStream(
         path,
         Stream<DataFrame>.fromIterable([DataFrame.fromTable(ids(0, 0))]),
-      );
-      final t = await ParquetReader(path).read();
+      ).ok;
+      final t = await ParquetReader(path).read().ok;
       expect(t.rowCount, 0);
     });
   });
@@ -2142,9 +2503,9 @@ void main() {
           path,
           Stream.fromIterable(batches),
           options: const ParquetWriterOptions(rowGroupSize: 100),
-        );
+        ).ok;
 
-        final t = await ParquetReader(path).read();
+        final t = await ParquetReader(path).read().ok;
         expect(t.rowCount, 210);
         final id = t.column('id')!.toList();
         final name = t.column('name')!.toList();
@@ -2221,6 +2582,26 @@ void main() {
         expect(RowFilter.compare('x', FilterOp.ne, 7).keep(withNulls), isTrue);
         // Non-uniform range -> keep.
         expect(RowFilter.compare('x', FilterOp.ne, 15).keep(g), isTrue);
+      });
+
+      test('ne keeps a uniform floating-point group that may hold NaN', () {
+        // min/max exclude NaN, and NaN <> 5 is true, so [5.0, NaN] has the
+        // bounds of a uniform group and must still be read.
+        ColumnBounds bounds({int? nans}) => ColumnBounds(
+          min: 5.0,
+          max: 5.0,
+          nullCount: 0,
+          nanCount: nans,
+          rowCount: 2,
+          hasStats: true,
+        );
+        final unknown = {'x': bounds()};
+        final some = {'x': bounds(nans: 1)};
+        final none = {'x': bounds(nans: 0)};
+        expect(RowFilter.compare('x', FilterOp.ne, 5).keep(unknown), isTrue);
+        expect(RowFilter.compare('x', FilterOp.ne, 5).keep(some), isTrue);
+        expect(RowFilter.compare('x', FilterOp.ne, 5).keep(none), isFalse);
+        expect(RowFilter.compare('x', FilterOp.ne, 5.0).keep(none), isFalse);
       });
 
       test('all-null group is skipped for any comparison', () {
@@ -2342,6 +2723,39 @@ void main() {
         final b = statsToBounds(null, DataType.int64, 100);
         expect(b.hasStats, isFalse);
       });
+
+      test('deprecated min/max are used only for signed-order types', () {
+        // Old writers (PARQUET-686) order the deprecated fields by signed
+        // bytes, so {'a', 'é'} records min 'é' and max 'a'.
+        final legacy = thrift.Statistics()
+          ..min = Uint8List.fromList(utf8.encode('é'))
+          ..max = Uint8List.fromList(utf8.encode('a'));
+        final text = statsToBounds(legacy, DataType.string, 2);
+        expect(text.min, isNull);
+        expect(
+          RowFilter.compare('s', FilterOp.eq, 'a').keep({'s': text}),
+          isTrue,
+        );
+
+        final unsigned = statsToBounds(
+          thrift.Statistics()
+            ..min = i64(-1)
+            ..max = i64(5),
+          DataType.int64,
+          2,
+          unsignedBits: 32,
+        );
+        expect(unsigned.min, isNull);
+
+        final signed = statsToBounds(
+          thrift.Statistics()
+            ..min = i64(3)
+            ..max = i64(5),
+          DataType.int64,
+          2,
+        );
+        expect([signed.min, signed.max], [3, 5]);
+      });
     });
 
     group('end-to-end row-group pruning', () {
@@ -2377,13 +2791,13 @@ void main() {
         await ParquetWriter(
           path,
           options: const ParquetWriterOptions(rowGroupSize: 100),
-        ).write(table);
+        ).write(table).ok;
       });
       tearDown(() => dir.deleteSync(recursive: true));
 
       test('no filter reads every row', () async {
-        final df = await DataFrameIO.readParquet(path);
-        expect((await df.execute()).rowCount, 1000);
+        final df = await DataFrameIO.readParquet(path).ok;
+        expect((await df.execute().ok).rowCount, 1000);
       });
 
       test(
@@ -2392,8 +2806,8 @@ void main() {
           final df = await DataFrameIO.readParquet(
             path,
             filter: RowFilter.compare('id', FilterOp.ge, 500),
-          );
-          final t = await df.execute();
+          ).ok;
+          final t = await df.execute().ok;
           // Groups 0-4 (ids 0-499) pruned; 5-9 kept whole.
           expect(t.rowCount, 500);
           final ids = t.column('id')!.toList().cast<int>();
@@ -2402,12 +2816,47 @@ void main() {
         },
       );
 
+      test('a column with an unknown sort order is not pruned', () async {
+        // Rewrite the footer so the id column declares a sort order this
+        // reader does not know (an empty ColumnOrder union).
+        final bytes = File(path).readAsBytesSync();
+        final length = ByteData.sublistView(
+          bytes,
+        ).getUint32(bytes.length - 8, Endian.little);
+        final start = bytes.length - 8 - length;
+        final metadata = thrift.FileMetaData()
+          ..read(
+            CompactReader(Uint8List.sublistView(bytes, start, start + length)),
+          );
+        metadata.columnOrders = [
+          thrift.ColumnOrder(),
+          for (final _ in metadata.schema.skip(2)) thrift.ColumnOrder(),
+        ];
+        final writer = CompactWriter();
+        metadata.write(writer);
+        final footer = writer.takeBytes();
+        final patched = '${dir.path}/unknown_order.parquet';
+        File(patched).writeAsBytesSync([
+          ...Uint8List.sublistView(bytes, 0, start),
+          ...footer,
+          ...(ByteData(
+            4,
+          )..setUint32(0, footer.length, Endian.little)).buffer.asUint8List(),
+          ...'PAR1'.codeUnits,
+        ]);
+        final df = await DataFrameIO.readParquet(
+          patched,
+          filter: RowFilter.compare('id', FilterOp.ge, 500),
+        ).ok;
+        expect((await df.execute().ok).rowCount, 1000);
+      });
+
       test('filter matching nothing prunes all groups', () async {
         final df = await DataFrameIO.readParquet(
           path,
           filter: RowFilter.compare('id', FilterOp.gt, 100000),
-        );
-        expect((await df.execute()).rowCount, 0);
+        ).ok;
+        expect((await df.execute().ok).rowCount, 0);
       });
 
       test('range AND keeps only the overlapping groups', () async {
@@ -2417,19 +2866,37 @@ void main() {
             RowFilter.compare('id', FilterOp.ge, 300),
             RowFilter.compare('id', FilterOp.lt, 500),
           ]),
-        );
-        final t = await df.execute();
+        ).ok;
+        final t = await df.execute().ok;
         expect(t.rowCount, 200); // groups 3 and 4
         final ids = t.column('id')!.toList().cast<int>();
         expect(ids.first, 300);
         expect(ids.last, 499);
       });
 
+      test('a NaN row survives pruning for <>', () async {
+        final file = '${dir.path}/nan.parquet';
+        await ParquetWriter(file)
+            .write(
+              Table.fromRows('t', [
+                {'x': 5.0},
+                {'x': double.nan},
+              ]),
+            )
+            .ok;
+        final t = await (await DataFrameIO.readParquet(
+          file,
+          filter: RowFilter.compare('x', FilterOp.ne, 5),
+        ).ok).execute().ok;
+        // The filter only prunes groups: the group is kept whole.
+        expect(t.rowCount, 2);
+      });
+
       test('column projection returns only the requested columns', () async {
         final t = await (await DataFrameIO.readParquet(
           path,
           columns: ['id'],
-        )).execute();
+        ).ok).execute().ok;
         expect(t.schema.fieldNames, ['id']);
         expect(t.rowCount, 1000);
         expect(t.column('id')!.toList().first, 0);
@@ -2440,7 +2907,7 @@ void main() {
           path,
           columns: ['id'],
           filter: RowFilter.compare('id', FilterOp.ge, 500),
-        )).execute();
+        ).ok).execute().ok;
         expect(t.schema.fieldNames, ['id']);
         expect(t.rowCount, 500);
         expect(t.column('id')!.toList().first, 500);
@@ -2457,6 +2924,9 @@ void main() {
       required int totalCompressedSize,
     }) {
       final root = thrift.SchemaElement()..numChildren = 1;
+      final leaf = thrift.SchemaElement()
+        ..name = 'c'
+        ..type = thrift.ParquetType.int32;
       final col = thrift.ColumnMetaData()
         ..codec = thrift.CompressionCodec.uncompressed
         ..pathInSchema = ['c']
@@ -2469,7 +2939,7 @@ void main() {
         ..numRows = 1;
       return thrift.FileMetaData()
         ..version = 1
-        ..schema = [root]
+        ..schema = [root, leaf]
         ..numRows = 1
         ..rowGroups = [rg];
     }
@@ -2517,7 +2987,7 @@ void main() {
   group('large header', () {
     // a valid Parquet page header larger than the initial 1024-byte
     // read window (e.g. rich per-page statistics) must be read by widening the
-    // window — not rejected as "truncated". This regressed when the
+    // window, not rejected as "truncated". This regressed when the
     // compact protocol began throwing FormatException (not RangeError) on the
     // end-of-window that drives the widen loop.
     Future<HeaderResult?> readHeader(Uint8List headerBytes) async {
@@ -2600,23 +3070,25 @@ void main() {
 
     Future<String> write(int n) async {
       final p = '${dir.path}/f.parquet';
-      await ParquetWriter(p).write(
-        Table(
-          name: 't',
-          columns: [
-            NumericColumn.int64(
-              name: 'id',
-              values: [for (var i = 0; i < n; i++) i],
-              nullable: false,
+      await ParquetWriter(p)
+          .write(
+            Table(
+              name: 't',
+              columns: [
+                NumericColumn.int64(
+                  name: 'id',
+                  values: [for (var i = 0; i < n; i++) i],
+                  nullable: false,
+                ),
+              ],
+              schema: Schema(
+                fields: [
+                  Field(name: 'id', dataType: DataType.int64, nullable: false),
+                ],
+              ),
             ),
-          ],
-          schema: Schema(
-            fields: [
-              Field(name: 'id', dataType: DataType.int64, nullable: false),
-            ],
-          ),
-        ),
-      );
+          )
+          .ok;
       return p;
     }
 
@@ -2624,29 +3096,29 @@ void main() {
       final p = await write(1000);
       await expectLater(
         ParquetReader(p).read(maxRows: 100),
-        throwsA(isA<StateError>()),
+        failsWith(Kind.limit),
       );
-      expect((await ParquetReader(p).read(maxRows: null)).rowCount, 1000);
+      expect((await ParquetReader(p).read(maxRows: null).ok).rowCount, 1000);
     });
 
     test('read() throws past maxBytes (memory cap)', () async {
       final p = await write(1000); // 1000 int64 = ~8000 bytes
       await expectLater(
         ParquetReader(p).read(maxBytes: 64),
-        throwsA(isA<StateError>()),
+        failsWith(Kind.limit),
       );
-      expect((await ParquetReader(p).read(maxBytes: null)).rowCount, 1000);
+      expect((await ParquetReader(p).read(maxBytes: null).ok).rowCount, 1000);
     });
 
     test('default caps clear a normal file', () async {
       final p = await write(1000);
-      expect((await ParquetReader(p).read()).rowCount, 1000);
+      expect((await ParquetReader(p).read().ok).rowCount, 1000);
     });
   });
 
   group('batch bounded', () {
-    // ParquetReader.readBatches streams a row group page-by-page
-    // — peak memory ≈ one `size`-row batch, not the whole group. A single large
+    // ParquetReader.readBatches streams a row group page-by-page:
+    // peak memory ≈ one `size`-row batch, not the whole group. A single large
     // row group (default rowGroupSize=100k) read with a small `size` must yield many
     // small batches whose concatenation equals read() column-for-column.
     late Directory dir;
@@ -2656,39 +3128,45 @@ void main() {
     test('flat columns: small-size batches concat to read()', () async {
       final path = '${dir.path}/flat.parquet';
       const n = 1000; // one row group (default 100k)
-      await ParquetWriter(path).write(
-        Table(
-          name: 't',
-          columns: [
-            NumericColumn.int64(
-              name: 'id',
-              values: [for (var i = 0; i < n; i++) i],
-              nullable: false,
+      await ParquetWriter(path)
+          .write(
+            Table(
+              name: 't',
+              columns: [
+                NumericColumn.int64(
+                  name: 'id',
+                  values: [for (var i = 0; i < n; i++) i],
+                  nullable: false,
+                ),
+                NumericColumn.float64(
+                  name: 'v',
+                  values: [
+                    for (var i = 0; i < n; i++) i % 7 == 0 ? null : i * 1.5,
+                  ],
+                  nullable: true,
+                ),
+                ListColumn<String>(
+                  name: 's',
+                  dataType: DataType.string,
+                  data: [for (var i = 0; i < n; i++) 'r$i'],
+                  nullable: false,
+                ),
+              ],
+              schema: Schema(
+                fields: [
+                  Field(name: 'id', dataType: DataType.int64, nullable: false),
+                  Field(name: 'v', dataType: DataType.float64, nullable: true),
+                  Field(name: 's', dataType: DataType.string, nullable: false),
+                ],
+              ),
             ),
-            NumericColumn.float64(
-              name: 'v',
-              values: [for (var i = 0; i < n; i++) i % 7 == 0 ? null : i * 1.5],
-              nullable: true,
-            ),
-            ListColumn<String>(
-              name: 's',
-              dataType: DataType.string,
-              data: [for (var i = 0; i < n; i++) 'r$i'],
-              nullable: false,
-            ),
-          ],
-          schema: Schema(
-            fields: [
-              Field(name: 'id', dataType: DataType.int64, nullable: false),
-              Field(name: 'v', dataType: DataType.float64, nullable: true),
-              Field(name: 's', dataType: DataType.string, nullable: false),
-            ],
-          ),
-        ),
-      );
+          )
+          .ok;
 
-      final whole = await ParquetReader(path).read();
-      final batches = await ParquetReader(path).readBatches(size: 100).toList();
+      final whole = await ParquetReader(path).read().ok;
+      final batches = await ParquetReader(
+        path,
+      ).readBatches(batchSize: 100).ok.toList();
 
       expect(
         batches.length,
@@ -2709,25 +3187,29 @@ void main() {
       // last left off.
       final path = '${dir.path}/pages.parquet';
       const n = 5000;
-      await ParquetWriter(path).write(
-        Table(
-          name: 't',
-          columns: [
-            NumericColumn.int64(
-              name: 'k',
-              values: [for (var i = 0; i < n; i++) i * 3 - 1],
-              nullable: false,
+      await ParquetWriter(path)
+          .write(
+            Table(
+              name: 't',
+              columns: [
+                NumericColumn.int64(
+                  name: 'k',
+                  values: [for (var i = 0; i < n; i++) i * 3 - 1],
+                  nullable: false,
+                ),
+              ],
+              schema: Schema(
+                fields: [
+                  Field(name: 'k', dataType: DataType.int64, nullable: false),
+                ],
+              ),
             ),
-          ],
-          schema: Schema(
-            fields: [
-              Field(name: 'k', dataType: DataType.int64, nullable: false),
-            ],
-          ),
-        ),
-      );
-      final whole = await ParquetReader(path).read();
-      final batches = await ParquetReader(path).readBatches(size: 257).toList();
+          )
+          .ok;
+      final whole = await ParquetReader(path).read().ok;
+      final batches = await ParquetReader(
+        path,
+      ).readBatches(batchSize: 257).ok.toList();
       expect(batches.length, greaterThan(1));
       final streamed = [for (final b in batches) ...b.column('k')!.toList()];
       expect(streamed, whole.column('k')!.toList());
@@ -2744,33 +3226,39 @@ void main() {
 
     Future<String> writeNested() async {
       final p = '${dir.path}/n.parquet';
-      await ParquetWriter(p).write(
-        Table(
-          name: 't',
-          columns: [
-            ListColumn(
-              name: 'tags',
-              dataType: DataType.list,
-              data: [
-                for (var i = 0; i < 500; i++) [i, i + 1, i + 2],
+      await ParquetWriter(p)
+          .write(
+            Table(
+              name: 't',
+              columns: [
+                ListColumn(
+                  name: 'tags',
+                  dataType: DataType.list,
+                  data: [
+                    for (var i = 0; i < 500; i++) [i, i + 1, i + 2],
+                  ],
+                  nullable: true,
+                ),
               ],
-              nullable: true,
-            ),
-          ],
-          schema: Schema(
-            fields: [
-              Field(
-                name: 'tags',
-                dataType: DataType.list,
-                nullable: true,
-                children: [
-                  Field(name: 'item', dataType: DataType.int64, nullable: true),
+              schema: Schema(
+                fields: [
+                  Field(
+                    name: 'tags',
+                    dataType: DataType.list,
+                    nullable: true,
+                    children: [
+                      Field(
+                        name: 'item',
+                        dataType: DataType.int64,
+                        nullable: true,
+                      ),
+                    ],
+                  ),
                 ],
               ),
-            ],
-          ),
-        ),
-      );
+            ),
+          )
+          .ok;
       return p;
     }
 
@@ -2778,19 +3266,13 @@ void main() {
       final p = await writeNested();
       await expectLater(
         ParquetReader(p).read(maxBytes: 1),
-        throwsA(
-          isA<StateError>().having(
-            (e) => e.toString(),
-            'message',
-            contains('maxBytes'),
-          ),
-        ),
+        failsWith(Kind.limit, contains('maxBytes')),
       );
     });
 
     test('the same nested file reads fine under the default cap', () async {
       final p = await writeNested();
-      final t = await ParquetReader(p).read();
+      final t = await ParquetReader(p).read().ok;
       expect(t.column('tags')!.toList().first, [0, 1, 2]);
       expect(t.rowCount, 500);
     });
@@ -2799,7 +3281,7 @@ void main() {
   group('concurrent write', () {
     // ParquetWriter uses a per-writer unique temp path, so two
     // writers targeting the same destination can't corrupt or cross-delete each
-    // other's in-progress temp — the destination ends up a valid file.
+    // other's in-progress temp: the destination ends up a valid file.
     test(
       'concurrent writers to one destination both produce valid files',
       () async {
@@ -2831,7 +3313,7 @@ void main() {
 
           // Whichever won the final rename, the file must be valid and complete
           // (not a corrupted interleave of both writers' temps).
-          final back = await ParquetReader(path).read();
+          final back = await ParquetReader(path).read().ok;
           expect(back.rowCount, 500);
           final first = back.column('v')!.toList().first as int;
           expect(first == 0 || first == 1000, isTrue);
@@ -2853,7 +3335,7 @@ void main() {
     // a high-cardinality integer column is DELTA_BINARY_PACKED
     // encoded by the writer. The writer marks a no-null column `required` in the
     // file schema, so the per-column encoder must agree (write no definition
-    // levels) — otherwise the reader reads the delta header at the wrong offset.
+    // levels); otherwise the reader reads the delta header at the wrong offset.
     // Regression for the nullable delta round-trip bug.
     late Directory dir;
     setUp(() => dir = Directory.systemTemp.createTempSync('pqdelta_'));
@@ -2861,8 +3343,8 @@ void main() {
 
     Future<Table> roundTrip(Table t) async {
       final p = '${dir.path}/d.parquet';
-      await ParquetWriter(p).write(t);
-      return ParquetReader(p).read();
+      await ParquetWriter(p).write(t).ok;
+      return ParquetReader(p).read().ok;
     }
 
     Table ints(List<int?> values, {required bool nullable}) => Table(
@@ -2953,12 +3435,12 @@ void main() {
 
   group('external read', () {
     // libbigdata reads Parquet written by external engines (pyarrow,
-    // Spark, parquet-mr) correctly — unsigned ints, BYTE_STREAM_SPLIT, legacy
+    // Spark, parquet-mr) correctly: unsigned ints, BYTE_STREAM_SPLIT, legacy
     // 2-level LIST, FLBA decimals, INT96 timestamps.
     Future<Table> read(String path, {bool tolerate = false}) => ParquetReader(
       path,
       options: ParquetReaderOptions(tolerateTruncatedPages: tolerate),
-    ).read();
+    ).read().ok;
 
     test(
       'unsigned ints read losslessly (uint8/16/32 widen; uint64 → BigInt)',
@@ -2986,7 +3468,7 @@ void main() {
       addTearDown(() => dir.deleteSync(recursive: true));
       final t = await read('test/fixtures/parquet/uint_pyarrow.parquet');
       final out = '${dir.path}/rt.parquet';
-      await ParquetWriter(out).write(t);
+      await ParquetWriter(out).write(t).ok;
       final back = await read(out);
       expect(
         back.toRows().first['u64'],
@@ -3036,8 +3518,10 @@ void main() {
       // The fixture mixes normal timestamps with a year-290000 value beyond Dart's
       // DateTime range: fail loud by default, coerce-to-null with tolerate.
       await expectLater(
-        read('test/fixtures/parquet-testing/data/int96_from_spark.parquet'),
-        throwsA(isA<FormatException>()),
+        ParquetReader(
+          'test/fixtures/parquet-testing/data/int96_from_spark.parquet',
+        ).read(),
+        failsWith(Kind.corrupt),
       );
       final t = await read(
         'test/fixtures/parquet-testing/data/int96_from_spark.parquet',
@@ -3086,7 +3570,7 @@ void main() {
     setUp(() => dir = Directory.systemTemp.createTempSync('shredguard_'));
     tearDown(() => dir.deleteSync(recursive: true));
 
-    Future<void> writeBad(Field bad, Column col) =>
+    Future<Result<void, ErrorDetails>> writeBad(Field bad, Column col) =>
         ParquetWriter('${dir.path}/x.parquet').write(
           Table(
             name: 't',
@@ -3095,7 +3579,7 @@ void main() {
           ),
         );
 
-    test('map without a key_value struct child throws ArgumentError', () async {
+    test('map without a key_value struct child is invalid', () async {
       // The common mistake: children = [key, value] directly (no wrapping struct).
       final bad = Field(
         name: 'm',
@@ -3114,7 +3598,7 @@ void main() {
         ],
         nullable: false,
       );
-      await expectLater(writeBad(bad, col), throwsA(isA<ArgumentError>()));
+      await expectLater(writeBad(bad, col), failsWith(Kind.invalid));
     });
   });
 
@@ -3124,28 +3608,19 @@ void main() {
     const csv = 'a,b\n1,2\n3,4\n5,6\n';
 
     test('CSV readString caps rows; null opts out', () async {
-      expect(
-        CsvReader().readString(csv, maxRows: 2),
-        throwsA(isA<StateError>()),
-      );
-      final t = await CsvReader().readString(csv, maxRows: null);
+      expect(CsvReader().readString(csv, maxRows: 2), failsWith(Kind.limit));
+      final t = await CsvReader().readString(csv, maxRows: null).ok;
       expect(t.rowCount, 3);
     });
 
     test('CSV readString caps bytes', () async {
-      expect(
-        CsvReader().readString(csv, maxBytes: 4),
-        throwsA(isA<StateError>()),
-      );
+      expect(CsvReader().readString(csv, maxBytes: 4), failsWith(Kind.limit));
     });
 
     test('JSON readString caps rows; null opts out', () async {
       const j = '[{"a":1},{"a":2},{"a":3}]';
-      expect(
-        JsonReader().readString(j, maxRows: 2),
-        throwsA(isA<StateError>()),
-      );
-      final df = await JsonReader().readString(j, maxRows: null);
+      expect(JsonReader().readString(j, maxRows: 2), failsWith(Kind.limit));
+      final df = await JsonReader().readString(j, maxRows: null).ok;
       expect(df.rowCount, 3);
     });
 
@@ -3157,7 +3632,7 @@ void main() {
 
       expect(
         JsonReader().readStream(body(), maxBytes: 4),
-        throwsA(isA<StateError>()),
+        failsWith(Kind.limit),
       );
     });
   });
@@ -3231,7 +3706,7 @@ void main() {
     group('W1 Parquet float stats ignore NaN but keep ±Infinity', () {
       test('a NaN in a non-first slot does not poison min/max', () async {
         final path = '${dir.path}/nan.parquet';
-        await ParquetWriter(path).write(floats([1.0, double.nan, 3.0, 2.0]));
+        await ParquetWriter(path).write(floats([1.0, double.nan, 3.0, 2.0])).ok;
         final s = await stats(path);
         final min = ByteData.sublistView(s.min!).getFloat64(0, Endian.little);
         final max = ByteData.sublistView(s.max!).getFloat64(0, Endian.little);
@@ -3244,7 +3719,9 @@ void main() {
         // the max, else a `f >= x` filter prunes this row group and the +Inf row
         // silently vanishes (and external readers trust the poisoned stat).
         final path = '${dir.path}/inf.parquet';
-        await ParquetWriter(path).write(floats([double.nan, double.infinity]));
+        await ParquetWriter(
+          path,
+        ).write(floats([double.nan, double.infinity])).ok;
         final s = await stats(path);
         final min = ByteData.sublistView(s.min!).getFloat64(0, Endian.little);
         final max = ByteData.sublistView(s.max!).getFloat64(0, Endian.little);
@@ -3256,7 +3733,7 @@ void main() {
         final path = '${dir.path}/neginf.parquet';
         await ParquetWriter(
           path,
-        ).write(floats([1.0, double.negativeInfinity, 2.0]));
+        ).write(floats([1.0, double.negativeInfinity, 2.0])).ok;
         final s = await stats(path);
         final min = ByteData.sublistView(s.min!).getFloat64(0, Endian.little);
         expect(min, double.negativeInfinity);
@@ -3264,7 +3741,7 @@ void main() {
 
       test('a genuinely all-NaN column emits no min/max', () async {
         final path = '${dir.path}/allnan.parquet';
-        await ParquetWriter(path).write(floats([double.nan, double.nan]));
+        await ParquetWriter(path).write(floats([double.nan, double.nan])).ok;
         final s = await stats(path);
         expect(s.min, isNull);
         expect(s.max, isNull);
@@ -3276,11 +3753,13 @@ void main() {
           // The functional consequence of the stats fix: reading with a predicate
           // above every finite value must still return the +Inf row.
           final path = '${dir.path}/prune.parquet';
-          await ParquetWriter(path).write(floats([1.0, 2.0, double.infinity]));
-          final engine = SqlEngine(allowExternalPaths: true);
-          final r = await engine.execute(
-            "SELECT f FROM '$path' WHERE f >= 1e308",
-          );
+          await ParquetWriter(
+            path,
+          ).write(floats([1.0, 2.0, double.infinity])).ok;
+          final engine = SqlEngine.open(allowExternalPaths: true).ok;
+          final r = await engine
+              .execute("SELECT f FROM '$path' WHERE f >= 1e308")
+              .ok;
           expect(r.toRows().map((e) => e['f']), [double.infinity]);
           await engine.dispose();
         },
@@ -3288,8 +3767,10 @@ void main() {
 
       test('the NaN value itself still round-trips', () async {
         final path = '${dir.path}/rt.parquet';
-        await ParquetWriter(path).write(floats([1.0, double.nan, 3.0]));
-        final back = (await ParquetReader(path).read()).column('f')!.toList();
+        await ParquetWriter(path).write(floats([1.0, double.nan, 3.0])).ok;
+        final back = (await ParquetReader(
+          path,
+        ).read().ok).column('f')!.toList();
         expect(back[0], 1.0);
         expect((back[1] as double).isNaN, isTrue);
         expect(back[2], 3.0);
@@ -3304,25 +3785,29 @@ void main() {
           Uint8List.fromList([255, 0, 128]),
           null,
         ];
-        await ParquetWriter(path).write(
-          Table(
-            name: 't',
-            columns: [
-              ListColumn<Uint8List>(
-                name: 'b',
-                dataType: DataType.binary,
-                data: values,
-                nullable: true,
+        await ParquetWriter(path)
+            .write(
+              Table(
+                name: 't',
+                columns: [
+                  ListColumn<Uint8List>(
+                    name: 'b',
+                    dataType: DataType.binary,
+                    data: values,
+                    nullable: true,
+                  ),
+                ],
+                schema: Schema(
+                  fields: [
+                    Field(name: 'b', dataType: DataType.binary, nullable: true),
+                  ],
+                ),
               ),
-            ],
-            schema: Schema(
-              fields: [
-                Field(name: 'b', dataType: DataType.binary, nullable: true),
-              ],
-            ),
-          ),
-        );
-        final back = (await ParquetReader(path).read()).column('b')!.toList();
+            )
+            .ok;
+        final back = (await ParquetReader(
+          path,
+        ).read().ok).column('b')!.toList();
         expect(back[0], equals([1, 2, 3]));
         expect(back[1], equals([255, 0, 128]));
         expect(back[2], isNull);
@@ -3350,10 +3835,12 @@ void main() {
     group('#1 streaming writers reject a widened batch (no truncation)', () {
       test('Parquet: int64 batch under a frozen int32 schema throws', () async {
         final w = ParquetWriter('${dir.path}/a.parquet');
-        await w.writeBatch(intTable('n', DataType.int32, [1])); // freezes int32
+        await w
+            .writeBatch(intTable('n', DataType.int32, [1]))
+            .ok; // freezes int32
         await expectLater(
           w.writeBatch(intTable('n', DataType.int64, [1 << 40])),
-          throwsArgumentError,
+          failsWith(Kind.schema),
         );
         await w.abort();
       });
@@ -3374,9 +3861,11 @@ void main() {
         () async {
           final path = '${dir.path}/b.parquet';
           final w = ParquetWriter(path);
-          await w.writeBatch(intTable('n', DataType.int64, [1, 1 << 40]));
-          await w.close();
-          final back = (await ParquetReader(path).read()).column('n')!.toList();
+          await w.writeBatch(intTable('n', DataType.int64, [1, 1 << 40])).ok;
+          await w.close().ok;
+          final back = (await ParquetReader(
+            path,
+          ).read().ok).column('n')!.toList();
           expect(back, [1, 1 << 40]); // was [1, 0] under the old widening bug
         },
       );
@@ -3387,20 +3876,22 @@ void main() {
         final path = '${dir.path}/x.parquet';
         Directory(path).createSync(); // rename onto a directory fails
         final w = ParquetWriter(path);
-        await w.writeBatch(
-          Table(
-            name: 't',
-            columns: [
-              NumericColumn.int64(name: 'n', values: [1], nullable: false),
-            ],
-            schema: Schema(
-              fields: [
-                Field(name: 'n', dataType: DataType.int64, nullable: false),
-              ],
-            ),
-          ),
-        );
-        await expectLater(w.close(), throwsA(anything));
+        await w
+            .writeBatch(
+              Table(
+                name: 't',
+                columns: [
+                  NumericColumn.int64(name: 'n', values: [1], nullable: false),
+                ],
+                schema: Schema(
+                  fields: [
+                    Field(name: 'n', dataType: DataType.int64, nullable: false),
+                  ],
+                ),
+              ),
+            )
+            .ok;
+        await expectLater(w.close(), failsWith(Kind.io));
         // No .tmp orphan survives (close() aborted itself).
         final orphans = Directory(
           dir.path,
@@ -3416,26 +3907,23 @@ void main() {
 
     test('an over-cap multi-sub-block frame surfaces the budget error', () {
       // Two 400-byte sub-blocks (each UNDER a 500-byte per-block cap) sum to 800
-      // > 500 — only the CUMULATIVE guard can catch it. Before the fix its
+      // > 500, only the CUMULATIVE guard can catch it. Before the fix its
       // FormatException was swallowed by the `on Object` fallback, which
       // re-inflated the bomb via the raw decoder (a different error); now the
       // typed exception surfaces the budget message.
-      final block = Lz4Codec().compressBlock(
-        Uint8List(400)..fillRange(0, 400, 65),
-      );
+      final block = Lz4Codec(
+        format: Lz4Format.raw,
+      ).compress(Uint8List(400)..fillRange(0, 400, 65));
       final frame = BytesBuilder()
         ..add(be32(800)) // outer uncompressed size
         ..add(be32(block.length))
         ..add(block)
         ..add(be32(block.length))
         ..add(block);
-      final codec = codecFor(
-        thrift.CompressionCodec.lz4,
-        maxDecompressedSize: 500,
-      );
+      final codec = codecFor(thrift.CompressionCodec.lz4, maxSize: 500);
       expect(
         () => codec.decompress(frame.takeBytes()),
-        throwsA(predicate((e) => e.toString().contains('maxDecompressedSize'))),
+        throwsA(isA<LimitException>()),
       );
     });
   });
@@ -3457,13 +3945,13 @@ void main() {
       final path = '${dir.path}/p.parquet';
       await ParquetWriter(
         path,
-      ).write(intTable('id', [for (var i = 0; i < 1000; i++) i]));
+      ).write(intTable('id', [for (var i = 0; i < 1000; i++) i])).ok;
       await expectLater(
         ParquetReader(
           path,
           options: const ParquetReaderOptions(maxPageBytes: 8),
         ).read(),
-        throwsA(isA<FormatException>()),
+        failsWith(Kind.corrupt),
       );
     });
   });
@@ -3500,8 +3988,10 @@ void main() {
           ],
         ),
       );
-      await ParquetWriter(path).write(t);
-      final batches = await ParquetReader(path).readBatches(size: 2).toList();
+      await ParquetWriter(path).write(t).ok;
+      final batches = await ParquetReader(
+        path,
+      ).readBatches(batchSize: 2).ok.toList();
       // 5 rows in windows of 2 → 3 batches (2, 2, 1), each carrying the list.
       expect(batches.length, greaterThan(1));
       for (final b in batches) {
@@ -3550,12 +4040,9 @@ void main() {
           ],
         ),
       );
-      await ParquetWriter(path).write(t);
-      expect(
-        () => ParquetReader(path).read(maxRows: 1),
-        throwsA(isA<StateError>()),
-      );
-      expect((await ParquetReader(path).read(maxRows: null)).rowCount, 3);
+      await ParquetWriter(path).write(t).ok;
+      expect(ParquetReader(path).read(maxRows: 1), failsWith(Kind.limit));
+      expect((await ParquetReader(path).read(maxRows: null).ok).rowCount, 3);
     });
   });
 
@@ -3594,6 +4081,334 @@ void main() {
 
   // a malformed Parquet encoding header must not be able to
   // drive an unbounded allocation (a decompression / run-length "size bomb").
+  group('DELTA_BINARY_PACKED rejects crafted headers', () {
+    // Header: block size, miniblocks per block, value count (ULEB128), then
+    // the first value (zigzag ULEB128).
+    Uint8List header(int block, int miniblocks, int count, [List<int>? rest]) =>
+        Uint8List.fromList([
+          ..._uleb(block),
+          ..._uleb(miniblocks),
+          ..._uleb(count),
+          0x00,
+          ...?rest,
+        ]);
+
+    for (final MapEntry(key: name, value: data) in {
+      // A 14-byte header that asked for a 1 TiB allocation.
+      'more miniblocks than bytes': header(1 << 40, 1 << 40, 3),
+      'block size not a multiple of 128': header(100, 4, 3),
+      'miniblock size not a multiple of 32': header(128, 8, 3),
+      'a bit width wider than the type': header(128, 4, 3, [
+        0x00, // min delta
+        65, 0, 0, 0, // widths
+        ...List.filled(1024, 0),
+      ]),
+    }.entries) {
+      test(name, () {
+        for (final decode in [
+          () => DeltaBinaryPackedDecoder.decodeInto(data, 3, Int64List(3), 0),
+          () => DeltaBinaryPackedDecoder.decode(data, 3),
+        ]) {
+          expect(decode, throwsFormatException);
+        }
+      });
+    }
+
+    test('a 32-bit column rejects a 33-bit width', () {
+      final data = header(128, 4, 3, [
+        0x00,
+        33,
+        0,
+        0,
+        0,
+        ...List.filled(1024, 0),
+      ]);
+      expect(
+        () => DeltaBinaryPackedDecoder.decodeInto(
+          data,
+          3,
+          Int64List(3),
+          0,
+          bits: 32,
+        ),
+        throwsFormatException,
+      );
+    });
+  });
+
+  group('DELTA_BINARY_PACKED decoded into a buffer', () {
+    int state = 7;
+    int next() => state = (state * 6364136223846793005 + 1442695040888963407);
+
+    final shapes = <String, List<int>>{
+      'sorted ids': [for (var i = 0; i < 5000; i++) 1000 + i],
+      'timestamps': [
+        for (var i = 0; i < 5000; i++) 1700000000000000 + i * 997 + i % 13,
+      ],
+      'small random': [for (var i = 0; i < 5000; i++) next() % 1000],
+      'wide random': [for (var i = 0; i < 5000; i++) next() >> 9],
+      'one value': [42],
+      'constant': List.filled(3000, -5),
+    };
+    for (final MapEntry(key: name, value: values) in shapes.entries) {
+      test('agrees with the list decoder on $name', () {
+        final data = DeltaBinaryPackedEncoder().encodeInts(values);
+        final expected = DeltaBinaryPackedDecoder.decode(data, values.length);
+        final into = Int64List(values.length + 3);
+        final written = DeltaBinaryPackedDecoder.decodeInto(
+          data,
+          values.length,
+          into,
+          3,
+        );
+        expect(written, values.length);
+        expect(into.sublist(3), expected);
+        expect(expected, values);
+      });
+    }
+
+    test('stops at the count and still checks the rest', () {
+      final values = [for (var i = 0; i < 1000; i++) i * 3];
+      final data = DeltaBinaryPackedEncoder().encodeInts(values);
+      final into = Int64List(10);
+      expect(DeltaBinaryPackedDecoder.decodeInto(data, 10, into, 0), 10);
+      expect(into, values.take(10));
+    });
+
+    test('int32 columns wrap in 32 bits', () {
+      final values = [2147483647, -2147483648, 0, 2147483647, -1];
+      final data = DeltaBinaryPackedEncoder(
+        thrift.ParquetType.int32,
+      ).encodeInts(values);
+      final into = Int64List(values.length);
+      DeltaBinaryPackedDecoder.decodeInto(
+        data,
+        values.length,
+        into,
+        0,
+        bits: 32,
+      );
+      expect(into, values);
+    });
+
+    test('a truncated stream throws', () {
+      final values = [for (var i = 0; i < 1000; i++) next() >> 20];
+      final data = DeltaBinaryPackedEncoder().encodeInts(values);
+      expect(
+        () => DeltaBinaryPackedDecoder.decodeInto(
+          Uint8List.sublistView(data, 0, data.length ~/ 2),
+          values.length,
+          Int64List(values.length),
+          0,
+        ),
+        throwsA(isA<FormatException>()),
+      );
+    });
+  });
+
+  group('dictionary indices decoded into a buffer', () {
+    List<int> indices(int count, int max, int seed) {
+      var state = seed;
+      int next() => state = (state * 1103515245 + 12345) & 0x7fffffff;
+      final out = <int>[];
+      while (out.length < count) {
+        final value = next() % (max + 1);
+        final run = next() % 3 == 0 ? next() % 100 : 1;
+        for (var i = 0; i < run && out.length < count; i++) {
+          out.add(run == 1 ? next() % (max + 1) : value);
+        }
+      }
+      return out;
+    }
+
+    for (final width in [1, 2, 7, 8, 9, 13, 17, 24, 31]) {
+      test('agrees with the list decoder at width $width', () {
+        for (final count in [1, 8, 9, 1000, 4099]) {
+          final expected = indices(count, (1 << width) - 1, count + width);
+          final data = RleBitpackedHybrid.encode(expected, width);
+          final into = Int32List(count);
+          final decoded = RleBitpackedHybrid.decodeInto(
+            data,
+            width,
+            count,
+            into,
+          );
+          expect(decoded, count);
+          expect(into, expected, reason: 'count $count');
+        }
+      });
+    }
+
+    test('a final run is cut at the count', () {
+      final data = Uint8List.fromList([..._uleb((1 << 27) << 1), 0x02]);
+      final into = Int32List(3);
+      expect(RleBitpackedHybrid.decodeInto(data, 2, 3, into), 3);
+      expect(into, [2, 2, 2]);
+    });
+
+    test('a truncated bit-packed run throws', () {
+      final data = Uint8List.fromList([0x03, 0xFF]);
+      expect(
+        () => RleBitpackedHybrid.decodeInto(data, 9, 8, Int32List(8)),
+        throwsA(isA<FormatException>()),
+      );
+    });
+
+    test(
+      'dictionary-encoded int64, double and int32 columns read back',
+      () async {
+        // Written by DuckDB (our writer does not dictionary-encode): 9000 rows,
+        // row groups of 4096, each column also repeated with every fifth null.
+        final table = await ParquetReader(
+          'test/fixtures/dictionary_numeric.parquet',
+        ).read().ok;
+        final rows = [for (var i = 0; i < 9000; i++) i];
+        final longs = [for (final i in rows) (i % 13) * 1000003];
+        final doubles = [for (final i in rows) (i % 11) * 0.25];
+        final ints = [for (final i in rows) (i % 17) - 8];
+        List<Object?> holes(List<Object> values) => [
+          for (final i in rows) i % 5 == 0 ? null : values[i],
+        ];
+        expect(table.column('l')!.toList(), longs);
+        expect(table.column('d')!.toList(), doubles);
+        expect(table.column('n')!.toList(), ints);
+        expect(table.column('lh')!.toList(), holes(longs));
+        expect(table.column('dh')!.toList(), holes(doubles));
+        expect(table.column('nh')!.toList(), holes(ints));
+      },
+    );
+  });
+
+  group('definition levels decoded into a buffer', () {
+    // Levels as a writer would produce them: long runs (encoded as RLE) mixed
+    // with noise (encoded bit-packed).
+    List<int> levels(int count, int max, int seed) {
+      var state = seed;
+      int next() => state = (state * 1103515245 + 12345) & 0x7fffffff;
+      final out = <int>[];
+      while (out.length < count) {
+        final value = next() % (max + 1);
+        final run = next() % 3 == 0 ? next() % 200 : 1;
+        for (var i = 0; i < run && out.length < count; i++) {
+          out.add(run == 1 ? next() % (max + 1) : value);
+        }
+      }
+      return out;
+    }
+
+    for (final max in [1, 2, 3, 7]) {
+      test('agrees with the list decoder at max level $max', () {
+        final width = levelBitWidth(max);
+        for (final count in [1, 7, 8, 9, 1000, 4099]) {
+          final expected = levels(count, max, count * 31 + max);
+          final data = RleBitpackedHybrid.encode(expected, width);
+          final into = Uint8List(count);
+          final (:decoded, :present) = RleBitpackedHybrid.decodeLevels(
+            data,
+            width,
+            count,
+            into,
+            max,
+          );
+          expect(decoded, count);
+          expect(into, expected, reason: 'count $count');
+          expect(present, expected.where((level) => level == max).length);
+        }
+      });
+    }
+
+    test('stops at the count inside a padded bit-packed block', () {
+      // 256 one-bit levels of 1 in one bit-packed run; only 16 are wanted.
+      final data = Uint8List.fromList([0x41, ...List.filled(32, 0xFF)]);
+      final into = Uint8List(16);
+      final (:decoded, :present) = RleBitpackedHybrid.decodeLevels(
+        data,
+        1,
+        16,
+        into,
+        1,
+      );
+      expect(decoded, 16);
+      expect(present, 16);
+    });
+
+    test('an RLE run past the count bound throws', () {
+      final data = Uint8List.fromList([..._uleb(5000 << 1), 0x01]);
+      expect(
+        () => RleBitpackedHybrid.decodeLevels(data, 1, 10, Uint8List(10), 1),
+        throwsA(isA<FormatException>()),
+      );
+    });
+
+    test('a truncated bit-packed run throws', () {
+      // Claims 8 values at width 3 (3 bytes) but carries one.
+      final data = Uint8List.fromList([0x03, 0xFF]);
+      expect(
+        () => RleBitpackedHybrid.decodeLevels(data, 3, 8, Uint8List(8), 7),
+        throwsA(isA<FormatException>()),
+      );
+    });
+
+    test('short data reports how many levels it held', () {
+      final data = Uint8List.fromList([..._uleb(3 << 1), 0x01]);
+      final (:decoded, :present) = RleBitpackedHybrid.decodeLevels(
+        data,
+        1,
+        10,
+        Uint8List(10),
+        1,
+      );
+      expect(decoded, 3);
+      expect(present, 3);
+    });
+
+    test(
+      'an optional column with and without nulls reads back exactly',
+      () async {
+        final dir = Directory.systemTemp.createTempSync('levels_');
+        addTearDown(() => dir.deleteSync(recursive: true));
+        Future<List<Object?>> roundTrip(List<double?> values) async {
+          final path = '${dir.path}/${values.length}-${values.first}.parquet';
+          // Streamed batches keep the leaf optional even with no nulls.
+          final schema = Schema(
+            fields: [Field(name: 'x', dataType: DataType.float64)],
+          );
+          final writer = ParquetWriter(
+            path,
+            options: const ParquetWriterOptions(rowGroupSize: 3000),
+          );
+          await writer.open(schema).ok;
+          await writer
+              .writeBatch(
+                Table(
+                  name: 't',
+                  schema: schema,
+                  columns: [
+                    ListColumn<double>(
+                      name: 'x',
+                      dataType: DataType.float64,
+                      data: values,
+                      nullable: true,
+                    ),
+                  ],
+                ),
+              )
+              .ok;
+          await writer.close().ok;
+          final table = await ParquetReader(path).read().ok;
+          return table.column('x')!.toList();
+        }
+
+        final full = [for (var i = 0; i < 10000; i++) i * 0.5];
+        expect(await roundTrip(full), full);
+        final holes = [
+          for (var i = 0; i < 10000; i++) i % 7 == 0 ? null : i * 1.5,
+        ];
+        expect(await roundTrip(holes), holes);
+      },
+    );
+  });
+
   group('Parquet decoder allocation guards', () {
     test('RLE run length past maxValues throws (not a giant alloc)', () {
       // bitWidth 0, one RLE run claiming 2000 zeros; cap (maxValues 10 + slack)
@@ -3627,9 +4442,41 @@ void main() {
       expect(decoded.every((v) => v == 1), isTrue);
     });
 
+    // A data page's index stream may legally overrun its value count, so the
+    // decoder must stop at the count rather than expand the whole run.
+    test('dictionary indices stop at the requested count', () {
+      // bit width 1, then one RLE run of 2^27 copies of index 0: 7 bytes.
+      final data = Uint8List.fromList([1, ..._uleb((1 << 27) << 1), 0x00]);
+      final decoder = DictionaryDecoder(thrift.ParquetType.int32);
+      final watch = Stopwatch()..start();
+      expect(decoder.decodeIndices(data, 1), [0]);
+      expect(watch.elapsed, lessThan(const Duration(milliseconds: 100)));
+    });
+
+    test('an overrunning final run is cut at the count', () {
+      final data = Uint8List.fromList([1, ..._uleb(10 << 1), 0x01]);
+      final decoder = DictionaryDecoder(thrift.ParquetType.int32);
+      expect(decoder.decodeIndices(data, 3), [1, 1, 1]);
+    });
+
+    test('a bit-packed run is cut at the limit', () {
+      // 8 one-bit values 0b10110101, limit 5.
+      final data = Uint8List.fromList([0x03, 0xB5]);
+      expect(RleBitpackedHybrid.decode(data, 1, limit: 5), [1, 0, 1, 0, 1]);
+    });
+
+    test('boolean RLE stops at the requested count', () {
+      // 4-byte length prefix, then one RLE run of 2^27 trues.
+      final run = [..._uleb((1 << 27) << 1), 0x01];
+      final data = Uint8List.fromList([run.length, 0, 0, 0, ...run]);
+      final watch = Stopwatch()..start();
+      expect(RleDecoder().decode(data, 2), [true, true]);
+      expect(watch.elapsed, lessThan(const Duration(milliseconds: 100)));
+    });
+
     test('an RLE run (bit width >= 1) past maxValues still throws', () {
       // The RLE branch materializes runLength copies from a tiny header with no
-      // further reads — a real size bomb — so it keeps the tight cap.
+      // further reads (a real size bomb) so it keeps the tight cap.
       final data = Uint8List.fromList([..._uleb(5000 << 1), 0x01]);
       expect(
         () => RleBitpackedHybrid.decode(data, 1, maxValues: 10),
@@ -3652,7 +4499,7 @@ void main() {
 
     test('a page over-claiming present values throws FormatException', () {
       // def-levels declare two present values (level == maxDef) but only one was
-      // decoded — a corrupt page, not a RangeError.
+      // decoded: a corrupt page, not a RangeError.
       final decoder = PageDecoder(
         type: thrift.ParquetType.int32,
         maxDefinitionLevel: 1,
@@ -3686,6 +4533,86 @@ void main() {
       );
     });
 
+    group('V2 page header validation', () {
+      final decoder = PageDecoder(
+        type: thrift.ParquetType.int32,
+        maxDefinitionLevel: 1,
+      );
+      // Two values; def levels [1, 0] as one bit-packed group, then one int32.
+      final data = Uint8List.fromList([0x03, 0x01, 7, 0, 0, 0]);
+      thrift.PageHeader header({int nulls = 1, int rep = 0, int def = 2}) =>
+          thrift.PageHeader()
+            ..type = thrift.PageType.dataPageV2
+            ..uncompressedPageSize = data.length
+            ..compressedPageSize = data.length
+            ..dataPageHeaderV2 = (thrift.DataPageHeaderV2()
+              ..numValues = 2
+              ..numNulls = nulls
+              ..numRows = 2
+              ..encoding = thrift.Encoding.plain
+              ..repetitionLevelsByteLength = rep
+              ..definitionLevelsByteLength = def);
+
+      test('a negative null count throws FormatException', () {
+        expect(
+          () => decoder.parseBody(header(nulls: -0x7fffffff), data),
+          throwsA(isA<FormatException>()),
+        );
+      });
+
+      test('a null count above the value count throws FormatException', () {
+        expect(
+          () => decoder.parseBody(header(nulls: 3), data),
+          throwsA(isA<FormatException>()),
+        );
+      });
+
+      test('a negative level length throws FormatException', () {
+        expect(
+          () => decoder.parseBody(header(rep: -1), data),
+          throwsA(isA<FormatException>()),
+        );
+        expect(
+          () => decoder.parseBody(header(def: -1), data),
+          throwsA(isA<FormatException>()),
+        );
+      });
+
+      test('the present count comes from the definition levels', () {
+        // The header claims no nulls; the levels show one.
+        expect(decoder.parseBody(header(nulls: 0), data).present, 1);
+      });
+
+      test('nulls without definition levels throw FormatException', () {
+        // Nothing says which values are null, so the typed paths would read
+        // the missing slots as zeros.
+        expect(
+          () => decoder.parseBody(header(nulls: 1, def: 0), data),
+          throwsA(isA<FormatException>()),
+        );
+      });
+    });
+
+    test('a V1 page too short for its level length throws FormatException', () {
+      final decoder = PageDecoder(
+        type: thrift.ParquetType.int32,
+        maxDefinitionLevel: 1,
+      );
+      final header = thrift.PageHeader()
+        ..type = thrift.PageType.dataPage
+        ..uncompressedPageSize = 2
+        ..compressedPageSize = 2
+        ..dataPageHeader = (thrift.DataPageHeader()
+          ..numValues = 1
+          ..encoding = thrift.Encoding.plain
+          ..definitionLevelEncoding = thrift.Encoding.rle
+          ..repetitionLevelEncoding = thrift.Encoding.rle);
+      expect(
+        () => decoder.parseBody(header, Uint8List(2)),
+        throwsA(isA<FormatException>()),
+      );
+    });
+
     test(
       'DELTA_BINARY_PACKED with zero miniblocks throws (no div-by-zero)',
       () {
@@ -3715,6 +4642,136 @@ void main() {
         () => DeltaBinaryPackedDecoder.decode(data, 8),
         throwsA(isA<FormatException>()),
       );
+    });
+
+    test('DELTA_BINARY_PACKED stops at the requested count', () {
+      // 12 bytes: one width-0 miniblock claiming 2^27 values, which reads no
+      // further input and so must not be expanded past the requested count.
+      final data = Uint8List.fromList([
+        ..._uleb(1 << 27), // block size
+        ..._uleb(1), // miniblocks per block
+        ..._uleb(1 << 27), // total values
+        ..._uleb(0), // first value (zigzag)
+        ..._uleb(2), // min delta 1 (zigzag)
+        0, // bit width
+      ]);
+      final reader = ByteReader(data);
+      final watch = Stopwatch()..start();
+      expect(DeltaBinaryPackedDecoder.decodeFrom(reader, 3), [0, 1, 2]);
+      expect(watch.elapsed, lessThan(const Duration(milliseconds: 100)));
+      expect(reader.position, data.length);
+    });
+
+    test('DELTA_BINARY_PACKED skips unread miniblocks to the stream end', () {
+      // One 32-value miniblock of width 1 (four bytes), then a sentinel.
+      final data = Uint8List.fromList([
+        ..._uleb(128), // block size
+        ..._uleb(4), // miniblocks per block
+        ..._uleb(33), // total values
+        ..._uleb(0), // first value
+        ..._uleb(0), // min delta 0
+        1, 1, 1, 1, // bit widths
+        0xFF, 0xFF, 0xFF, 0xFF, // every delta is 1
+        0xAB, // sentinel after the stream
+      ]);
+      final reader = ByteReader(data);
+      expect(DeltaBinaryPackedDecoder.decodeFrom(reader, 2), [0, 1]);
+      expect(reader.readByte(), 0xAB);
+    });
+  });
+
+  group('the writer never writes a corrupt file', () {
+    late Directory dir;
+    setUp(() => dir = Directory.systemTemp.createTempSync('pq_corrupt_'));
+    tearDown(() => dir.deleteSync(recursive: true));
+
+    test('a top-level column named like a nested leaf', () async {
+      final path = '${dir.path}/collide.parquet';
+      final schema = Schema(
+        fields: [
+          Field(name: 'id', dataType: DataType.int64, nullable: false),
+          Field(
+            name: 's',
+            dataType: DataType.struct,
+            children: [Field(name: 'id', dataType: DataType.int64)],
+          ),
+        ],
+      );
+      final table = Table(
+        name: 't',
+        schema: schema,
+        columns: [
+          NumericColumn.int64(name: 'id', values: [1, 2, 3], nullable: false),
+          ListColumn<Map<String, dynamic>?>(
+            name: 's',
+            dataType: DataType.struct,
+            data: [
+              {'id': 10},
+              {'id': null},
+              null,
+            ],
+          ),
+        ],
+      );
+      await ParquetWriter(path).write(table).ok;
+      final back = await ParquetReader(path).read().ok;
+      expect(back.toRows(), [
+        {
+          'id': 1,
+          's': {'id': 10},
+        },
+        {
+          'id': 2,
+          's': {'id': null},
+        },
+        {'id': 3, 's': null},
+      ]);
+    });
+
+    test('a null in a required column is refused', () async {
+      final schema = Schema(
+        fields: [Field(name: 'a', dataType: DataType.int64, nullable: false)],
+      );
+      final writer = ParquetWriter('${dir.path}/required.parquet');
+      await writer.open(schema).ok;
+      // Batches are buffered, so the refusal comes from the batch or the
+      // flush at close; either way nothing is written.
+      final batch = await writer.writeBatch(
+        Table(
+          name: 't',
+          schema: Schema(
+            fields: [Field(name: 'a', dataType: DataType.int64)],
+          ),
+          columns: [
+            NumericColumn.int64(name: 'a', values: [1, null, 3]),
+          ],
+        ),
+      );
+      await expectLater(
+        Future.value(batch is Err ? batch : await writer.close()),
+        failsWith(Kind.invalid, contains('required')),
+      );
+      expect(File('${dir.path}/required.parquet').existsSync(), isFalse);
+    });
+
+    test('large values are split into bounded pages', () async {
+      // 6 MiB of text: one page before, which a reader capped at 2 MiB per
+      // page refused.
+      final path = '${dir.path}/big.parquet';
+      final value = 'x' * 2048;
+      await ParquetWriter(path)
+          .write(
+            Table.fromRows('t', [
+              for (var i = 0; i < 3000; i++) {'s': '$value$i'},
+            ]),
+          )
+          .ok;
+      final back = await ParquetReader(
+        path,
+        options: const ParquetReaderOptions(maxPageBytes: 2 << 20),
+      ).read().ok;
+      expect(back.rowCount, 3000);
+      expect(back.column('s')![2999], '${value}2999');
     });
   });
 
@@ -3750,7 +4807,7 @@ void main() {
 
     test('no .tmp left after a successful write', () async {
       final path = parquetPath();
-      await ParquetWriter(path).write(sample());
+      await ParquetWriter(path).write(sample()).ok;
       expect(File(path).existsSync(), isTrue);
       expect(File('$path.tmp').existsSync(), isFalse);
     });
@@ -3768,7 +4825,7 @@ void main() {
           batches(),
           options: const ParquetWriterOptions(rowGroupSize: 10),
         ),
-        throwsA(isA<StateError>()),
+        failsWith(Kind.invalid),
       );
       expect(File(path).existsSync(), isFalse);
       expect(File('$path.tmp').existsSync(), isFalse);
@@ -3803,7 +4860,7 @@ void main() {
         );
         await expectLater(
           ParquetWriter(path).writeBatches(Stream.fromIterable([a, b])),
-          throwsA(isA<ArgumentError>()),
+          failsWith(Kind.schema),
         );
         final orphans = await dir
             .list()
@@ -3837,9 +4894,9 @@ void main() {
             rowGroupSize: 500,
           ), // 10 row groups
         );
-        await writer.writeBatch(table);
-        await writer.close();
-        final back = await ParquetReader(path).read();
+        await writer.writeBatch(table).ok;
+        await writer.close().ok;
+        final back = await ParquetReader(path).read().ok;
         expect(back.rowCount, n);
         expect(back.column('v')!.toList(), [for (var i = 0; i < n; i++) i]);
       },
@@ -3885,7 +4942,7 @@ void main() {
           );
           await expectLater(
             ParquetWriter(dest).write(table),
-            throwsA(isA<Object>()),
+            failsWith(Kind.io),
           );
           final orphans = await dir
               .list()
@@ -3927,10 +4984,71 @@ void main() {
 
     test('Parquet projection of an unknown column throws', () async {
       final path = '${dir.path}/data.parquet';
-      await ParquetWriter(path).write(sample());
+      await ParquetWriter(path).write(sample()).ok;
       expect(
         DataFrameIO.readParquet(path, columns: ['id', 'ghost']),
-        throwsA(isA<ArgumentError>()),
+        failsWith(Kind.invalid),
+      );
+    });
+  });
+
+  // DELTA_BYTE_ARRAY reuses each value's prefix, so a small page can claim far
+  // more output than it holds. Lengths are checked before allocating and the
+  // total decoded size is bounded.
+  group('DELTA_BYTE_ARRAY rejects hostile lengths', () {
+    Uint8List page(List<int> prefixes, List<int> suffixes, [int body = 0]) {
+      final encoder = DeltaBinaryPackedEncoder();
+      return Uint8List.fromList([
+        ...encoder.encodeInts(prefixes),
+        ...encoder.encodeInts(suffixes),
+        ...List.filled(body, 0x61),
+      ]);
+    }
+
+    test('a negative suffix length throws FormatException', () {
+      expect(
+        () => DeltaByteArrayDecoder.decode(page([0], [-1]), 1),
+        throwsA(isA<FormatException>()),
+      );
+    });
+
+    test('a negative prefix length throws FormatException', () {
+      expect(
+        () => DeltaByteArrayDecoder.decode(page([0, -1], [1, 0], 1), 2),
+        throwsA(isA<FormatException>()),
+      );
+    });
+
+    test('a suffix past the page end throws FormatException', () {
+      expect(
+        () => DeltaByteArrayDecoder.decode(page([0], [10], 3), 1),
+        throwsA(isA<FormatException>()),
+      );
+    });
+
+    test('prefix reuse past the output limit throws FormatException', () {
+      // One 100-byte value, then 19 copies of it via prefix reuse: 2000 bytes
+      // of output from about 120 bytes of input.
+      final data = page(
+        [0, for (var i = 1; i < 20; i++) 100],
+        [100, for (var i = 1; i < 20; i++) 0],
+        100,
+      );
+      expect(DeltaByteArrayDecoder.decode(data, 20), hasLength(20));
+      expect(
+        () => DeltaByteArrayDecoder.decode(data, 20, limit: 1000),
+        throwsA(isA<FormatException>()),
+      );
+    });
+
+    test('a length-array value past the page end throws FormatException', () {
+      final data = Uint8List.fromList([
+        ...DeltaBinaryPackedEncoder().encodeInts([10]),
+        0x61,
+      ]);
+      expect(
+        () => DeltaLengthByteArrayDecoder.decode(data, 1),
+        throwsA(isA<FormatException>()),
       );
     });
   });
@@ -3970,7 +5088,7 @@ void main() {
     test(
       'a tolerant decoder also refuses it (it is corruption, not truncation)',
       () {
-        // `tolerant` exists for legacy pages that end EARLY — a negative length is
+        // `tolerant` exists for legacy pages that end EARLY: a negative length is
         // malformed either way and must not be silently swallowed.
         expect(
           () => PlainDecoder(
@@ -4010,6 +5128,480 @@ void main() {
         () => decoder.decodeIndices(Uint8List.fromList([64, 0, 0]), 1),
         throwsA(isA<FormatException>()),
       );
+    });
+  });
+
+  group('schema layout built once per file', () {
+    thrift.SchemaElement element(
+      String name, {
+      thrift.ParquetType? type,
+      thrift.FieldRepetitionType repetition =
+          thrift.FieldRepetitionType.optional,
+      int? children,
+    }) => thrift.SchemaElement()
+      ..name = name
+      ..type = type
+      ..repetitionType = repetition
+      ..numChildren = children;
+
+    // root { a; s { b; l* }; c* { e } }
+    final schema = [
+      element('root', children: 3),
+      element('a', type: thrift.ParquetType.int32),
+      element('s', children: 2),
+      element(
+        'b',
+        type: thrift.ParquetType.int64,
+        repetition: thrift.FieldRepetitionType.required,
+      ),
+      element(
+        'l',
+        type: thrift.ParquetType.int32,
+        repetition: thrift.FieldRepetitionType.repeated,
+      ),
+      element(
+        'c',
+        repetition: thrift.FieldRepetitionType.repeated,
+        children: 1,
+      ),
+      element('e', type: thrift.ParquetType.double),
+    ];
+
+    test('levels match the per-column calculation', () {
+      final layout = SchemaLayout(schema);
+      for (final index in [1, 3, 4, 6]) {
+        final expected = SchemaLevels.calculateLevels(schema, index);
+        final levels = layout.levels(index);
+        expect(levels.maxDefinition, expected.maxDefinition, reason: '$index');
+        expect(levels.maxRepetition, expected.maxRepetition, reason: '$index');
+      }
+      expect(layout.levels(6).maxDefinition, 2);
+      expect(layout.levels(6).maxRepetition, 1);
+    });
+
+    test('paths match the leaf paths', () {
+      expect(SchemaLayout(schema).paths, SchemaLevels.leafPaths(schema));
+      expect(SchemaLayout(schema).paths, ['a', 's.b', 's.l', 'c.e']);
+    });
+  });
+
+  group('streamed batches match an eager read', () {
+    // streaming_v2.parquet: DuckDB, PARQUET_VERSION V2, three row groups of
+    // up to 2048 rows. id, n (every seventh null) and ts are
+    // DELTA_BINARY_PACKED; s (every fifth null) and k are dictionary; d is
+    // PLAIN. strings_v2.parquet: DuckDB, V2, DELTA_LENGTH_BYTE_ARRAY text.
+    // strings_pages.parquet: pyarrow, one row group of 3000 rows cut into
+    // pages of about 64 rows: PLAIN text (p), dictionary text (d) and int64
+    // (v), all with nulls. A batch size of 61 crosses page and row group
+    // boundaries.
+    for (final name in [
+      'streaming_v2.parquet',
+      'strings_v2.parquet',
+      'strings_pages.parquet',
+      'dictionary_numeric.parquet',
+      'byte_stream_split_nulls.parquet',
+      'booleans_pages.parquet',
+      'iris.parquet',
+    ]) {
+      test(name, () async {
+        final path = 'test/fixtures/$name';
+        final whole = await ParquetReader(path).read().ok;
+        final batches = await ParquetReader(
+          path,
+        ).readBatches(batchSize: 61).ok.toList();
+        expect(batches.length, greaterThan(1));
+        for (final column in whole.columns) {
+          final parts = [for (final b in batches) b.column(column.name)!];
+          expect(
+            [for (final part in parts) ...part.toList()],
+            column.toList(),
+            reason: column.name,
+          );
+          for (final part in parts) {
+            expect(part.dataType, column.dataType, reason: column.name);
+            expect(part.runtimeType, column.runtimeType, reason: column.name);
+          }
+        }
+      });
+    }
+  });
+
+  group('byte stream split', () {
+    // byte_stream_split_nulls.parquet: pyarrow, 3000 rows in pages of 512
+    // bytes, every eleventh row null, all four columns BYTE_STREAM_SPLIT.
+    test('reads typed columns with nulls across pages', () async {
+      final table = await ParquetReader(
+        'test/fixtures/byte_stream_split_nulls.parquet',
+      ).read().ok;
+      List<num?> expected(num Function(int) value) => [
+        for (var i = 0; i < 3000; i++) i % 11 == 0 ? null : value(i),
+      ];
+      final columns = {
+        'f32': expected((i) => i * 0.5),
+        'f64': expected((i) => i * 1.25 - 7),
+        'i32': expected((i) => i * 7 - 9000),
+        'i64': expected((i) => i * 1000003 - 5),
+      };
+      for (final MapEntry(:key, :value) in columns.entries) {
+        final column = table.column(key)!;
+        expect(column, isA<NumericColumn>(), reason: key);
+        expect(column.toList(), value, reason: key);
+      }
+    });
+
+    test('matches the PLAIN twin of each column', () async {
+      final table = await ParquetReader(
+        'test/fixtures/parquet-testing/data/'
+        'byte_stream_split_extended.gzip.parquet',
+      ).read().ok;
+      for (final name in ['float', 'double', 'int32', 'int64']) {
+        expect(
+          table.column('${name}_byte_stream_split')!.toList(),
+          table.column('${name}_plain')!.toList(),
+          reason: name,
+        );
+      }
+    });
+
+    test('a short stream is a FormatException', () {
+      expect(
+        () => ByteStreamSplitDecoder(
+          thrift.ParquetType.double,
+        ).decodeInto(Uint8List(15), 2, Float64List(2), 0),
+        throwsFormatException,
+      );
+    });
+  });
+
+  group('booleans read as BoolColumn', () {
+    // booleans_pages.parquet: pyarrow, V2 pages of 50 values, 3000 rows: b is
+    // RLE with every thirteenth row null, r is PLAIN with no nulls.
+    test('RLE and PLAIN pages, with nulls', () async {
+      final table = await ParquetReader(
+        'test/fixtures/booleans_pages.parquet',
+      ).read().ok;
+      expect(table.column('b'), isA<BoolColumn>());
+      expect(table.column('b')!.toList(), [
+        for (var i = 0; i < 3000; i++) i % 13 == 0 ? null : i % 3 == 0,
+      ]);
+      expect(table.column('r'), isA<BoolColumn>());
+      expect(table.column('r')!.toList(), [
+        for (var i = 0; i < 3000; i++) i % 5 != 0,
+      ]);
+    });
+
+    test('V1 PLAIN pages written by this library', () async {
+      final dir = Directory.systemTemp.createTempSync('booleans_');
+      addTearDown(() => dir.deleteSync(recursive: true));
+      final values = [
+        for (var i = 0; i < 1000; i++) i % 7 == 0 ? null : i.isEven,
+      ];
+      final path = '${dir.path}/b.parquet';
+      await ParquetWriter(path)
+          .write(
+            Table(
+              name: 't',
+              columns: [BoolColumn(name: 'flag', values: values)],
+              schema: Schema(
+                fields: [Field(name: 'flag', dataType: DataType.boolean)],
+              ),
+            ),
+          )
+          .ok;
+      final column = (await ParquetReader(path).read().ok).column('flag')!;
+      expect(column, isA<BoolColumn>());
+      expect(column.toList(), values);
+    });
+
+    test('a short page is a FormatException', () {
+      final decoder = PageDecoder(type: thrift.ParquetType.boolean);
+      expect(
+        () => decoder.decodeValuesTyped(
+          Uint8List(1),
+          9,
+          thrift.Encoding.plain,
+          Uint8List(9),
+          0,
+        ),
+        throwsFormatException,
+      );
+      expect(
+        () => decoder.decodeValuesTyped(
+          Uint8List.fromList([9, 0, 0, 0, 0]),
+          4,
+          thrift.Encoding.rle,
+          Uint8List(4),
+          0,
+        ),
+        throwsFormatException,
+      );
+    });
+  });
+
+  group('string columns read as StringColumn', () {
+    late Directory dir;
+    setUp(() => dir = Directory.systemTemp.createTempSync('strings_'));
+    tearDown(() => dir.deleteSync(recursive: true));
+
+    // fixed_utf8.parquet: pyarrow fixed_size_binary(3), every seventh row
+    // null, with a UTF8 annotation added to the footer afterwards. DuckDB
+    // reads it as VARCHAR.
+    test('DuckDB JSON columns read as text', () async {
+      final table = await ParquetReader(
+        'test/fixtures/duckdb_json.parquet',
+      ).read().ok;
+      expect(table.schema.field('j')!.dataType, DataType.string);
+      expect(table.column('j')!.toList(), ['{"a":0}', '{"a":1}', '{"a":2}']);
+      expect(table.column('id')!.toList(), [0, 1, 2]);
+    });
+
+    test(
+      'DuckDB INTERVAL columns read (INTERVAL is converted type 21)',
+      () async {
+        // The footer failed with "Invalid ConvertedType value: 21".
+        final table = await ParquetReader(
+          'test/fixtures/duckdb_interval.parquet',
+        ).read().ok;
+        expect(table.column('id')!.toList(), [0, 1, 2]);
+        expect(table.schema.field('d')!.dataType, DataType.binary);
+      },
+    );
+
+    test('converted types follow the spec numbering', () {
+      expect(
+        {
+          for (final type in [
+            thrift.ConvertedType.int32,
+            thrift.ConvertedType.int64,
+            thrift.ConvertedType.json,
+            thrift.ConvertedType.bson,
+            thrift.ConvertedType.interval,
+          ])
+            type.name: type.value,
+        },
+        {'int32': 17, 'int64': 18, 'json': 19, 'bson': 20, 'interval': 21},
+      );
+    });
+
+    test('FIXED_LEN_BYTE_ARRAY with a UTF8 annotation', () async {
+      final table = await ParquetReader(
+        'test/fixtures/fixed_utf8.parquet',
+      ).read().ok;
+      final column = table.column('code')!;
+      expect(column, isA<StringColumn>());
+      expect(column.toList(), [
+        for (var i = 0; i < 40; i++)
+          i % 7 == 0 ? null : const ['abc', 'xyz', '\u00e9t', 'q12'][i % 4],
+      ]);
+      final batches = await ParquetReader(
+        'test/fixtures/fixed_utf8.parquet',
+      ).readBatches(batchSize: 9).ok.toList();
+      expect(batches, hasLength(5));
+      expect([
+        for (final b in batches) ...b.column('code')!.toList(),
+      ], column.toList());
+    });
+
+    test('dictionary encoded, with nulls', () async {
+      final table = await ParquetReader(
+        'test/fixtures/streaming_v2.parquet',
+      ).read().ok;
+      final column = table.column('s')!;
+      expect(column, isA<StringColumn>());
+      expect(column.toList(), [
+        for (var i = 0; i < 6000; i++) i % 5 == 0 ? null : 's${i % 97}',
+      ]);
+    });
+
+    test('DELTA_LENGTH_BYTE_ARRAY, with nulls and non-ASCII text', () async {
+      final table = await ParquetReader(
+        'test/fixtures/strings_v2.parquet',
+      ).read().ok;
+      final column = table.column('s')!;
+      expect(column, isA<StringColumn>());
+      expect(column.toList(), [
+        for (var i = 0; i < 5000; i++)
+          i % 6 == 0
+              ? null
+              : i % 4 == 0
+              ? 'n\u00e4me-$i'
+              : 'name-${i * 7919}',
+      ]);
+    });
+
+    test('PLAIN, from our writer', () async {
+      final path = '${dir.path}/plain.parquet';
+      final values = [
+        for (var i = 0; i < 3000; i++)
+          i % 7 == 0 ? null : (i.isEven ? 'v$i' : '\u65e5\u672c$i'),
+      ];
+      await ParquetWriter(path)
+          .write(
+            Table(
+              name: 't',
+              columns: [
+                ListColumn<String>(
+                  name: 's',
+                  dataType: DataType.string,
+                  data: values,
+                ),
+              ],
+              schema: Schema(
+                fields: [Field(name: 's', dataType: DataType.string)],
+              ),
+            ),
+          )
+          .ok;
+      final column = (await ParquetReader(path).read().ok).column('s')!;
+      expect(column, isA<StringColumn>());
+      expect(column.toList(), values);
+    });
+
+    test('malformed UTF-8 reads as replacement characters', () async {
+      final path = '${dir.path}/malformed.parquet';
+      await ParquetWriter(
+            path,
+            options: const ParquetWriterOptions(
+              compression: ParquetCompression.none,
+              writeChecksums: false,
+            ),
+          )
+          .write(
+            Table(
+              name: 't',
+              columns: [
+                ListColumn<String>(
+                  name: 's',
+                  dataType: DataType.string,
+                  data: ['ok', 'QQQQ', null],
+                ),
+              ],
+              schema: Schema(
+                fields: [Field(name: 's', dataType: DataType.string)],
+              ),
+            ),
+          )
+          .ok;
+      // Overwrite every copy of QQQQ (the page and the statistics) with an
+      // invalid lead byte followed by ASCII.
+      final bytes = File(path).readAsBytesSync();
+      final marker = 'QQQQ'.codeUnits;
+      for (var i = 0; i + marker.length <= bytes.length; i++) {
+        var match = true;
+        for (var j = 0; j < marker.length; j++) {
+          if (bytes[i + j] != marker[j]) match = false;
+        }
+        if (match) bytes[i] = 0xff;
+      }
+      File(path).writeAsBytesSync(bytes);
+      final column = (await ParquetReader(path).read().ok).column('s')!;
+      expect(column, isA<StringColumn>());
+      expect(column.toList(), ['ok', '\ufffdQQQ', null]);
+      final batches = await ParquetReader(
+        path,
+      ).readBatches(batchSize: 2).ok.toList();
+      final parts = [for (final b in batches) b.column('s')!];
+      expect(parts, everyElement(isA<StringColumn>()));
+      expect(
+        [for (final part in parts) ...part.toList()],
+        ['ok', '\ufffdQQQ', null],
+      );
+    });
+  });
+
+  group('row groups decoded in parallel', () {
+    late Directory dir;
+    late String path;
+
+    setUpAll(() async {
+      dir = Directory.systemTemp.createTempSync('parallel_');
+      path = '${dir.path}/groups.parquet';
+      // 9 row groups of 1000 rows, with nulls, text and doubles.
+      await ParquetWriter(
+            path,
+            options: const ParquetWriterOptions(rowGroupSize: 1000),
+          )
+          .write(
+            Table.fromRows('t', [
+              for (var i = 0; i < 9000; i++)
+                {
+                  'id': i,
+                  'n': i % 7 == 0 ? null : i * 3,
+                  's': i % 5 == 0 ? null : 's${i % 113}',
+                  'd': i / 8,
+                },
+            ]),
+          )
+          .ok;
+    });
+    tearDownAll(() => dir.deleteSync(recursive: true));
+
+    void same(Table actual, Table expected) {
+      expect(actual.rowCount, expected.rowCount);
+      expect(
+        actual.schema.fields.map((f) => '${f.name} ${f.dataType}'),
+        expected.schema.fields.map((f) => '${f.name} ${f.dataType}'),
+      );
+      for (final column in expected.columns) {
+        expect(
+          actual.column(column.name)!.toList(),
+          column.toList(),
+          reason: column.name,
+        );
+      }
+    }
+
+    test('match the serial read in order and content', () async {
+      final serial = await ParquetReader(path).read().ok;
+      for (final concurrency in [2, 4, 16]) {
+        same(
+          await ParquetReader(path).read(concurrency: concurrency).ok,
+          serial,
+        );
+      }
+    });
+
+    test('honor projection and row-group pruning', () async {
+      final options = ParquetReaderOptions(
+        columns: ['s', 'id'],
+        filter: RowFilter.compare('id', FilterOp.ge, 6500),
+      );
+      final serial = await ParquetReader(path, options: options).read().ok;
+      expect(serial.rowCount, 3000);
+      same(
+        await ParquetReader(path, options: options).read(concurrency: 4).ok,
+        serial,
+      );
+    });
+
+    test('stop at the row cap like the serial read', () async {
+      await expectLater(
+        ParquetReader(path).read(maxRows: 2500, concurrency: 4),
+        failsWith(Kind.limit),
+      );
+    });
+  });
+
+  group('nested assembly and caps', () {
+    test('a nested read over maxBytes is a limit', () async {
+      final file = Directory(
+        'test/fixtures/delta/rs_nested',
+      ).listSync().firstWhere((f) => f.path.endsWith('.parquet')).path;
+      await expectLater(
+        ParquetReader(file).read(maxBytes: 10),
+        failsWith(Kind.limit, contains('maxBytes=10')),
+      );
+    });
+
+    test('a record that starts mid-list is corrupt', () {
+      expect(
+        () => ColumnReader.assemble([1], [1], [1], 1, false),
+        throwsA(isA<FormatException>()),
+      );
+      expect(ColumnReader.assemble([1, 2, 3], [0, 1, 0], [1, 1, 1], 1, false), [
+        [1, 2],
+        [3],
+      ]);
     });
   });
 }

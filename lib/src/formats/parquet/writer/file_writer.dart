@@ -17,7 +17,7 @@ class FileWriter {
 
   /// Flush to stable media, then close.
   ///
-  /// `close()` alone only hands the bytes to the OS — it is not an fsync, so a
+  /// `close()` alone only hands the bytes to the OS; it is not an fsync, so a
   /// power loss can leave a published file whose content never reached disk.
   /// That matters here because the commit layers (Delta/Iceberg) DO fsync their
   /// metadata, so without this a durable commit could reference a data file that
@@ -26,7 +26,7 @@ class FileWriter {
   /// This covers the file's CONTENT. Durably committing the directory entry
   /// created by the subsequent rename needs an fsync on the parent directory,
   /// which `dart:io` cannot express (it would require FFI, and this package has
-  /// no native dependencies) — so a crash in that window can still lose a
+  /// no native dependencies), so a crash in that window can still lose a
   /// rename that already returned.
   Future<void> close() async {
     await file.flush();

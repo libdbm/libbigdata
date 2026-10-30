@@ -38,26 +38,22 @@ class IcebergSchema {
     }
   }
 
-  /// Extract (precision, scale) from an Iceberg "decimal(p,s)" type string.
-  static ({int precision, int scale}) decimalParams(String type) =>
-      decimalTypeParams(type);
-
-  static Schema fromJson(Map<String, dynamic> schemaJson) {
-    final fields = (schemaJson['fields'] as List).cast<Map<String, dynamic>>();
-    return Schema(fields: [for (final f in fields) _field(f)]);
+  static Schema fromJson(Map<String, dynamic> json) {
+    final fields = (json['fields'] as List).cast<Map<String, dynamic>>();
+    return Schema(fields: [for (final field in fields) _field(field)]);
   }
 
   /// Build a [Field] from an Iceberg field map, attaching precision/scale for
   /// decimal(p,s) and recursing into nested type objects (struct/list/map).
-  static Field _field(Map<String, dynamic> f) {
-    final nullable = !((f['required'] as bool?) ?? false);
+  static Field _field(Map<String, dynamic> json) {
+    final nullable = !((json['required'] as bool?) ?? false);
     // Carry the Iceberg field-id so the reader can resolve a data-file column by
     // id (a renamed column keeps its id but changes its physical name).
     return _fieldOfType(
-      f['name'] as String,
-      f['type'],
+      json['name'] as String,
+      json['type'],
       nullable,
-      f['id'] as int?,
+      json['id'] as int?,
     );
   }
 
@@ -70,25 +66,25 @@ class IcebergSchema {
     int? id,
   ]) {
     if (type is Map) {
-      final t = type['type'];
-      if (t == 'struct') {
+      final kind = type['type'];
+      if (kind == 'struct') {
         return Field(
           name: name,
           dataType: DataType.struct,
           nullable: nullable,
           id: id,
           children: [
-            for (final c in (type['fields'] as List).cast<Map>())
+            for (final child in (type['fields'] as List).cast<Map>())
               _fieldOfType(
-                c['name'] as String,
-                c['type'],
-                !((c['required'] as bool?) ?? false),
-                c['id'] as int?,
+                child['name'] as String,
+                child['type'],
+                !((child['required'] as bool?) ?? false),
+                child['id'] as int?,
               ),
           ],
         );
       }
-      if (t == 'list') {
+      if (kind == 'list') {
         return Field(
           name: name,
           dataType: DataType.list,
@@ -104,7 +100,7 @@ class IcebergSchema {
           ],
         );
       }
-      if (t == 'map') {
+      if (kind == 'map') {
         return Field(
           name: name,
           dataType: DataType.map,
@@ -129,19 +125,19 @@ class IcebergSchema {
         );
       }
     }
-    final dt = parseType(type);
-    if (dt == DataType.decimal && type is String) {
-      final p = decimalParams(type);
+    final parsed = parseType(type);
+    if (parsed == DataType.decimal && type is String) {
+      final decimal = decimalTypeParams(type);
       return Field(
         name: name,
-        dataType: dt,
+        dataType: parsed,
         nullable: nullable,
-        precision: p.precision,
-        scale: p.scale,
+        precision: decimal.precision,
+        scale: decimal.scale,
         id: id,
       );
     }
-    return Field(name: name, dataType: dt, nullable: nullable, id: id);
+    return Field(name: name, dataType: parsed, nullable: nullable, id: id);
   }
 
   static String typeName(DataType type, {int? precision, int? scale}) {
@@ -174,8 +170,17 @@ class IcebergSchema {
 
   /// Serialize a [Schema] to an Iceberg schema object (field IDs 1..N, nested
   /// types fully described).
-  static Map<String, dynamic> toJson(Schema schema, {int schemaId = 0}) =>
-      build(schema, schemaId: schemaId).json;
+  static Map<String, dynamic> toJson(
+    Schema schema, {
+    int schemaId = 0,
+    Map<String, int>? reuseIds,
+    int lastId = 0,
+  }) => build(
+    schema,
+    schemaId: schemaId,
+    reuseIds: reuseIds,
+    lastId: lastId,
+  ).json;
 
   /// Assign Iceberg field-ids and produce BOTH the schema JSON and an id-stamped
   /// [Schema] (used to tag the Parquet data file). The two share one id counter
@@ -185,39 +190,69 @@ class IcebergSchema {
     Schema schema, {
     int schemaId = 0,
     Map<String, int>? reuseIds,
+    int lastId = 0,
   }) {
-    // On append we REUSE the table's existing field-ids (Iceberg projects by id;
-    // regenerating 1..N here while the metadata keeps the old ids makes external
-    // engines bind the wrong columns). [reuseIds] maps a dotted field PATH
-    // (`col`, `col.child`, `col.element`, `col.key`, `col.value`) to its id; a
-    // field with no entry (a genuinely new column) gets the next fresh id.
-    var next = reuseIds == null || reuseIds.isEmpty
-        ? 1
-        : reuseIds.values.reduce((a, b) => a > b ? a : b) + 1;
+    // On append and overwrite we REUSE the table's existing field-ids (Iceberg
+    // projects by id; regenerating 1..N here while the metadata keeps the old
+    // ids makes external engines bind the wrong columns). [reuseIds] maps a
+    // dotted field PATH (`col`, `col.child`, `col.element`, `col.key`,
+    // `col.value`) to its id; a field with no entry (a genuinely new column)
+    // gets the next fresh id, above both [reuseIds] and [lastId] (the table's
+    // `last-column-id`, which also covers ids of dropped columns).
+    var next = lastId + 1;
+    for (final id in reuseIds?.values ?? const <int>[]) {
+      if (id >= next) next = id + 1;
+    }
     int idFor(String path) => reuseIds?[path] ?? next++;
     final jsons = <Map<String, dynamic>>[];
-    final idFields = <Field>[];
-    for (final f in schema.fields) {
-      final id = idFor(f.name);
-      final r = _emit(f, id, idFor, f.name);
+    final stamped = <Field>[];
+    for (final field in schema.fields) {
+      final id = idFor(field.name);
+      final emitted = _emit(field, id, idFor, field.name);
       jsons.add({
         'id': id,
-        'name': f.name,
-        'required': !f.nullable,
-        'type': r.type,
+        'name': field.name,
+        'required': !field.nullable,
+        'type': emitted.type,
       });
-      idFields.add(r.field);
+      stamped.add(emitted.field);
     }
     return (
       json: {'type': 'struct', 'schema-id': schemaId, 'fields': jsons},
-      idSchema: Schema(fields: idFields),
+      idSchema: Schema(fields: stamped),
     );
+  }
+
+  /// The ids of [current] (the table's schema JSON) that [schema] may keep on
+  /// an overwrite: those of each top-level column whose name and type are
+  /// unchanged, nested ids included. A column whose type changed is a new
+  /// column to Iceberg and gets fresh ids, since reusing an id across an
+  /// incompatible type breaks every reader that binds old files by id.
+  static Map<String, int> reuseFor(
+    Map<String, dynamic> current,
+    Schema schema,
+  ) {
+    final ids = idMap(current);
+    final old = {
+      for (final field
+          in (current['fields'] as List).cast<Map<String, dynamic>>())
+        field['name'] as String: '${field['type']}',
+    };
+    final built = (build(schema, reuseIds: ids).json['fields'] as List)
+        .cast<Map<String, dynamic>>();
+    for (final field in built) {
+      final name = field['name'] as String;
+      if (old[name] != '${field['type']}') {
+        ids.removeWhere((path, _) => path == name || path.startsWith('$name.'));
+      }
+    }
+    return ids;
   }
 
   /// A dotted-path → field-id map extracted from an Iceberg schema JSON (the
   /// table's current schema), so an append can pass it as [build]'s `reuseIds`
   /// and keep the data-file field-ids in lock-step with the metadata ids.
-  static Map<String, int> idMap(Map<String, dynamic> schemaJson) {
+  static Map<String, int> idMap(Map<String, dynamic> json) {
     final map = <String, int>{};
     late final void Function(List<Map<String, dynamic>>, String) walkFields;
     void walkType(Object? type, String path) {
@@ -240,86 +275,90 @@ class IcebergSchema {
     }
 
     walkFields = (fields, prefix) {
-      for (final f in fields) {
+      for (final field in fields) {
         final path = prefix.isEmpty
-            ? f['name'] as String
-            : '$prefix.${f['name']}';
-        map[path] = f['id'] as int;
-        walkType(f['type'], path);
+            ? field['name'] as String
+            : '$prefix.${field['name']}';
+        map[path] = field['id'] as int;
+        walkType(field['type'], path);
       }
     };
 
-    walkFields((schemaJson['fields'] as List).cast<Map<String, dynamic>>(), '');
+    walkFields((json['fields'] as List).cast<Map<String, dynamic>>(), '');
     return map;
   }
 
   /// Emit one field's Iceberg `type` JSON (a string for scalars, an object for
   /// nested) plus the id-stamped [Field]. [id] is already assigned to this field.
   static ({Object type, Field field}) _emit(
-    Field f,
+    Field field,
     int id,
     int Function(String) idFor,
     String path,
   ) {
-    switch (f.dataType) {
+    switch (field.dataType) {
       case DataType.struct:
-        final childJsons = <Map<String, dynamic>>[];
-        final childFields = <Field>[];
-        for (final c in f.children) {
-          final cpath = '$path.${c.name}';
-          final cid = idFor(cpath);
-          final r = _emit(c, cid, idFor, cpath);
-          childJsons.add({
-            'id': cid,
-            'name': c.name,
-            'required': !c.nullable,
-            'type': r.type,
+        final fields = <Map<String, dynamic>>[];
+        final children = <Field>[];
+        for (final child in field.children) {
+          final nested = '$path.${child.name}';
+          final assigned = idFor(nested);
+          final emitted = _emit(child, assigned, idFor, nested);
+          fields.add({
+            'id': assigned,
+            'name': child.name,
+            'required': !child.nullable,
+            'type': emitted.type,
           });
-          childFields.add(r.field);
+          children.add(emitted.field);
         }
         return (
-          type: {'type': 'struct', 'fields': childJsons},
-          field: f.copyWith(id: id, children: childFields),
+          type: {'type': 'struct', 'fields': fields},
+          field: field.copyWith(id: id, children: children),
         );
       case DataType.list:
-        final element = f.children.first;
-        final eid = idFor('$path.element');
-        final r = _emit(element, eid, idFor, '$path.element');
+        final element = field.children.first;
+        final assigned = idFor('$path.element');
+        final emitted = _emit(element, assigned, idFor, '$path.element');
         return (
           type: {
             'type': 'list',
-            'element-id': eid,
+            'element-id': assigned,
             'element-required': !element.nullable,
-            'element': r.type,
+            'element': emitted.type,
           },
-          field: f.copyWith(id: id, children: [r.field]),
+          field: field.copyWith(id: id, children: [emitted.field]),
         );
       case DataType.map:
-        final entries = f.children.first; // key_value struct(key, value)
-        final kid = idFor('$path.key'), vid = idFor('$path.value');
-        final kr = _emit(entries.children[0], kid, idFor, '$path.key');
-        final vr = _emit(entries.children[1], vid, idFor, '$path.value');
+        final entries = field.children.first; // key_value struct(key, value)
+        final keyId = idFor('$path.key'), valueId = idFor('$path.value');
+        final key = _emit(entries.children[0], keyId, idFor, '$path.key');
+        final value = _emit(entries.children[1], valueId, idFor, '$path.value');
         return (
           type: {
             'type': 'map',
-            'key-id': kid,
-            'key': kr.type,
-            'value-id': vid,
+            'key-id': keyId,
+            'key': key.type,
+            'value-id': valueId,
             'value-required': !entries.children[1].nullable,
-            'value': vr.type,
+            'value': value.type,
           },
           // The key_value wrapper itself carries no Iceberg id.
-          field: f.copyWith(
+          field: field.copyWith(
             id: id,
             children: [
-              entries.copyWith(children: [kr.field, vr.field]),
+              entries.copyWith(children: [key.field, value.field]),
             ],
           ),
         );
       default:
         return (
-          type: typeName(f.dataType, precision: f.precision, scale: f.scale),
-          field: f.copyWith(id: id),
+          type: typeName(
+            field.dataType,
+            precision: field.precision,
+            scale: field.scale,
+          ),
+          field: field.copyWith(id: id),
         );
     }
   }

@@ -1,10 +1,14 @@
 import 'dart:io';
 import 'dart:isolate';
 
+import 'package:meta/meta.dart';
+
 import '../../core/column.dart';
 import '../../core/partitions.dart';
 import '../../core/data_type.dart';
+import '../../core/failure.dart';
 import '../../core/limits.dart';
+import '../../core/result.dart';
 import '../../core/schema.dart';
 import '../../core/table.dart';
 import '../../core/columnar.dart';
@@ -19,7 +23,7 @@ import '../parallel_read.dart';
 /// path, prunes whole files via a [RowFilter] over partition values (and pushes
 /// the same filter into Parquet row-group pruning), and unifies the schema
 /// across files (union of fields, null-filling absentees).
-class Dataset {
+final class Dataset {
   /// A directory, a glob (`dir/**`, `dir/*.parquet`), or a single file.
   final String source;
 
@@ -52,7 +56,7 @@ class Dataset {
     this.maxBytes = defaultMaxMaterializedBytes,
   });
 
-  static const _exts = [
+  static const _extensions = [
     '.parquet',
     '.csv',
     '.jsonl',
@@ -61,19 +65,22 @@ class Dataset {
     '.arrow',
   ];
 
-  Future<Table> read() async {
+  /// Read the whole dataset. A failure is reported as an [Err]:
+  /// [Kind.missing] for a path that does not exist, [Kind.schema] for column
+  /// types that differ across files, [Kind.invalid] for an unknown projected
+  /// column, [Kind.limit] past a cap, and the file readers' kinds otherwise.
+  @useResult
+  Future<Result<Table, ErrorDetails>> read() =>
+      capture(_read, fallback: Kind.corrupt);
+
+  Future<Table> _read() async {
     // Safe by default: stream and stop at the cap so a giant dataset/file can't
     // OOM. Both caps null opts into the unbounded eager path below.
     if (maxRows != null || maxBytes != null) return _readBounded();
 
     // Prune whole files by partition predicate first, so pruned files never
     // spawn read work. Kept files retain their input order.
-    final kept = <(String, Map<String, Object?>)>[];
-    for (final file in await _resolve(source)) {
-      final parts = _partitions(file);
-      if (filter != null && !_partitionKeep(filter!, parts)) continue;
-      kept.add((file, parts));
-    }
+    final kept = await _kept();
     if (kept.isEmpty) {
       return Table.empty('dataset', Schema(fields: const []));
     }
@@ -84,7 +91,7 @@ class Dataset {
       // work out the projection is reused by the read instead of being parsed
       // again. Interleaved rather than projecting every file up front: only one
       // file's footer is alive at a time, which matters at a million files.
-      raw = [for (final e in kept) await _readOne(e.$1, e.$2)];
+      raw = [for (final entry in kept) await _readOne(entry.$1, entry.$2)];
     } else {
       // Per-file column projection: push the requested columns into each Parquet
       // read (intersected with the file's own schema, minus partition columns)
@@ -92,7 +99,8 @@ class Dataset {
       // isolate re-opens the file itself (a Scan can't cross an isolate), so
       // this path still parses each footer twice.
       final projections = [
-        for (final e in kept) await _fileProjection(openScan(e.$1), e.$1, e.$2),
+        for (final entry in kept)
+          await _fileProjection(openScan(entry.$1), entry.$1, entry.$2),
       ];
       final localFilter = filter; // bind locally so the isolate closure
       // captures only sendable values, not `this`.
@@ -100,12 +108,12 @@ class Dataset {
       final localMaxBytes = maxBytes;
       raw = await parallelMap(
         [for (int i = 0; i < kept.length; i++) (kept[i].$1, projections[i])],
-        (e) => Isolate.run(
+        (entry) => Isolate.run(
           () => readTableTask(
             ReadSpec(
-              e.$1,
+              entry.$1,
               filter: localFilter,
-              columns: e.$2,
+              columns: entry.$2,
               maxRows: localMaxRows,
               maxBytes: localMaxBytes,
             ),
@@ -130,11 +138,11 @@ class Dataset {
     final batches = <Table>[];
     var rows = 0;
     var bytes = 0;
-    await for (final b in readBatches()) {
-      rows += b.rowCount;
-      bytes += b.memoryUsage;
+    await for (final batch in _batches()) {
+      rows += batch.rowCount;
+      bytes += batch.memoryUsage;
       enforceMaterializationCaps(rows, bytes, maxRows, maxBytes, 'dataset');
-      batches.add(b);
+      batches.add(batch);
     }
     if (batches.isEmpty) {
       return Table.empty('dataset', Schema(fields: const []));
@@ -146,43 +154,74 @@ class Dataset {
       name: 'dataset',
       schema: batches.first.schema,
       columns: [
-        for (final f in fields)
-          Column.concat([for (final b in batches) b.column(f.name)!]),
+        for (final field in fields)
+          Column.concat([
+            for (final batch in batches) batch.column(field.name)!,
+          ]),
       ],
     );
   }
 
   // --- file resolution -----------------------------------------------------
 
-  Future<List<String>> _resolve(String source) async {
+  /// The files to read, each with its partition values, minus those the
+  /// [filter] prunes by partition.
+  Future<List<(String, Map<String, Object?>)>> _kept() async {
+    final (root, files) = await _resolve(source);
+    final parts = _partitions(root, files);
+    return [
+      for (int i = 0; i < files.length; i++)
+        if (filter == null || _partitionKeep(filter!, parts[i]))
+          (files[i], parts[i]),
+    ];
+  }
+
+  /// The directory partitions are read below, and the files. A Delta or
+  /// Iceberg table directory is one "file" that [openScan] reads as the
+  /// table; listing its data files would read removed and uncommitted ones.
+  Future<(String, List<String>)> _resolve(String source) async {
     final type = await FileSystemEntity.type(source);
-    if (type == FileSystemEntityType.file) return [source];
-    if (type == FileSystemEntityType.directory) return _listDir(source);
-    if (source.contains('*')) return _glob(source);
-    throw ArgumentError('Dataset path not found: $source');
+    if (type == FileSystemEntityType.file) return (source, [source]);
+    if (type == FileSystemEntityType.directory) {
+      if (isTable(source)) return (source, [source]);
+      return (source, await _list(source, (path) => _supported(path)));
+    }
+    if (source.contains('*')) {
+      final base = <String>[];
+      for (final segment in source.split('/')) {
+        if (segment.contains('*')) break;
+        base.add(segment);
+      }
+      final directory = base.isEmpty ? '.' : base.join('/');
+      final regex = _globRegex(source);
+      return (directory, await _list(directory, regex.hasMatch));
+    }
+    throw Failure.of(Kind.missing, 'Dataset path not found: $source');
   }
 
-  Future<List<String>> _listDir(String dir) async {
+  /// The files below [directory] that [match], sorted. A file or directory whose
+  /// name starts with `_` or `.` is skipped, as Spark and Arrow do
+  /// (`_SUCCESS`, `_temporary`, `_delta_log`, `.crc` files). A Delta or
+  /// Iceberg table below [directory] is [Kind.unsupported]: reading its data files
+  /// directly would include removed ones.
+  Future<List<String>> _list(
+    String directory,
+    bool Function(String) match,
+  ) async {
     final out = <String>[];
-    await for (final e in Directory(dir).list(recursive: true)) {
-      if (e is File && _supported(e.path)) out.add(e.path);
-    }
-    out.sort();
-    return out;
-  }
-
-  Future<List<String>> _glob(String pattern) async {
-    final segments = pattern.split('/');
-    final base = <String>[];
-    for (final s in segments) {
-      if (s.contains('*')) break;
-      base.add(s);
-    }
-    final dir = base.isEmpty ? '.' : base.join('/');
-    final regex = _globRegex(pattern);
-    final out = <String>[];
-    await for (final e in Directory(dir).list(recursive: true)) {
-      if (e is File && regex.hasMatch(e.path)) out.add(e.path);
+    await for (final entry in Directory(directory).list(recursive: true)) {
+      final names = _names(entry.path.substring(directory.length));
+      if (names.any((name) => name.startsWith('_') || name.startsWith('.'))) {
+        continue;
+      }
+      if (entry is Directory && isTable(entry.path)) {
+        throw Failure.of(
+          Kind.unsupported,
+          'Dataset $source holds the table ${entry.path}; read the table '
+          'directly or list it as its own source',
+        );
+      }
+      if (entry is File && match(entry.path)) out.add(entry.path);
     }
     out.sort();
     return out;
@@ -191,20 +230,20 @@ class Dataset {
   RegExp _globRegex(String pattern) {
     final buffer = StringBuffer('^');
     for (int i = 0; i < pattern.length; i++) {
-      final c = pattern[i];
-      if (c == '*') {
+      final character = pattern[i];
+      if (character == '*') {
         if (i + 1 < pattern.length && pattern[i + 1] == '*') {
           buffer.write('.*');
           i++;
         } else {
           buffer.write('[^/]*');
         }
-      } else if (c == '?') {
+      } else if (character == '?') {
         buffer.write('[^/]');
-      } else if ('.+(){}[]^\$|\\'.contains(c)) {
-        buffer.write('\\$c');
+      } else if ('.+(){}[]^\$|\\'.contains(character)) {
+        buffer.write('\\$character');
       } else {
-        buffer.write(c);
+        buffer.write(character);
       }
     }
     buffer.write(r'$');
@@ -213,52 +252,80 @@ class Dataset {
 
   bool _supported(String path) {
     final lower = path.toLowerCase();
-    return _exts.any(lower.endsWith);
+    return _extensions.any(lower.endsWith);
   }
 
   // --- partitions ----------------------------------------------------------
 
-  /// Parse `key=value` segments anywhere in [path] into typed partition values.
-  Map<String, Object?> _partitions(String path) {
-    final out = <String, Object?>{};
-    for (final seg
-        in path.split('/').expand((s) => s.split(Platform.pathSeparator))) {
-      final eq = seg.indexOf('=');
-      if (eq > 0 && eq < seg.length - 1) {
-        final key = seg.substring(0, eq);
-        if (key.isNotEmpty && !key.contains('.')) {
-          out[key] = _coerce(seg.substring(eq + 1));
-        }
-      }
-    }
-    return out;
+  /// The non-empty names in the [relative] path, split on `/` and the
+  /// platform's separator.
+  static List<String> _names(String relative) => [
+    for (final name in relative.split('/'))
+      ...name.split(Platform.pathSeparator).where((part) => part.isNotEmpty),
+  ];
+
+  /// The directory names in the [relative] path of a file: all but the last.
+  static List<String> _directories(String relative) {
+    final names = _names(relative);
+    return names.isEmpty ? names : names.sublist(0, names.length - 1);
   }
 
-  Object? _coerce(String value) {
-    if (isNullPartition(value)) return null;
-    // Hive/Spark (and this library's Delta writer) escape special characters
-    // in the segment value as %XX — `a b` is written `a b` but `50%` is
-    // `50%25`; taking the text literally returned the ESCAPED form.
-    final raw = unescapePathName(value);
-    final i = int.tryParse(raw);
-    if (i != null) return i;
-    final d = double.tryParse(raw);
-    if (d != null) return d;
-    if (raw == 'true') return true;
-    if (raw == 'false') return false;
-    return raw;
+  /// The partition values of each of [files]: its `key=value` directories
+  /// below [root] (an ancestor of the root, or the file name, is not one),
+  /// typed alike across files. A key whose values all read as integers is an
+  /// integer, as finite numbers a double, as `true`/`false` a boolean, and
+  /// otherwise text: typing each file alone made `k=1` and `k=1.5` a schema
+  /// conflict, and `NaN` a number.
+  List<Map<String, Object?>> _partitions(String root, List<String> files) {
+    final texts = [
+      for (final file in files)
+        <String, String?>{
+          for (final segment in _directories(file.substring(root.length)))
+            if (segment.indexOf('=') case final index
+                when index > 0 &&
+                    index < segment.length - 1 &&
+                    !segment.substring(0, index).contains('.'))
+              segment.substring(
+                0,
+                index,
+              ): isNullPartition(segment.substring(index + 1))
+                  ? null
+                  // Hive/Spark (and this library's Delta writer) escape
+                  // special characters in the segment value as %XX.
+                  : unescapePathName(segment.substring(index + 1)),
+        },
+    ];
+    final types = <String, DataType>{};
+    for (final key in {for (final text in texts) ...text.keys}) {
+      final values = [for (final text in texts) ?text[key]];
+      types[key] = values.every((value) => int.tryParse(value) != null)
+          ? DataType.int64
+          : values.every((value) => double.tryParse(value)?.isFinite ?? false)
+          ? DataType.float64
+          : values.every((value) => value == 'true' || value == 'false')
+          ? DataType.boolean
+          : DataType.string;
+    }
+    return [
+      for (final text in texts)
+        {
+          for (final MapEntry(:key, :value) in text.entries)
+            key: value == null
+                ? null
+                : switch (types[key]!) {
+                    DataType.int64 => int.parse(value),
+                    DataType.float64 => double.parse(value),
+                    DataType.boolean => value == 'true',
+                    _ => value,
+                  },
+        },
+    ];
   }
 
   bool _partitionKeep(RowFilter filter, Map<String, Object?> parts) {
     final bounds = <String, ColumnBounds>{
-      for (final e in parts.entries)
-        e.key: ColumnBounds(
-          min: e.value,
-          max: e.value,
-          nullCount: e.value == null ? 1 : 0,
-          rowCount: 1,
-          hasStats: true,
-        ),
+      for (final entry in parts.entries)
+        entry.key: ColumnBounds.exact(entry.value),
     };
     return filter.keep(bounds);
   }
@@ -267,7 +334,7 @@ class Dataset {
     if (parts.isEmpty) return table;
     final columns = [...table.columns];
     final fields = [...table.schema.fields];
-    final existing = table.schema.fields.map((f) => f.name).toSet();
+    final existing = table.schema.fields.map((field) => field.name).toSet();
     parts.forEach((key, value) {
       if (existing.contains(key)) return; // file column wins over partition
       final type = _typeOf(value);
@@ -286,12 +353,12 @@ class Dataset {
   /// The type of a partition value decoded from a path segment.
   ///
   /// Deliberately NOT [DataType.fromValue]: that narrows an integer by
-  /// magnitude, and partition types are derived PER FILE — `part=5` (int8) and
+  /// magnitude, and partition types are derived PER FILE: `part=5` (int8) and
   /// `part=300` (int16) would then be "incompatible types" in [_unionFields].
   /// The widths here are the widest of each family so every file agrees.
   ///
   /// A null partition (the `__HIVE_DEFAULT_PARTITION__` sentinel this library
-  /// itself writes) MUST be [DataType.null_] — that is the escape hatch
+  /// itself writes) MUST be [DataType.null_]; that is the escape hatch
   /// [_unionFields] uses to let a null column sit under a sibling file's real
   /// type. Typing it `string` made that hatch unreachable, so a perfectly
   /// ordinary Hive layout failed to read.
@@ -305,10 +372,6 @@ class Dataset {
 
   // --- per-file read -------------------------------------------------------
 
-  /// Columns to read from [file]: the requested projection intersected with the
-  /// file's own schema and minus partition columns (which come from the path),
-  /// or null to read all. Only Parquet projection is pushed down today; an empty
-  /// intersection keeps one column so the file's row count survives null-filling.
   /// Read one file through a single [Scan], so the footer parsed for the
   /// projection is reused by the read (see [_ParquetScan]).
   Future<Table> _readOne(String file, Map<String, Object?> parts) async {
@@ -316,30 +379,34 @@ class Dataset {
     return _readFile(scan, await _fileProjection(scan, file, parts));
   }
 
+  /// Columns to read from [file]: the requested projection intersected with the
+  /// file's own schema and minus partition columns (which come from the path),
+  /// or null to read all. Only Parquet projection is pushed down today; an empty
+  /// intersection keeps one column so the file's row count survives null-filling.
   Future<List<String>?> _fileProjection(
     Scan scan,
     String file,
     Map<String, Object?> parts,
   ) async {
-    final cols = columns;
-    if (cols == null || !file.toLowerCase().endsWith('.parquet')) return null;
+    final wanted = columns;
+    if (wanted == null || !file.toLowerCase().endsWith('.parquet')) return null;
     final schema = await scan.readSchema();
-    final fileNames = schema == null
+    final names = schema == null
         ? const <String>[]
-        : schema.fields.map((f) => f.name).toList();
-    final partKeys = parts.keys.toSet();
-    final proj = [
-      for (final c in cols)
-        if (fileNames.contains(c) && !partKeys.contains(c)) c,
+        : schema.fields.map((field) => field.name).toList();
+    final keys = parts.keys.toSet();
+    final projection = [
+      for (final column in wanted)
+        if (names.contains(column) && !keys.contains(column)) column,
     ];
-    if (proj.isNotEmpty) return proj;
-    return fileNames.isEmpty ? null : [fileNames.first];
+    if (projection.isNotEmpty) return projection;
+    return names.isEmpty ? null : [names.first];
   }
 
   Future<Table> _readFile(Scan scan, [List<String>? projection]) async {
     // Format selection came from the single registry (openScan); forward the
-    // dataset-level caps so `null` (opt-out) is truly unbounded per file — not
-    // silently re-defaulted to 10M / 1 GiB — and a smaller dataset cap is
+    // dataset-level caps so `null` (opt-out) is truly unbounded per file, not
+    // silently re-defaulted to 10M / 1 GiB, and a smaller dataset cap is
     // honoured. (The cap bounds each file, not the dataset total.)
     return scan.read(
       maxRows: maxRows,
@@ -354,28 +421,28 @@ class Dataset {
   /// First-seen-order union of fields across [perFile] schemas (no data). Data
   /// fields are marked nullable: a field may be absent from some file (null-filled
   /// there), and per-file schemas come from a bounded peek that can't prove a
-  /// later row isn't null — so non-nullness can't be guaranteed across a streaming
+  /// later row isn't null, so non-nullness can't be guaranteed across a streaming
   /// heterogeneous dataset.
   List<Field> _unionFields(Iterable<List<Field>> perFile) {
-    final fieldByName = <String, Field>{};
+    final byName = <String, Field>{};
     final order = <String>[];
     for (final fields in perFile) {
       for (final field in fields) {
-        final seen = fieldByName[field.name];
+        final seen = byName[field.name];
         if (seen == null) {
-          fieldByName[field.name] = field.nullable
+          byName[field.name] = field.nullable
               ? field
               : field.copyWith(nullable: true);
           order.add(field.name);
           continue;
         }
-        // null_ carries no shape — promote to the first CONCRETE type. The
+        // null_ carries no shape: promote to the first CONCRETE type. The
         // null-partition sentinel starts with '_', so its file can sort (and
         // be seen) FIRST; first-seen-wins then froze the field as null_ and
         // every concrete column failed validation.
         if (seen.dataType == DataType.null_) {
           if (field.dataType != DataType.null_) {
-            fieldByName[field.name] = field.copyWith(nullable: true);
+            byName[field.name] = field.copyWith(nullable: true);
           }
           continue;
         }
@@ -383,7 +450,8 @@ class Dataset {
         if (seen.dataType != field.dataType) {
           // First-seen-wins would otherwise seat a later file's differently
           // typed column under this field's type and silently mislabel data.
-          throw ArgumentError(
+          throw Failure.of(
+            Kind.schema,
             'Incompatible types for column "${field.name}" across dataset '
             'files: ${seen.dataType} vs ${field.dataType}',
           );
@@ -393,18 +461,19 @@ class Dataset {
         // values (unscaled BigInts reinterpreted) or mis-pairs struct members.
         if (seen.dataType == DataType.decimal) {
           final unified = _unifyDecimal(seen, field);
-          if (unified != null) fieldByName[field.name] = unified;
+          if (unified != null) byName[field.name] = unified;
           continue;
         }
         if (!seen.isCompatibleWith(field)) {
-          throw ArgumentError(
+          throw Failure.of(
+            Kind.schema,
             'Incompatible ${field.dataType.name} shapes for column '
             '"${field.name}" across dataset files (nested children differ)',
           );
         }
       }
     }
-    return [for (final n in order) fieldByName[n]!];
+    return [for (final name in order) byName[name]!];
   }
 
   /// The unified decimal field for [seen] + [next]: the WIDER scale wins
@@ -415,16 +484,16 @@ class Dataset {
     final seenScale = seen.scale ?? 0;
     final nextScale = next.scale ?? 0;
     final scale = seenScale > nextScale ? seenScale : nextScale;
-    final sp = seen.precision;
-    final np = next.precision;
+    final seenPrecision = seen.precision;
+    final nextPrecision = next.precision;
     final int? precision;
-    if (sp == null || np == null) {
-      precision = sp ?? np;
+    if (seenPrecision == null || nextPrecision == null) {
+      precision = seenPrecision ?? nextPrecision;
     } else {
-      final ints = (sp - seenScale) > (np - nextScale)
-          ? (sp - seenScale)
-          : (np - nextScale);
-      final wanted = ints + scale;
+      final integral = (seenPrecision - seenScale) > (nextPrecision - nextScale)
+          ? (seenPrecision - seenScale)
+          : (nextPrecision - nextScale);
+      final wanted = integral + scale;
       precision = wanted > 38 ? 38 : wanted;
     }
     if (scale == seenScale && precision == seen.precision) return null;
@@ -460,12 +529,12 @@ class Dataset {
   }
 
   Table _unify(List<Table> tables) {
-    final unifiedFields = _unionFields([
-      for (final t in tables) t.schema.fields,
+    final unified = _unionFields([
+      for (final table in tables) table.schema.fields,
     ]);
-    final names = unifiedFields.map((f) => f.name).toSet();
-    final outColumns = <Column>[
-      for (final field in unifiedFields)
+    final names = unified.map((field) => field.name).toSet();
+    final merged = <Column>[
+      for (final field in unified)
         Column.concat([
           for (final table in tables)
             _aligned(table, field) ??
@@ -479,8 +548,8 @@ class Dataset {
 
     var result = Table(
       name: 'dataset',
-      columns: outColumns,
-      schema: Schema(fields: unifiedFields),
+      columns: merged,
+      schema: Schema(fields: unified),
     );
     final select = columns;
     if (select != null) {
@@ -491,9 +560,12 @@ class Dataset {
   }
 
   void _checkProjection(List<String> select, Set<String> available) {
-    final missing = select.where((c) => !available.contains(c)).toList();
+    final missing = select
+        .where((column) => !available.contains(column))
+        .toList();
     if (missing.isNotEmpty) {
-      throw ArgumentError(
+      throw Failure.of(
+        Kind.invalid,
         'Unknown column(s) in projection: ${missing.join(', ')}',
       );
     }
@@ -508,22 +580,33 @@ class Dataset {
   /// parallel-read option is only available on the eager [read]). Plain `.json`
   /// (not line-delimited) has no streaming reader and is emitted as one batch.
   /// [schema], when supplied, PINS the unified schema and SKIPS the per-file
-  /// metadata pre-pass entirely — a million-file dataset then costs no up-front
+  /// metadata pre-pass entirely: a million-file dataset then costs no up-front
   /// O(files) schema reads (each file's reader still conforms to it). Without it,
-  /// the schema is derived by peeking every file's fields (the historical path).
-  Stream<Table> readBatches({int size = 10000, Schema? schema}) async* {
-    if (size <= 0) throw ArgumentError.value(size, 'size', 'must be > 0');
-    final kept = <(String, Map<String, Object?>)>[];
-    for (final file in await _resolve(source)) {
-      final parts = _partitions(file);
-      if (filter != null && !_partitionKeep(filter!, parts)) continue;
-      kept.add((file, parts));
+  /// the schema is derived by peeking every file's fields.
+  ///
+  /// Each batch arrives as an [Ok]; a failure as one [Err], reported as [read]
+  /// reports it, which ends the stream.
+  /// A [batchSize] below 1 is a programming error and throws at the call.
+  Stream<Result<Table, ErrorDetails>> readBatches({
+    int batchSize = 10000,
+    Schema? schema,
+  }) {
+    if (batchSize <= 0) {
+      throw ArgumentError.value(batchSize, 'batchSize', 'must be > 0');
     }
+    return captureStream(
+      () => _batches(size: batchSize, schema: schema),
+      fallback: Kind.corrupt,
+    );
+  }
+
+  Stream<Table> _batches({int size = 10000, Schema? schema}) async* {
+    final kept = await _kept();
     if (kept.isEmpty) return;
 
     List<Field> unified;
     // Only when we peek: each file's PUSHED PROJECTION (the small list of column
-    // names to read), NOT the full per-file Field list — so the stream doesn't
+    // names to read), NOT the full per-file Field list, so the stream doesn't
     // retain O(files) worth of schema metadata after unification is computed.
     List<List<String>?>? projections;
     if (schema != null) {
@@ -531,7 +614,7 @@ class Dataset {
     } else {
       // Cheap metadata pre-pass: derive the unified schema (file fields + their
       // partition columns) up front so every emitted batch can be conformed to
-      // it — a stream can't retroactively widen already-emitted batches. The
+      // it: a stream can't retroactively widen already-emitted batches. The
       // peeked file fields are also reused to compute each file's projection.
       // Overlap the per-file schema reads up to [concurrency] (order
       // preserved): serially, this pre-pass was the whole time-to-first-row on
@@ -547,15 +630,13 @@ class Dataset {
       projections = <List<String>?>[];
       for (int i = 0; i < kept.length; i++) {
         final (_, parts) = kept[i];
-        final fileFields = peeked[i];
-        projections.add(
-          _projectionFor(fileFields),
-        ); // small; fileFields dropped
-        final withParts = [...fileFields];
-        final have = fileFields.map((f) => f.name).toSet();
+        final fields = peeked[i];
+        projections.add(_projectionFor(fields)); // small; fields dropped
+        final extended = [...fields];
+        final have = fields.map((field) => field.name).toSet();
         parts.forEach((key, value) {
           if (!have.contains(key)) {
-            withParts.add(
+            extended.add(
               Field(
                 name: key,
                 dataType: _typeOf(value),
@@ -564,13 +645,13 @@ class Dataset {
             );
           }
         });
-        perFile.add(withParts);
+        perFile.add(extended);
       }
       unified = _unionFields(perFile);
     }
     final select = columns;
     if (select != null) {
-      _checkProjection(select, unified.map((f) => f.name).toSet());
+      _checkProjection(select, unified.map((field) => field.name).toSet());
     }
 
     for (int i = 0; i < kept.length; i++) {
@@ -586,19 +667,19 @@ class Dataset {
     }
   }
 
-  /// The requested columns that exist in [fileFields] (partition columns come
+  /// The requested columns that exist in [fields] (partition columns come
   /// from the path, not the reader), or null when no projection. When the
   /// intersection is empty, keep one column so the file's row count survives.
-  List<String>? _projectionFor(List<Field> fileFields) {
-    final cols = columns;
-    if (cols == null) return null;
-    final names = fileFields.map((f) => f.name).toSet();
-    final proj = [
-      for (final c in cols)
-        if (names.contains(c)) c,
+  List<String>? _projectionFor(List<Field> fields) {
+    final wanted = columns;
+    if (wanted == null) return null;
+    final names = fields.map((field) => field.name).toSet();
+    final projection = [
+      for (final column in wanted)
+        if (names.contains(column)) column,
     ];
-    if (proj.isNotEmpty) return proj;
-    return fileFields.isEmpty ? null : [fileFields.first.name];
+    if (projection.isNotEmpty) return projection;
+    return fields.isEmpty ? null : [fields.first.name];
   }
 
   /// Cheap per-file field list for the unification pre-pass, via the single
@@ -607,8 +688,8 @@ class Dataset {
   ///
   /// Deliberately does NOT hold its [Scan] to share the parsed footer with the
   /// later stream: the pre-pass visits every file before the first batch is
-  /// emitted, so keeping the scans alive would hold every file's footer at once
-  /// — worse, at a million files, than the parse it saves. Pass `schema:` to
+  /// emitted, so keeping the scans alive would hold every file's footer at once:
+  /// worse, at a million files, than the parse it saves. Pass `schema:` to
   /// skip the pre-pass entirely.
   Future<List<Field>> _fileFields(String path) async =>
       (await openScan(path).readSchema())?.fields ?? const [];

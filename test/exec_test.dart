@@ -2,20 +2,19 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:libbigdata/libbigdata.dart' hide JoinType, RowFilter, FilterOp;
+import 'package:libbigdata/src/core/failure.dart';
 import 'package:libbigdata/src/core/keys.dart';
 import 'package:libbigdata/src/core/limits.dart';
 import 'package:libbigdata/src/formats/delta/roaring_bitmap.dart';
-import 'package:libbigdata/src/formats/parquet/filter/row_filter.dart';
-import 'package:libbigdata/src/sql/ast/ast.dart';
 import 'package:libbigdata/src/sql/exec/kernels.dart';
 import 'package:libbigdata/src/sql/exec/where_pushdown.dart';
-import 'package:libbigdata/src/sql/execution/engine_options.dart';
-import 'package:libbigdata/src/sql/execution/memory_manager.dart';
 import 'package:libbigdata/src/sql/operators/physical_operators.dart';
 import 'package:libbigdata/src/sql/operators/spill.dart';
 import 'package:libbigdata/src/sql/planner/logical_plan.dart' as lp;
 import 'package:libbigdata/src/sql/planner/physical_plan.dart';
 import 'package:test/test.dart';
+
+import 'support/results.dart';
 
 /// a throw in one cleanup step of an operator's close() must
 /// not strand the remaining steps (other children, FDs, spill files, budget).
@@ -36,6 +35,45 @@ class _FakeIterator extends RecordBatchIterator {
   }
 }
 
+/// Yields each batch after running its `before` callback, then null.
+class _CallbackIterator extends RecordBatchIterator {
+  _CallbackIterator(this.schema, this._steps);
+  @override
+  final Schema schema;
+  final List<({RecordBatch batch, void Function() before})> _steps;
+  var _next = 0;
+
+  @override
+  Future<RecordBatch?> next() async {
+    if (_next >= _steps.length) return null;
+    final step = _steps[_next++];
+    step.before();
+    return step.batch;
+  }
+
+  @override
+  Future<void> close() async {}
+}
+
+/// Yields [batch], then throws on the next call.
+class _FailingIterator extends RecordBatchIterator {
+  _FailingIterator(this.schema, this.batch);
+  @override
+  final Schema schema;
+  final RecordBatch batch;
+  var _done = false;
+
+  @override
+  Future<RecordBatch?> next() async {
+    if (_done) throw StateError('input failed');
+    _done = true;
+    return batch;
+  }
+
+  @override
+  Future<void> close() async {}
+}
+
 /// Yields a fixed list of batches, then null.
 class _ListIterator extends RecordBatchIterator {
   _ListIterator(this.schema, this._batches);
@@ -54,14 +92,18 @@ class _ListIterator extends RecordBatchIterator {
 
 /// A [MemoryManager] that records the high-water mark of [used] after every
 /// grant, so a test can assert the true reserved peak.
-class _PeakManager extends MemoryManager {
+final class _PeakManager extends MemoryManager {
   _PeakManager(super.budget) : super(hardCap: true);
   int peak = 0;
+
+  /// Reserves refused, each of which made the caller spill.
+  int denied = 0;
 
   @override
   bool reserve(int bytes) {
     final ok = super.reserve(bytes);
     if (used > peak) peak = used;
+    if (!ok) denied++;
     return ok;
   }
 }
@@ -307,10 +349,10 @@ void main() {
             ],
           ),
         );
-        final engine = SqlEngine();
+        final engine = SqlEngine.open().ok;
         engine.registerTable('t', table);
-        final df = await engine.sql('SELECT id, v FROM t WHERE id > 2');
-        final result = await df.execute();
+        final df = await engine.sql('SELECT id, v FROM t WHERE id > 2').ok;
+        final result = await df.execute().ok;
         expect(result.rowCount, 3);
         expect(
           result.column('id'),
@@ -323,7 +365,7 @@ void main() {
     });
 
     // Zero-copy typed concat/slice/filter (#1.1): data is bulk-copied and the
-    // packed null bitmap is realigned/shifted bit-by-bit — these cases cross byte
+    // packed null bitmap is realigned/shifted bit-by-bit; these cases cross byte
     // boundaries where that logic is easy to get wrong.
     group('typed concat/slice/filter parity (#1.1)', () {
       test('concat across byte boundaries preserves values and nulls', () {
@@ -693,7 +735,7 @@ void main() {
             rightKeys: ['k'],
             joinType: lp.JoinType.semi,
             // A tiny positive threshold forces the grace-partition path (0 would
-            // DISABLE spilling — `spills` is `spillThresholdBytes > 0`).
+            // DISABLE spilling: `spills` is `spillThresholdBytes > 0`).
             options: const EngineOptions(spillThresholdBytes: 256),
           ),
         );
@@ -820,12 +862,6 @@ void main() {
   });
 
   group('where pushdown', () {
-    // AST builders
-    Expression col(String n) => ColumnExpression(column: n);
-    Expression lit(Object? v) => LiteralExpression(v);
-    Expression bin(Expression l, String op, Expression r) =>
-        BinaryExpression(left: l, operator: op, right: r);
-
     // A one-column row group spanning [lo, hi].
     Map<String, ColumnBounds> g(int lo, int hi) => {
       'id': ColumnBounds(
@@ -836,119 +872,6 @@ void main() {
         hasStats: true,
       ),
     };
-
-    group('whereToRowFilter', () {
-      test('col OP literal', () {
-        final f = whereToRowFilter(bin(col('id'), '>', lit(5)))!;
-        expect(f.keep(g(0, 4)), isFalse);
-        expect(f.keep(g(0, 10)), isTrue);
-      });
-
-      test('literal OP col is flipped', () {
-        final f = whereToRowFilter(
-          bin(lit(5), '<', col('id')),
-        )!; // 5 < id => id > 5
-        expect(f.keep(g(0, 4)), isFalse);
-        expect(f.keep(g(6, 10)), isTrue);
-      });
-
-      test('AND of two prunable leaves prunes on either', () {
-        final f = whereToRowFilter(
-          bin(
-            bin(col('id'), '>=', lit(10)),
-            'AND',
-            bin(col('id'), '<', lit(20)),
-          ),
-        )!;
-        expect(f.keep(g(0, 9)), isFalse); // fails id>=10
-        expect(f.keep(g(20, 29)), isFalse); // fails id<20
-        expect(f.keep(g(10, 19)), isTrue);
-      });
-
-      test('AND keeps the prunable side when the other is unprunable', () {
-        final f = whereToRowFilter(
-          bin(bin(col('id'), '>', lit(5)), 'AND', bin(col('a'), '=', col('b'))),
-        )!; // col=col is not prunable
-        expect(f.keep(g(0, 4)), isFalse);
-        expect(f.columns, {'id'});
-      });
-
-      test('OR with an unprunable side yields no filter', () {
-        final f = whereToRowFilter(
-          bin(bin(col('id'), '>', lit(5)), 'OR', bin(col('a'), '=', col('b'))),
-        );
-        expect(f, isNull);
-      });
-
-      // IN is its own node rather than an OR-chain of equalities, so pruning
-      // has to be translated for it explicitly — without this, IN over Parquet
-      // silently stops skipping row groups.
-      test('IN over literals prunes like an OR of equalities', () {
-        final f = whereToRowFilter(
-          InExpression(expression: col('id'), values: [lit(10), lit(30)]),
-        )!;
-        expect(f.keep(g(0, 5)), isFalse, reason: 'holds neither value');
-        expect(f.keep(g(40, 50)), isFalse);
-        expect(f.keep(g(8, 12)), isTrue, reason: 'may hold 10');
-        expect(f.keep(g(25, 35)), isTrue, reason: 'may hold 30');
-        expect(f.columns, {'id'});
-      });
-
-      test('NOT IN prunes a group pinned to an excluded value', () {
-        final f = whereToRowFilter(
-          InExpression(expression: col('id'), values: [lit(10)], negated: true),
-        )!;
-        expect(f.keep(g(10, 10)), isFalse, reason: 'every row is 10');
-        expect(f.keep(g(0, 20)), isTrue);
-      });
-
-      test('a NULL in the list yields no filter', () {
-        // `id IN (10, NULL)` is UNKNOWN rather than TRUE for a non-match, and a
-        // null leaf is not prunable — dropping the filter over-keeps, which is
-        // always safe.
-        expect(
-          whereToRowFilter(
-            InExpression(expression: col('id'), values: [lit(10), lit(null)]),
-          ),
-          isNull,
-        );
-      });
-
-      test('IN over a non-literal or non-column yields no filter', () {
-        expect(
-          whereToRowFilter(
-            InExpression(expression: col('id'), values: [col('other')]),
-          ),
-          isNull,
-        );
-        expect(
-          whereToRowFilter(
-            InExpression(
-              expression: bin(col('id'), '+', lit(1)),
-              values: [lit(2)],
-            ),
-          ),
-          isNull,
-        );
-      });
-
-      test('IN composes inside AND', () {
-        final f = whereToRowFilter(
-          bin(
-            InExpression(expression: col('id'), values: [lit(10), lit(30)]),
-            'AND',
-            bin(col('id'), '<', lit(20)),
-          ),
-        )!;
-        expect(f.keep(g(25, 35)), isFalse, reason: 'fails id<20');
-        expect(f.keep(g(0, 5)), isFalse, reason: 'fails the IN');
-        expect(f.keep(g(8, 12)), isTrue);
-      });
-
-      test('non-comparison (LIKE) yields null', () {
-        expect(whereToRowFilter(bin(col('x'), 'LIKE', lit('a%'))), isNull);
-      });
-    });
 
     group('logicalToRowFilter (#3.1)', () {
       lp.LogicalExpression lcol(String n) =>
@@ -1013,16 +936,16 @@ void main() {
         await ParquetWriter(
           path,
           options: const ParquetWriterOptions(rowGroupSize: 100),
-        ).write(table);
+        ).write(table).ok;
       });
       tearDown(() => dir.deleteSync(recursive: true));
 
       test('WHERE prunes row groups and returns exact rows', () async {
         ParquetReader.rowGroupsPruned = 0;
-        final engine = SqlEngine(allowExternalPaths: true);
-        final result = await engine.execute(
-          "SELECT * FROM '$path' WHERE id >= 500",
-        );
+        final engine = SqlEngine.open(allowExternalPaths: true).ok;
+        final result = await engine
+            .execute("SELECT * FROM '$path' WHERE id >= 500")
+            .ok;
         expect(result.rowCount, 500);
         final ids = result.column('id')!.toList().cast<int>();
         expect(ids.first, 500);
@@ -1036,10 +959,10 @@ void main() {
 
       test('multi-conjunct WHERE prunes both ends through the rule', () async {
         ParquetReader.rowGroupsPruned = 0;
-        final engine = SqlEngine(allowExternalPaths: true);
-        final result = await engine.execute(
-          "SELECT * FROM '$path' WHERE id >= 500 AND id < 800",
-        );
+        final engine = SqlEngine.open(allowExternalPaths: true).ok;
+        final result = await engine
+            .execute("SELECT * FROM '$path' WHERE id >= 500 AND id < 800")
+            .ok;
         final ids = result.column('id')!.toList().cast<int>();
         expect(result.rowCount, 300);
         expect(ids.first, 500);
@@ -1049,10 +972,10 @@ void main() {
 
       test('a non-prunable predicate still returns correct rows', () async {
         ParquetReader.rowGroupsPruned = 0;
-        final engine = SqlEngine(allowExternalPaths: true);
-        final result = await engine.execute(
-          "SELECT * FROM '$path' WHERE name = 'n7'",
-        );
+        final engine = SqlEngine.open(allowExternalPaths: true).ok;
+        final result = await engine
+            .execute("SELECT * FROM '$path' WHERE name = 'n7'")
+            .ok;
         expect(result.rowCount, 1);
         expect(result.column('id')!.toList(), [7]);
       });
@@ -1093,7 +1016,7 @@ void main() {
     test('a positive adjust over the cap throws (not silently crossed)', () {
       final b = SpillBudget(100);
       b.charge(90);
-      expect(() => b.adjust(20), throwsA(isA<StateError>())); // 90+20 > 100
+      expect(() => b.adjust(20), throwsFailure(Kind.limit)); // 90+20 > 100
       expect(b.used, 90, reason: 'a rejected reservation counts nothing');
       b.adjust(-40); // a refund always applies
       expect(b.used, 50);
@@ -1134,7 +1057,7 @@ void main() {
   group('S2 DISTINCT accumulators are bounded', () {
     test('multi-COUNT(DISTINCT) over a low maxOutputRows fails loud', () async {
       final dir = Directory.systemTemp.createTempSync('r48s2_');
-      final engine = SqlEngine(spillDir: dir.path, maxOutputRows: 4);
+      final engine = SqlEngine.open(spillDir: dir.path, maxOutputRows: 4).ok;
       try {
         engine.registerTable(
           't',
@@ -1172,7 +1095,7 @@ void main() {
           engine.execute(
             'SELECT COUNT(DISTINCT a) AS ca, COUNT(DISTINCT b) AS cb FROM t',
           ),
-          throwsA(isA<StateError>()),
+          failsWith(Kind.limit),
         );
       } finally {
         await engine.dispose();
@@ -1189,12 +1112,12 @@ void main() {
 
     test('multi-DISTINCT over large values fails on the byte budget', () async {
       // maxOutputRows: null opts OUT of the count cap, so only the byte budget
-      // (spillThresholdBytes) can arm — a few large distinct values must trip it.
-      final engine = SqlEngine(
+      // (spillThresholdBytes) can arm: a few large distinct values must trip it.
+      final engine = SqlEngine.open(
         spillDir: dir.path,
         maxOutputRows: null,
         spillThresholdBytes: 256,
-      );
+      ).ok;
       final big = 'x' * 500;
       engine.registerTable(
         't',
@@ -1236,7 +1159,7 @@ void main() {
             'SELECT k % 2 AS g, COUNT(DISTINCT a) AS ca, '
             'COUNT(DISTINCT b) AS cb FROM t GROUP BY k % 2',
           ),
-          throwsA(isA<StateError>()),
+          failsWith(Kind.limit),
         );
       } finally {
         await engine.dispose();
@@ -1360,7 +1283,7 @@ void main() {
             fields: [Field(name: 'v', dataType: DataType.int64)],
           ),
         );
-        expect(run.read().toList(), throwsA(isA<StateError>()));
+        expect(run.read().toList(), throwsFailure(Kind.io));
       },
     );
 
@@ -1400,13 +1323,13 @@ void main() {
     test(
       'a hot-key join over the cap throws instead of buffering it all',
       () async {
-        final engine = SqlEngine(spillDir: dir.path, maxOutputRows: 5);
+        final engine = SqlEngine.open(spillDir: dir.path, maxOutputRows: 5).ok;
         // 10 rows all sharing one key -> a self-join yields 100 pairs, over the cap.
         engine.registerTable('a', ids(List.filled(10, 1)));
         engine.registerTable('b', ids(List.filled(10, 1)));
         await expectLater(
           engine.execute('SELECT a.id FROM a JOIN b ON a.id = b.id'),
-          throwsA(isA<StateError>()),
+          failsWith(Kind.limit),
         );
         await engine.dispose();
       },
@@ -1414,13 +1337,13 @@ void main() {
   });
 
   // INTERSECT/EXCEPT dedup their output with an `emitted` RowKey set that grows
-  // with the DISTINCT OUTPUT. Its budget check was gated on `!canRecurse`, which
-  // is false at every depth an ordinary query reaches — so the guard never
+  // with the DISTINCT OUTPUT. Its budget check depended on `!canRecurse`, which
+  // is false at every depth an ordinary query reaches, so the guard never
   // fired, the memory reservation's denial was computed and discarded, and the
   // set grew without limit.
   //
   // It is now built in a first pass and consumed (`remove`) while emitting, so
-  // an overflow can repartition like the input key sets do — recursion is only a
+  // an overflow can repartition like the input key sets do: recursion is only a
   // recovery while nothing has been yielded. These pin the dedup that the
   // two-pass emit performs; a bug there drops or duplicates rows.
   group('set-op output dedup set is bounded', () {
@@ -1445,9 +1368,9 @@ void main() {
     );
 
     /// A tiny budget forces the grace path, so the emitted set must repartition
-    /// rather than grow — the whole point of the guard.
+    /// rather than grow: the whole point of the guard.
     SqlEngine tiny() =>
-        SqlEngine(spillDir: dir.path, spillThresholdBytes: 2048);
+        SqlEngine.open(spillDir: dir.path, spillThresholdBytes: 2048).ok;
 
     test(
       'EXCEPT under a tiny budget is correct and emits each row once',
@@ -1455,9 +1378,9 @@ void main() {
         final e = tiny();
         e.registerTable('l', dupes('l', 12000, 4000));
         e.registerTable('r', dupes('r', 100, 50, from: 100000)); // disjoint
-        final v = (await e.execute(
-          'SELECT v FROM l EXCEPT SELECT v FROM r',
-        )).column('v')!.toList();
+        final v = (await e.execute('SELECT v FROM l EXCEPT SELECT v FROM r').ok)
+            .column('v')!
+            .toList();
         expect(v.length, 4000, reason: 'one row per distinct left value');
         expect(v.toSet().length, 4000, reason: 'no duplicates emitted');
         await e.dispose();
@@ -1470,7 +1393,7 @@ void main() {
       );
       // Many rows, FEW distinct values: the input buffers dominate memory while
       // the distinct-key set stays tiny, so the peak is attributable to the
-      // concat transient (not the dedup set) — that is what makes this test
+      // concat transient (not the dedup set); that is what makes this test
       // sensitive to whether the transient is reserved.
       RecordBatch batch(int from, int n) => RecordBatch(
         columns: [
@@ -1527,7 +1450,7 @@ void main() {
 
       // Tight cap (fits the inputs but not the 2x concat transient): the reserve
       // is denied, the operator spills, and the reserved peak stays at/below the
-      // ceiling — strictMemory is a real bound. The SPILLED result must still be
+      // ceiling: strictMemory is a real bound. The SPILLED result must still be
       // the correct distinct value set, not just the right count.
       final tight = inputBytes + inputBytes ~/ 2;
       final small = await run(tight);
@@ -1541,9 +1464,10 @@ void main() {
         final e = tiny();
         e.registerTable('l', dupes('l', 12000, 4000));
         e.registerTable('r', dupes('r', 9000, 3000)); // overlaps 0..2999
-        final v = (await e.execute(
-          'SELECT v FROM l INTERSECT SELECT v FROM r',
-        )).column('v')!.toList();
+        final v =
+            (await e.execute('SELECT v FROM l INTERSECT SELECT v FROM r').ok)
+                .column('v')!
+                .toList();
         expect(v.length, 3000);
         expect(v.toSet(), {for (var i = 0; i < 3000; i++) i});
         await e.dispose();
@@ -1553,11 +1477,14 @@ void main() {
     test('a tiny budget agrees with the unbounded path', () async {
       Future<List<Object?>> run(int budget, String sql) async {
         final e = budget == 0
-            ? SqlEngine(spillThresholdBytes: 0)
-            : SqlEngine(spillDir: dir.path, spillThresholdBytes: budget);
+            ? SqlEngine.open(spillThresholdBytes: 0).ok
+            : SqlEngine.open(
+                spillDir: dir.path,
+                spillThresholdBytes: budget,
+              ).ok;
         e.registerTable('l', dupes('l', 8000, 2500));
         e.registerTable('r', dupes('r', 6000, 1200));
-        final out = (await e.execute(sql)).column('v')!.toList()
+        final out = (await e.execute(sql).ok).column('v')!.toList()
           ..sort((a, b) => (a as int).compareTo(b as int));
         await e.dispose();
         return out;
@@ -1575,13 +1502,314 @@ void main() {
       final e = tiny();
       e.registerTable('l', dupes('l', 8000, 2000));
       e.registerTable('r', dupes('r', 4000, 900));
-      await e.execute('SELECT v FROM l EXCEPT SELECT v FROM r');
+      await e.execute('SELECT v FROM l EXCEPT SELECT v FROM r').ok;
       await e.dispose();
       expect(
         dir
             .listSync(recursive: true)
             .whereType<File>()
             .where((f) => f.uri.pathSegments.last.startsWith('spill-')),
+        isEmpty,
+      );
+    });
+  });
+
+  group('top-n', () {
+    // 3000 rows in batches of 256: v and s repeat (ties) and hold nulls, id
+    // is unique, so comparing ids checks the exact order ties come out in.
+    const rows = 3000;
+    final table = Table.fromRows('t', [
+      for (var i = 0; i < rows; i++)
+        {
+          'id': i,
+          'v': i % 11 == 0 ? null : (i * 7919) % 37,
+          's': i % 13 == 0 ? null : 's${(i * 31) % 29}',
+          'd': i % 17 == 0 ? null : ((i * 13) % 101) / 4,
+        },
+    ]);
+    PhysicalTableScan scan() =>
+        PhysicalTableScan(tableName: 't', table: table, batchSize: 256);
+    PhysicalColumnExpression col(String name) => PhysicalColumnExpression(
+      name,
+      table.schema.fields.firstWhere((f) => f.name == name).dataType,
+    );
+
+    Future<List<Object?>> ids(PhysicalPlan plan) async {
+      final it = plan.execute();
+      final out = <Object?>[];
+      while (true) {
+        final b = await it.next();
+        if (b == null) break;
+        out.addAll(b.column('id')!.toList());
+      }
+      await it.close();
+      return out;
+    }
+
+    final orders = <String, List<SortExpression> Function()>{
+      'v': () => [SortExpression(expression: col('v'))],
+      'v desc nulls first': () => [
+        SortExpression(
+          expression: col('v'),
+          ascending: false,
+          nullsFirst: true,
+        ),
+      ],
+      'v nulls first': () => [
+        SortExpression(expression: col('v'), nullsFirst: true),
+      ],
+      's, v desc': () => [
+        SortExpression(expression: col('s')),
+        SortExpression(expression: col('v'), ascending: false),
+      ],
+      'd desc': () => [SortExpression(expression: col('d'), ascending: false)],
+    };
+
+    for (final MapEntry(key: label, value: order) in orders.entries) {
+      for (final count in [1, 10, 255, 2999, 5000]) {
+        test('$label, $count rows match the full sort', () async {
+          final top = PhysicalTopN(
+            input: scan(),
+            sortExpressions: order(),
+            count: count,
+          );
+          final full = PhysicalLimit(
+            input: PhysicalSort(input: scan(), sortExpressions: order()),
+            limit: count,
+          );
+          expect(await ids(top), await ids(full));
+        });
+      }
+    }
+
+    test('holds at most count rows between batches', () async {
+      final it =
+          PhysicalTopN(
+                input: scan(),
+                sortExpressions: orders['v']!(),
+                count: 10,
+              ).execute()
+              as TopNIterator;
+      while (await it.next() != null) {}
+      await it.close();
+      expect(it.peak, 10);
+    });
+
+    test('SQL ORDER BY with LIMIT and OFFSET matches the full sort', () async {
+      final engine = SqlEngine.open().ok;
+      addTearDown(engine.dispose);
+      engine.registerTable('t', table);
+      Future<List<Object?>> sql(String query) async => [
+        for (final row in (await engine.execute(query).ok).toRows()) row['id'],
+      ];
+      final full = await sql('SELECT id FROM t ORDER BY s DESC, d');
+      expect(
+        await sql('SELECT id FROM t ORDER BY s DESC, d LIMIT 25 OFFSET 7'),
+        full.sublist(7, 32),
+      );
+    });
+  });
+
+  group('grouped aggregate and the shared memory budget', () {
+    late Directory dir;
+    setUp(() => dir = Directory.systemTemp.createTempSync('agg_memory_'));
+    tearDown(() => dir.deleteSync(recursive: true));
+
+    final schema = Schema(
+      fields: [Field(name: 'k', dataType: DataType.int64, nullable: false)],
+    );
+
+    // 20000 distinct keys, each twice, in batches of 4000 rows.
+    final batches = [
+      for (var from = 0; from < 40000; from += 4000)
+        RecordBatch(
+          columns: [
+            NumericColumn.int64(
+              name: 'k',
+              values: [for (var i = from; i < from + 4000; i++) i % 20000],
+              nullable: false,
+            ),
+          ],
+          schema: schema,
+          rowCount: 4000,
+        ),
+    ];
+
+    AggregateIterator aggregate(
+      RecordBatchIterator input,
+      MemoryManager? memory,
+    ) => AggregateIterator(
+      input: input,
+      groupBy: [PhysicalColumnExpression('k', DataType.int64)],
+      aggregates: [PhysicalCount()],
+      aliases: ['c'],
+      options: EngineOptions(
+        spillThresholdBytes: 1 << 30, // only the shared budget can spill
+        spillDir: dir.path,
+        memory: memory,
+      ),
+    );
+
+    Future<Map<Object?, Object?>> drain(RecordBatchIterator op) async {
+      final counts = <Object?, Object?>{};
+      RecordBatch? b;
+      while ((b = await op.next()) != null) {
+        final keys = b!.column('k')!.toList();
+        final values = b.column('c')!.toList();
+        for (var i = 0; i < keys.length; i++) {
+          counts[keys[i]] = values[i];
+        }
+      }
+      await op.close();
+      return counts;
+    }
+
+    test('a budget below the threshold spills and stays within it', () async {
+      final expected = await drain(
+        aggregate(_ListIterator(schema, batches), null),
+      );
+      expect(expected, hasLength(20000));
+      const budget = 256 * 1024;
+      final manager = _PeakManager(budget);
+      final counts = await drain(
+        aggregate(_ListIterator(schema, batches), manager),
+      );
+      expect(counts, expected);
+      expect(manager.peak, greaterThan(0), reason: 'groups are reserved');
+      expect(manager.peak, lessThanOrEqualTo(budget));
+      expect(
+        manager.denied,
+        greaterThan(0),
+        reason: 'the budget forced a spill',
+      );
+      expect(manager.used, 0);
+    });
+
+    test('a stream closed after its first batch releases its groups', () async {
+      final manager = _PeakManager(1 << 30);
+      final op = aggregate(_ListIterator(schema, batches), manager);
+      expect(await op.next(), isNotNull);
+      expect(manager.used, greaterThan(0));
+      await op.close();
+      expect(manager.used, 0);
+    });
+
+    test('a group the pool refused stays out of the table', () async {
+      // Batch 0 arrives with the pool full, so group 2 goes to a partition;
+      // the pool frees up before batch 1. Group 2 must not then be created in
+      // the table too, or it comes out twice.
+      final manager = MemoryManager(1 << 20, hardCap: true);
+      final input = _CallbackIterator(schema, [
+        (
+          batch: RecordBatch(
+            columns: [
+              NumericColumn.int64(
+                name: 'k',
+                values: [1, 2, 2],
+                nullable: false,
+              ),
+            ],
+            schema: schema,
+            rowCount: 3,
+          ),
+          before: () => manager.reserve(manager.budget - 1),
+        ),
+        (
+          batch: RecordBatch(
+            columns: [
+              NumericColumn.int64(name: 'k', values: [2, 2], nullable: false),
+            ],
+            schema: schema,
+            rowCount: 2,
+          ),
+          before: () => manager.release(manager.budget - 1),
+        ),
+      ]);
+      final counts = await drain(aggregate(input, manager));
+      expect(counts, {1: 1, 2: 4});
+    });
+
+    test('a failing input releases the groups already reserved', () async {
+      final manager = _PeakManager(1 << 30);
+      final op = aggregate(_FailingIterator(schema, batches.first), manager);
+      await expectLater(op.next(), throwsStateError);
+      expect(manager.used, greaterThan(0));
+      await op.close();
+      expect(manager.used, 0);
+    });
+  });
+
+  group('blocking operators release what they hold', () {
+    late Directory dir;
+    setUp(() => dir = Directory.systemTemp.createTempSync('release_'));
+    tearDown(() => dir.deleteSync(recursive: true));
+
+    final schema = Schema(
+      fields: [Field(name: 'k', dataType: DataType.int64, nullable: false)],
+    );
+
+    /// [count] batches of [rows] consecutive values from [start].
+    _ListIterator feed(int start, int count, int rows) =>
+        _ListIterator(schema, [
+          for (var i = 0; i < count; i++)
+            RecordBatch(
+              columns: [
+                NumericColumn.int64(
+                  name: 'k',
+                  values: [for (var j = 0; j < rows; j++) start + i * rows + j],
+                  nullable: false,
+                ),
+              ],
+              schema: schema,
+              rowCount: rows,
+            ),
+        ]);
+
+    test('a set operation closed early returns its reservations', () async {
+      final memory = MemoryManager(1 << 30);
+      final op = SetOpIterator(
+        feed(0, 10, 1000),
+        feed(5, 10, 1000),
+        schema,
+        lp.SetOpType.union,
+        false,
+        EngineOptions(
+          spillThresholdBytes: 20000,
+          spillDir: dir.path,
+          memory: memory,
+        ),
+        schema,
+        schema,
+      );
+      expect(await op.next(), isNotNull);
+      await op.close();
+      expect(memory.used, 0);
+    });
+
+    test('a failed spill finish returns its budget and files', () async {
+      final budget = SpillBudget(2000);
+      final op = SetOpIterator(
+        feed(0, 2, 20),
+        feed(5, 2, 20),
+        schema,
+        lp.SetOpType.union,
+        false,
+        EngineOptions(
+          spillThresholdBytes: 1,
+          spillDir: dir.path,
+          spillBudget: budget,
+        ),
+        schema,
+        schema,
+      );
+      await expectLater(op.next(), throwsA(isA<Failure>()));
+      await op.close();
+      expect(budget.used, 0);
+      expect(
+        dir
+            .listSync(recursive: true)
+            .whereType<File>()
+            .where((file) => file.path.contains('spill-')),
         isEmpty,
       );
     });

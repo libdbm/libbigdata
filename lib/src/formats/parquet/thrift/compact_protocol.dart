@@ -3,7 +3,9 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
-/// A self-contained Thrift Compact Protocol reader/writer — the small subset the
+import '../../../util/varint.dart';
+
+/// A self-contained Thrift Compact Protocol reader/writer: the small subset the
 /// Parquet metadata/page structs need. Replaces the `fbthrift` dependency.
 ///
 /// Field/collection layout per the Thrift Compact Protocol spec: field headers
@@ -106,8 +108,8 @@ const int _cSet = 10;
 const int _cMap = 11;
 const int _cStruct = 12;
 
-int _compactType(int t) {
-  switch (t) {
+int _compactType(int type) {
+  switch (type) {
     case TType.BOOL:
       return _cBoolTrue;
     case TType.BYTE:
@@ -131,12 +133,12 @@ int _compactType(int t) {
     case TType.STRUCT:
       return _cStruct;
     default:
-      throw ArgumentError('No compact type for $t');
+      throw ArgumentError('No compact type for $type');
   }
 }
 
-int _ttype(int c) {
-  switch (c & 0x0f) {
+int _ttype(int code) {
+  switch (code & 0x0f) {
     case 0:
       return TType.STOP;
     case _cBoolTrue:
@@ -163,7 +165,7 @@ int _ttype(int c) {
     case _cStruct:
       return TType.STRUCT;
     default:
-      throw FormatException('Unknown compact type ${c & 0x0f}');
+      throw FormatException('Unknown compact type ${code & 0x0f}');
   }
 }
 
@@ -179,21 +181,13 @@ class CompactWriter implements TProtocol {
 
   Uint8List takeBytes() => _out.toBytes();
 
-  void _byte(int b) => _out.addByte(b & 0xff);
+  void _byte(int value) => _out.addByte(value & 0xff);
 
-  void _varint(int n) {
-    while (true) {
-      if ((n & ~0x7f) == 0) {
-        _byte(n);
-        return;
-      }
-      _byte((n & 0x7f) | 0x80);
-      n >>>= 7;
-    }
-  }
+  void _varint(int value) => writeVarint(_out, value);
 
-  int _zigzag32(int n) => ((n << 1) ^ (n >> 31)) & 0xffffffff;
-  int _zigzag64(int n) => (n << 1) ^ (n >> 63);
+  // A 32-bit zigzag code keeps to 32 bits, as the compact protocol writes it.
+  int _zigzag32(int value) => zigzag(value) & 0xffffffff;
+  int _zigzag64(int value) => zigzag(value);
 
   @override
   void writeStructBegin(TStruct struct) {
@@ -232,11 +226,11 @@ class CompactWriter implements TProtocol {
 
   @override
   void writeListBegin(TList list) {
-    final ct = _compactType(list.elementType);
+    final code = _compactType(list.elementType);
     if (list.length <= 14) {
-      _byte((list.length << 4) | ct);
+      _byte((list.length << 4) | code);
     } else {
-      _byte(0xf0 | ct);
+      _byte(0xf0 | code);
       _varint(list.length & 0xffffffff);
     }
   }
@@ -268,8 +262,8 @@ class CompactWriter implements TProtocol {
 
   @override
   void writeDouble(double value) {
-    final b = ByteData(8)..setFloat64(0, value, Endian.little);
-    _out.add(b.buffer.asUint8List());
+    final bytes = ByteData(8)..setFloat64(0, value, Endian.little);
+    _out.add(bytes.buffer.asUint8List());
   }
 
   @override
@@ -283,43 +277,43 @@ class CompactWriter implements TProtocol {
   }
 
   // Read methods are unsupported on a writer.
-  Never _ro() => throw UnsupportedError('CompactWriter cannot read');
+  Never _unsupported() => throw UnsupportedError('CompactWriter cannot read');
   @override
-  void readStructBegin() => _ro();
+  void readStructBegin() => _unsupported();
   @override
-  void readStructEnd() => _ro();
+  void readStructEnd() => _unsupported();
   @override
-  TField readFieldBegin() => _ro();
+  TField readFieldBegin() => _unsupported();
   @override
-  void readFieldEnd() => _ro();
+  void readFieldEnd() => _unsupported();
   @override
-  TList readListBegin() => _ro();
+  TList readListBegin() => _unsupported();
   @override
-  void readListEnd() => _ro();
+  void readListEnd() => _unsupported();
   @override
-  TMap readMapBegin() => _ro();
+  TMap readMapBegin() => _unsupported();
   @override
-  void readMapEnd() => _ro();
+  void readMapEnd() => _unsupported();
   @override
-  TList readSetBegin() => _ro();
+  TList readSetBegin() => _unsupported();
   @override
-  void readSetEnd() => _ro();
+  void readSetEnd() => _unsupported();
   @override
-  bool readBool() => _ro();
+  bool readBool() => _unsupported();
   @override
-  int readByte() => _ro();
+  int readByte() => _unsupported();
   @override
-  int readI16() => _ro();
+  int readI16() => _unsupported();
   @override
-  int readI32() => _ro();
+  int readI32() => _unsupported();
   @override
-  int readI64() => _ro();
+  int readI64() => _unsupported();
   @override
-  double readDouble() => _ro();
+  double readDouble() => _unsupported();
   @override
-  String readString() => _ro();
+  String readString() => _unsupported();
   @override
-  Int8List readBinary() => _ro();
+  Int8List readBinary() => _unsupported();
 }
 
 // ---------------------------------------------------------------------------
@@ -327,41 +321,37 @@ class CompactWriter implements TProtocol {
 // ---------------------------------------------------------------------------
 
 class CompactReader implements TProtocol {
-  final Uint8List _b;
-  int _pos = 0;
+  final Uint8List _bytes;
+  int _position = 0;
   final List<int> _fieldStack = [];
   int _lastFieldId = 0;
   bool? _boolValue;
 
-  CompactReader(this._b);
+  CompactReader(this._bytes);
 
   /// Bytes consumed so far (callers seek past non-length-prefixed page headers).
-  int get consumed => _pos;
+  int get consumed => _position;
 
   int _byte() {
     // Bounds-check: a truncated/corrupt buffer must fail as a domain
     // FormatException, not a raw RangeError.
-    if (_pos >= _b.length) {
+    if (_position >= _bytes.length) {
       throw const FormatException('Truncated Thrift compact buffer');
     }
-    return _b[_pos++];
+    return _bytes[_position++];
   }
 
   int _varint() {
-    int result = 0;
-    int shift = 0;
-    // A 64-bit varint is at most 10 bytes; cap the loop so a corrupt run of
-    // continuation bytes (0x80) can't spin / overrun.
-    for (int i = 0; i < 10; i++) {
-      final b = _byte();
-      result |= (b & 0x7f) << shift;
-      if ((b & 0x80) == 0) return result;
-      shift += 7;
-    }
-    throw const FormatException('Thrift varint exceeds 64 bits (corrupt)');
+    final (:value, :next) = readVarint(
+      _bytes,
+      _position,
+      label: 'Thrift compact buffer',
+    );
+    _position = next;
+    return value;
   }
 
-  int _zigzagToInt(int n) => (n >>> 1) ^ -(n & 1);
+  int _zigzagToInt(int value) => unzigzag(value);
 
   @override
   void readStructBegin() {
@@ -394,7 +384,7 @@ class CompactReader implements TProtocol {
     final header = _byte();
     var length = (header >> 4) & 0x0f;
     if (length == 15) length = _varint();
-    return TList(_ttype(header & 0x0f), length);
+    return TList(_ttype(header & 0x0f), _fits(length));
   }
 
   @override
@@ -403,8 +393,22 @@ class CompactReader implements TProtocol {
   @override
   TMap readMapBegin() {
     final length = _varint();
-    final kv = length == 0 ? 0 : _byte();
-    return TMap(_ttype(kv >> 4), _ttype(kv & 0x0f), length);
+    final types = length == 0 ? 0 : _byte();
+    return TMap(_ttype(types >> 4), _ttype(types & 0x0f), _fits(length));
+  }
+
+  /// [length], the declared element count of a container, when its elements
+  /// can fit in the bytes left: every element takes at least one byte, so a
+  /// larger count is corrupt (and would otherwise drive a loop, or an
+  /// allocation, by a number the input chose).
+  int _fits(int length) {
+    final left = _bytes.length - _position;
+    if (length > left) {
+      throw FormatException(
+        'Thrift container declares $length elements but $left bytes remain',
+      );
+    }
+    return length;
   }
 
   @override
@@ -418,10 +422,10 @@ class CompactReader implements TProtocol {
 
   @override
   bool readBool() {
-    final v = _boolValue;
-    if (v != null) {
+    final value = _boolValue;
+    if (value != null) {
       _boolValue = null;
-      return v;
+      return value;
     }
     return _byte() == _cBoolTrue;
   }
@@ -438,12 +442,12 @@ class CompactReader implements TProtocol {
   @override
   int readI64() => _zigzagToInt(_varint());
 
-  /// Guard that [n] more bytes are within the logical buffer [_b]. Without this,
-  /// readDouble's `ByteData.view(_b.buffer, …)` would read adjacent PARENT-buffer
+  /// Guard that [count] more bytes are within the logical buffer [_bytes]. Without this,
+  /// readDouble's `ByteData.view(_bytes.buffer, …)` would read adjacent PARENT-buffer
   /// bytes past a slice (memory disclosure), and the string/binary slices would
   /// throw a raw RangeError instead of a domain FormatException.
-  void _need(int n) {
-    if (n < 0 || _pos + n > _b.length) {
+  void _need(int count) {
+    if (count < 0 || _position + count > _bytes.length) {
       throw const FormatException('Truncated Thrift compact buffer');
     }
   }
@@ -451,65 +455,67 @@ class CompactReader implements TProtocol {
   @override
   double readDouble() {
     _need(8);
-    final v = ByteData.view(
-      _b.buffer,
-      _b.offsetInBytes + _pos,
+    final value = ByteData.view(
+      _bytes.buffer,
+      _bytes.offsetInBytes + _position,
       8,
     ).getFloat64(0, Endian.little);
-    _pos += 8;
-    return v;
+    _position += 8;
+    return value;
   }
 
   @override
   String readString() {
     final length = _varint();
     _need(length);
-    final s = utf8.decode(Uint8List.sublistView(_b, _pos, _pos + length));
-    _pos += length;
-    return s;
+    final text = utf8.decode(
+      Uint8List.sublistView(_bytes, _position, _position + length),
+    );
+    _position += length;
+    return text;
   }
 
   @override
   Int8List readBinary() {
     final length = _varint();
     _need(length);
-    final out = Int8List.sublistView(_b, _pos, _pos + length);
-    _pos += length;
+    final out = Int8List.sublistView(_bytes, _position, _position + length);
+    _position += length;
     return out;
   }
 
   // Write methods are unsupported on a reader.
-  Never _wo() => throw UnsupportedError('CompactReader cannot write');
+  Never _unsupported() => throw UnsupportedError('CompactReader cannot write');
   @override
-  void writeStructBegin(TStruct struct) => _wo();
+  void writeStructBegin(TStruct struct) => _unsupported();
   @override
-  void writeStructEnd() => _wo();
+  void writeStructEnd() => _unsupported();
   @override
-  void writeFieldBegin(TField field) => _wo();
+  void writeFieldBegin(TField field) => _unsupported();
   @override
-  void writeFieldEnd() => _wo();
+  void writeFieldEnd() => _unsupported();
   @override
-  void writeFieldStop() => _wo();
+  void writeFieldStop() => _unsupported();
   @override
-  void writeListBegin(TList list) => _wo();
+  void writeListBegin(TList list) => _unsupported();
   @override
-  void writeListEnd() => _wo();
+  void writeListEnd() => _unsupported();
   @override
-  void writeBool(bool value) => _wo();
+  void writeBool(bool value) => _unsupported();
   @override
-  void writeByte(int value) => _wo();
+  void writeByte(int value) => _unsupported();
   @override
-  void writeI16(int value) => _wo();
+  void writeI16(int value) => _unsupported();
   @override
-  void writeI32(int value) => _wo();
+  void writeI32(int value) => _unsupported();
   @override
-  void writeI64(int value) => _wo();
+  void writeI64(int value) => _unsupported();
   @override
-  void writeDouble(double value) => _wo();
+  void writeDouble(double value) => _unsupported();
   @override
-  void writeString(String value) => _wo();
+  void writeString(String value) => _unsupported();
   @override
-  void writeBinary(Int8List value) => _wo();
+  void writeBinary(Int8List value) => _unsupported();
 }
 
 /// Skips an unknown field value of [type].
@@ -518,63 +524,63 @@ class TProtocolUtil {
   /// overflow the stack.
   static const _maxDepth = 64;
 
-  static void skip(TProtocol p, int type, [int depth = 0]) {
+  static void skip(TProtocol protocol, int type, [int depth = 0]) {
     if (depth > _maxDepth) {
       throw FormatException('Thrift nesting exceeds max depth $_maxDepth');
     }
     switch (type) {
       case TType.BOOL:
-        p.readBool();
+        protocol.readBool();
         break;
       case TType.BYTE:
-        p.readByte();
+        protocol.readByte();
         break;
       case TType.I16:
-        p.readI16();
+        protocol.readI16();
         break;
       case TType.I32:
-        p.readI32();
+        protocol.readI32();
         break;
       case TType.I64:
-        p.readI64();
+        protocol.readI64();
         break;
       case TType.DOUBLE:
-        p.readDouble();
+        protocol.readDouble();
         break;
       case TType.STRING:
-        p.readBinary();
+        protocol.readBinary();
         break;
       case TType.STRUCT:
-        p.readStructBegin();
+        protocol.readStructBegin();
         while (true) {
-          final f = p.readFieldBegin();
-          if (f.type == TType.STOP) break;
-          skip(p, f.type, depth + 1);
-          p.readFieldEnd();
+          final field = protocol.readFieldBegin();
+          if (field.type == TType.STOP) break;
+          skip(protocol, field.type, depth + 1);
+          protocol.readFieldEnd();
         }
-        p.readStructEnd();
+        protocol.readStructEnd();
         break;
       case TType.LIST:
-        final l = p.readListBegin();
-        for (int i = 0; i < l.length; i++) {
-          skip(p, l.elementType, depth + 1);
+        final list = protocol.readListBegin();
+        for (int i = 0; i < list.length; i++) {
+          skip(protocol, list.elementType, depth + 1);
         }
-        p.readListEnd();
+        protocol.readListEnd();
         break;
       case TType.SET:
-        final s = p.readSetBegin();
-        for (int i = 0; i < s.length; i++) {
-          skip(p, s.elementType, depth + 1);
+        final members = protocol.readSetBegin();
+        for (int i = 0; i < members.length; i++) {
+          skip(protocol, members.elementType, depth + 1);
         }
-        p.readSetEnd();
+        protocol.readSetEnd();
         break;
       case TType.MAP:
-        final m = p.readMapBegin();
-        for (int i = 0; i < m.length; i++) {
-          skip(p, m.keyType, depth + 1);
-          skip(p, m.valueType, depth + 1);
+        final entries = protocol.readMapBegin();
+        for (int i = 0; i < entries.length; i++) {
+          skip(protocol, entries.keyType, depth + 1);
+          skip(protocol, entries.valueType, depth + 1);
         }
-        p.readMapEnd();
+        protocol.readMapEnd();
         break;
       default:
         throw FormatException('Cannot skip unknown type $type');

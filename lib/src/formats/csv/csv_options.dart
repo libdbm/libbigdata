@@ -4,7 +4,7 @@ import '../../core/schema.dart';
 
 /// Options for CSV reading and writing
 @immutable
-class CsvOptions {
+final class CsvOptions {
   /// Field delimiter character
   final String delimiter;
 
@@ -46,10 +46,10 @@ class CsvOptions {
   /// value silently mismatches the writer and an empty one throws a RangeError),
   /// and a `nullOutput` sentinel must be non-empty and never need quoting.
   void validate() {
-    void single(String name, String v) {
-      if (v.length != 1) {
+    void single(String name, String value) {
+      if (value.length != 1) {
         throw ArgumentError(
-          'CsvOptions.$name must be exactly one character (got "$v")',
+          'CsvOptions.$name must be exactly one character (got "$value")',
         );
       }
     }
@@ -167,7 +167,7 @@ class CsvOptions {
   });
 
   /// Options with TYPE inference and field trimming enabled. Despite the name,
-  /// this does NOT sniff the delimiter/quote/terminator — there is no dialect
+  /// this does NOT sniff the delimiter/quote/terminator; there is no dialect
   /// detection; pass [delimiter] etc. explicitly for non-default dialects.
   /// (Kept under this name for compatibility.)
   factory CsvOptions.autoDetect() {
@@ -195,8 +195,8 @@ class CsvOptions {
   }
 
   /// Sentinel distinguishing "argument omitted" (keep the current value) from an
-  /// explicit `null` (clear it) for the nullable options — `x ?? this.x` can't
-  /// tell those apart, so passing `maxRows: null` / `schema: null` etc. used to
+  /// explicit `null` (clear it) for the nullable options: `x ?? this.x` can't
+  /// tell those apart, so passing `maxRows: null` / `schema: null` etc. would
   /// silently retain the old value (a stale schema or a still-active safety cap).
   static const Object _keep = Object();
 
@@ -270,17 +270,4 @@ class CsvOptions {
       strict: strict ?? this.strict,
     );
   }
-}
-
-/// Result of CSV delimiter detection
-class DelimiterDetectionResult {
-  final String delimiter;
-  final double confidence;
-  final int consistency;
-
-  const DelimiterDetectionResult({
-    required this.delimiter,
-    required this.confidence,
-    required this.consistency,
-  });
 }

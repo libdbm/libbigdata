@@ -23,12 +23,14 @@ import 'schema_levels.dart';
 /// date→epoch days (int), timestamp→epoch micros (int), decimal→unscaled int
 /// (INT32/INT64) or big-endian two's-complement bytes (FLBA). Other types pass
 /// through unchanged.
-dynamic toPhysicalValue(DataType type, int precision, dynamic v) {
-  if (v == null) return null;
-  if (type == DataType.date) return dateToEpochDays(v as DateTime);
-  if (type == DataType.timestamp) return timestampToEpochMicros(v as DateTime);
+dynamic toPhysicalValue(DataType type, int precision, dynamic value) {
+  if (value == null) return null;
+  if (type == DataType.date) return dateToEpochDays(value as DateTime);
+  if (type == DataType.timestamp) {
+    return timestampToEpochMicros(value as DateTime);
+  }
   if (type == DataType.decimal) {
-    final unscaled = v as BigInt;
+    final unscaled = value as BigInt;
     final layout = decimalLayout(precision);
     if (layout.type == thrift.ParquetType.int32 ||
         layout.type == thrift.ParquetType.int64) {
@@ -36,7 +38,7 @@ dynamic toPhysicalValue(DataType type, int precision, dynamic v) {
     }
     return bigIntToBytes(unscaled, layout.typeLength!, littleEndian: false);
   }
-  return v;
+  return value;
 }
 
 /// Converts between Parquet schema and internal schema representations
@@ -55,24 +57,30 @@ class SchemaConverter {
         // Primitive elements have a type
         final path = leaf < paths.length ? paths[leaf] : element.name!;
         final dataType = convertType(element);
-        // uint64 reads as decimal(20,0); other decimals carry the file's params.
+        // uint64 reads as decimal(20,0); other decimals carry the file's params,
+        // which are untrusted and checked.
         final unsigned = unsignedInfo(element);
+        final precision = dataType == DataType.decimal
+            ? (unsigned?.precision ??
+                  element.logicalType?.decimal?.precision ??
+                  element.precision)
+            : null;
+        final scale = dataType == DataType.decimal
+            ? (unsigned?.scale ??
+                  element.logicalType?.decimal?.scale ??
+                  element.scale)
+            : null;
+        if (precision != null || scale != null) {
+          checkedDecimal(precision ?? maxDecimalPrecision, scale ?? 0);
+        }
         fields.add(
           ParquetSchemaField(
             name: path,
             dataType: dataType,
             // Nested (dotted) columns are reconstructed as lists, so nullable.
             nullable: isNullable(element) || path.contains('.'),
-            precision: dataType == DataType.decimal
-                ? (unsigned?.precision ??
-                      element.logicalType?.decimal?.precision ??
-                      element.precision)
-                : null,
-            scale: dataType == DataType.decimal
-                ? (unsigned?.scale ??
-                      element.logicalType?.decimal?.scale ??
-                      element.scale)
-                : null,
+            precision: precision,
+            scale: scale,
             id: element.fieldId,
           ),
         );
@@ -116,8 +124,8 @@ class SchemaConverter {
               .id // Iceberg field-id on the struct group
           ..numChildren = field.children.length,
       );
-      for (final c in field.children) {
-        _emitField(c, out);
+      for (final child in field.children) {
+        _emitField(child, out);
       }
       return;
     }
@@ -159,7 +167,11 @@ class SchemaConverter {
           ..repetitionType = thrift.FieldRepetitionType.repeated
           ..numChildren = 2,
       );
-      _emitField(entries.children[0].copyWith(name: 'key'), out);
+      // Map keys are required by the spec; pyarrow refuses optional ones.
+      _emitField(
+        entries.children[0].copyWith(name: 'key', nullable: false),
+        out,
+      );
       _emitField(entries.children[1].copyWith(name: 'value'), out);
       return;
     }
@@ -167,8 +179,11 @@ class SchemaConverter {
     out.add(scalarElement(field));
   }
 
-  /// The Parquet [SchemaElement] for a scalar [field] (physical type + legacy
-  /// converted-type annotation + decimal scale/precision/typeLength).
+  /// The Parquet [SchemaElement] for a scalar [field] (physical type, the
+  /// modern LogicalType and the legacy converted-type annotation, decimal
+  /// scale/precision/typeLength). Writing both annotations lets current
+  /// readers see a UTC timestamp (pyarrow's `timestamp[us, tz=UTC]`) and older
+  /// ones still read the column.
   thrift.SchemaElement scalarElement(core.Field field) {
     final element = thrift.SchemaElement()
       ..name = field.name
@@ -186,6 +201,10 @@ class SchemaConverter {
       element.scale = field.scale ?? 0;
       element.precision = precision;
       element.convertedType = thrift.ConvertedType.decimal;
+      element.logicalType = thrift.LogicalType()
+        ..decimal = (thrift.DecimalType()
+          ..scale = element.scale
+          ..precision = precision);
     } else {
       element.type = toParquetType(field.dataType);
       element.convertedType = switch (field.dataType) {
@@ -197,6 +216,17 @@ class SchemaConverter {
         // widening to int32.
         DataType.int8 => thrift.ConvertedType.int8,
         DataType.int16 => thrift.ConvertedType.int16,
+        _ => null,
+      };
+      element.logicalType = switch (field.dataType) {
+        DataType.string => thrift.LogicalType()..string = thrift.StringType(),
+        DataType.date => thrift.LogicalType()..date = thrift.DateType(),
+        // Stored as UTC microseconds since the epoch.
+        DataType.timestamp =>
+          thrift.LogicalType()
+            ..timestamp = (thrift.TimestampType()
+              ..isAdjustedToUTC = true
+              ..unit = (thrift.TimeUnit()..micros = thrift.MicroSeconds())),
         _ => null,
       };
     }
@@ -212,7 +242,11 @@ class SchemaConverter {
     // Check logical type first
     if (element.logicalType != null) {
       final logical = element.logicalType!;
-      if (logical.string != null) return DataType.string;
+      if (logical.string != null ||
+          logical.json != null ||
+          logical.enum_ != null) {
+        return DataType.string;
+      }
       if (logical.date != null) return DataType.date;
       if (logical.timestamp != null) return DataType.timestamp;
       if (logical.decimal != null) return DataType.decimal;
@@ -225,6 +259,8 @@ class SchemaConverter {
     if (element.convertedType != null) {
       switch (element.convertedType!) {
         case thrift.ConvertedType.utf8:
+        case thrift.ConvertedType.json:
+        case thrift.ConvertedType.enum_:
           return DataType.string;
         case thrift.ConvertedType.date:
           return DataType.date;
@@ -237,6 +273,10 @@ class SchemaConverter {
           return DataType.int8;
         case thrift.ConvertedType.int16:
           return DataType.int16;
+        case thrift.ConvertedType.int32:
+          return DataType.int32;
+        case thrift.ConvertedType.int64:
+          return DataType.int64;
         default:
           break;
       }
@@ -275,12 +315,12 @@ class SchemaConverter {
   /// The single source of truth for an UNSIGNED Parquet integer column (via
   /// either the modern `logicalType.integer{isSigned:false}` or the legacy
   /// `convertedType.uint*`). Returns its bit-width, the libbigdata type it reads
-  /// as, and decimal precision/scale when applicable — null for signed columns.
+  /// as, and decimal precision/scale when applicable: null for signed columns.
   ///
   /// uint8/16/32 widen to the next signed type that holds the full range
   /// (int16/int32/int64), so e.g. uint32 4000000000 is not read as a negative.
   /// uint64 exceeds int64, so it reads as `decimal(20,0)` (BigInt-backed, the
-  /// same mapping Spark uses) — lossless, never wrapping. Drives [convertType],
+  /// same mapping Spark uses): lossless, never wrapping. Drives [convertType],
   /// [fromParquetSchema] precision/scale, and the reader's reinterpretation.
   static ({int bits, DataType type, int? precision, int? scale})? unsignedInfo(
     thrift.SchemaElement element,
@@ -307,14 +347,14 @@ class SchemaConverter {
     };
   }
 
-  /// Reinterpret a signed physical integer [v] (read as two's-complement) as the
+  /// Reinterpret a signed physical integer [value] (read as two's-complement) as the
   /// unsigned value of the given [bits]. uint8/16/32 stay `int` (lossless in
   /// int64); the constant modulus avoids `1 << 32` wrapping to 1 under JS.
   /// uint64 cannot fit int64, so it returns a [BigInt] (full range, no loss).
-  static Object reinterpretUnsigned(int v, int bits) {
-    if (bits >= 64) return BigInt.from(v).toUnsigned(64);
-    if (v >= 0) return v;
-    return v + const {8: 0x100, 16: 0x10000, 32: 0x100000000}[bits]!;
+  static Object reinterpretUnsigned(int value, int bits) {
+    if (bits >= 64) return BigInt.from(value).toUnsigned(64);
+    if (value >= 0) return value;
+    return value + const {8: 0x100, 16: 0x10000, 32: 0x100000000}[bits]!;
   }
 
   /// Check if element is nullable
@@ -350,60 +390,6 @@ class SchemaConverter {
         return thrift.ParquetType.byteArray;
     }
   }
-
-  /// Get logical type for data type
-  thrift.LogicalType? getLogicalType(DataType type) {
-    switch (type) {
-      case DataType.string:
-        return thrift.LogicalType()..string = thrift.StringType();
-      case DataType.date:
-        return thrift.LogicalType()..date = thrift.DateType();
-      case DataType.timestamp:
-        return thrift.LogicalType()
-          ..timestamp = (thrift.TimestampType()
-            ..isAdjustedToUTC = true
-            ..unit = (thrift.TimeUnit()..millis = thrift.MilliSeconds()));
-      case DataType.decimal:
-        return thrift.LogicalType()
-          ..decimal = (thrift.DecimalType()
-            ..scale = 2
-            ..precision = 10);
-      case DataType.int8:
-        return thrift.LogicalType()
-          ..integer = (thrift.IntType()
-            ..bitWidth = 8
-            ..isSigned = true);
-      case DataType.int16:
-        return thrift.LogicalType()
-          ..integer = (thrift.IntType()
-            ..bitWidth = 16
-            ..isSigned = true);
-      // Note: DataType doesn't have unsigned types, handled via ConvertedType
-      default:
-        return null;
-    }
-  }
-
-  /// Get converted type for data type
-  thrift.ConvertedType? getConvertedType(DataType type) {
-    switch (type) {
-      case DataType.string:
-        return thrift.ConvertedType.utf8;
-      case DataType.date:
-        return thrift.ConvertedType.date;
-      case DataType.timestamp:
-        return thrift.ConvertedType.timestampMillis;
-      case DataType.decimal:
-        return thrift.ConvertedType.decimal;
-      case DataType.int8:
-        return thrift.ConvertedType.int8;
-      case DataType.int16:
-        return thrift.ConvertedType.int16;
-      // Note: DataType doesn't have unsigned types
-      default:
-        return null;
-    }
-  }
 }
 
 /// Extended Parquet schema with fields
@@ -425,7 +411,7 @@ class ParquetSchemaField {
   final int? scale;
 
   /// The Parquet field-id (from the SchemaElement), when present. Iceberg/Spark
-  /// use file-level field-ids so a renamed column still resolves by id — the
+  /// use file-level field-ids so a renamed column still resolves by id: the
   /// physical name in an old file may differ from the current schema's name.
   final int? id;
 

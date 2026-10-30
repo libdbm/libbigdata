@@ -7,6 +7,8 @@ import 'dart:io';
 import 'package:libbigdata/libbigdata.dart';
 import 'package:test/test.dart';
 
+import '../support/results.dart';
+
 /// cross-engine validation of nested Parquet WRITES. Prior
 /// rounds only self-round-tripped nested output (libbigdata read its own bytes),
 /// so a subtly wrong Dremel rep/def computation could pass while pyarrow
@@ -113,9 +115,9 @@ void main() {
         ),
       );
 
-      test('pyarrow reassembles list / struct / map identically', () async {
-        final path = '${tmp.path}/n.parquet';
-        await ParquetWriter(path).write(nested());
+    test('pyarrow reassembles list / struct / map identically', () async {
+      final path = '${tmp.path}/n.parquet';
+      await ParquetWriter(path).write(nested()).ok;
 
         // Read with pyarrow and emit normalized JSON (maps → dict, [] for empty).
         const script = '''
@@ -150,7 +152,124 @@ print(json.dumps([{k: norm(k, v) for k, v in r.items()} for r in rows]))
           {'p': 7},
         ]);
       });
-    },
-    skip: pyarrow() ? false : 'pyarrow not installed',
-  );
+
+    test('pyarrow reads a map whose key field is nullable', () async {
+      // Field defaults to nullable; map keys are still written REQUIRED,
+      // since pyarrow refuses optional ones.
+      final path = '${tmp.path}/m.parquet';
+      final schema = Schema(
+        fields: [
+          Field(
+            name: 'm',
+            dataType: DataType.map,
+            children: [
+              Field(
+                name: 'entries',
+                dataType: DataType.struct,
+                nullable: false,
+                children: [
+                  Field(name: 'key', dataType: DataType.string),
+                  Field(name: 'value', dataType: DataType.int64),
+                ],
+              ),
+            ],
+          ),
+        ],
+      );
+      await ParquetWriter(path)
+          .write(
+            Table(
+              name: 't',
+              schema: schema,
+              columns: [
+                ListColumn<Map<String, int>?>(
+                  name: 'm',
+                  dataType: DataType.map,
+                  data: [
+                    {'a': 1},
+                    null,
+                  ],
+                ),
+              ],
+            ),
+          )
+          .ok;
+      final r = Process.runSync('python3', [
+        '-c',
+        'import sys, pyarrow.parquet as pq; '
+            'print(pq.read_table(sys.argv[1]).column("m").to_pylist())',
+        path,
+      ]);
+      expect(r.exitCode, 0, reason: r.stderr.toString());
+      expect((r.stdout as String).trim(), "[[('a', 1)], None]");
+    });
+
+    test('pyarrow sees the logical types of scalar columns', () async {
+      final path = '${tmp.path}/logical.parquet';
+      await ParquetWriter(path)
+          .write(
+            Table(
+              name: 't',
+              schema: Schema(
+                fields: [
+                  Field(name: 'ts', dataType: DataType.timestamp),
+                  Field(name: 'day', dataType: DataType.date),
+                  Field(name: 's', dataType: DataType.string),
+                  Field(
+                    name: 'd',
+                    dataType: DataType.decimal,
+                    precision: 10,
+                    scale: 2,
+                  ),
+                ],
+              ),
+              columns: [
+                ListColumn<DateTime>(
+                  name: 'ts',
+                  dataType: DataType.timestamp,
+                  data: [DateTime.utc(2024, 1, 2, 3, 4, 5)],
+                ),
+                ListColumn<DateTime>(
+                  name: 'day',
+                  dataType: DataType.date,
+                  data: [DateTime.utc(2024, 1, 2)],
+                ),
+                ListColumn<String>(
+                  name: 's',
+                  dataType: DataType.string,
+                  data: ['x'],
+                ),
+                ListColumn<BigInt>(
+                  name: 'd',
+                  dataType: DataType.decimal,
+                  data: [BigInt.from(150)],
+                ),
+              ],
+            ),
+          )
+          .ok;
+      // pyarrow derives the Arrow types from the legacy converted types
+      // alone; the raw Parquet logical type shows whether the file itself
+      // carried one.
+      const script = '''
+import sys, json
+import pyarrow.parquet as pq
+schema = pq.read_schema(sys.argv[1])
+raw = pq.ParquetFile(sys.argv[1]).metadata.schema
+print(json.dumps({
+  'types': {f.name: str(f.type) for f in schema},
+  'raw': str(raw.column(0).logical_type),
+}))
+''';
+      final r = Process.runSync('python3', ['-c', script, path]);
+      expect(r.exitCode, 0, reason: r.stderr.toString());
+      final report = jsonDecode(r.stdout as String) as Map<String, dynamic>;
+      expect(report['raw'], contains('is_from_converted_type=false'));
+      final types = report['types'] as Map<String, dynamic>;
+      expect(types['ts'], 'timestamp[us, tz=UTC]');
+      expect(types['day'], 'date32[day]');
+      expect(types['s'], 'string');
+      expect(types['d'], 'decimal128(10, 2)');
+    });
+  }, skip: pyarrow() ? false : 'pyarrow not installed');
 }

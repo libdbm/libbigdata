@@ -131,6 +131,97 @@ def gen_pyice():
     table.append(data)
 
 
+# --- pyiceberg: a column dropped and re-added under the same name ------------
+def gen_pyice_readd():
+    import pyarrow as pa
+    from pyiceberg.catalog.sql import SqlCatalog
+    from pyiceberg.types import StringType
+
+    warehouse = f"{OUT}/pyice_readd"
+    os.makedirs(warehouse, exist_ok=True)
+    catalog = SqlCatalog(
+        "ice",
+        **{
+            "uri": f"sqlite:///{warehouse}/catalog.db",
+            "warehouse": f"file://{warehouse}",
+        },
+    )
+    old = pa.table({
+        "id": pa.array([1, 2], pa.int64()),
+        "a": pa.array(["old1", "old2"]),
+    })
+    catalog.create_namespace_if_not_exists("db")
+    table = catalog.create_table("db.t", schema=old.schema, location=f"{warehouse}/t")
+    table.append(old)
+    with table.update_schema() as update:
+        update.delete_column("a")
+    with table.update_schema() as update:
+        update.add_column("a", StringType())
+    table = catalog.load_table("db.t")
+    table.append(pa.table({
+        "id": pa.array([3], pa.int64()),
+        "a": pa.array(["new3"]),
+    }))
+
+
+# --- pyiceberg: a tag on the first of three snapshots ------------------------
+def gen_pyice_tag():
+    import time
+    import pyarrow as pa
+    from pyiceberg.catalog.sql import SqlCatalog
+
+    warehouse = f"{OUT}/pyice_tag"
+    os.makedirs(warehouse, exist_ok=True)
+    catalog = SqlCatalog(
+        "ice",
+        **{
+            "uri": f"sqlite:///{warehouse}/catalog.db",
+            "warehouse": f"file://{warehouse}",
+        },
+    )
+    first = pa.table({"id": pa.array([1], pa.int64())})
+    catalog.create_namespace_if_not_exists("db")
+    table = catalog.create_table("db.t", schema=first.schema, location=f"{warehouse}/t")
+    table.append(first)
+    tagged = table.current_snapshot().snapshot_id
+    table.manage_snapshots().create_tag(tagged, "v1").commit()
+    table = catalog.load_table("db.t")
+    time.sleep(0.02)
+    table.overwrite(pa.table({"id": pa.array([2], pa.int64())}))
+    time.sleep(0.02)
+    table.append(pa.table({"id": pa.array([3], pa.int64())}))
+
+
+# --- pyiceberg: a plain Parquet file added, then a column renamed ------------
+def gen_pyice_mapped():
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from pyiceberg.catalog.sql import SqlCatalog
+
+    warehouse = f"{OUT}/pyice_mapped"
+    os.makedirs(f"{warehouse}/raw", exist_ok=True)
+    catalog = SqlCatalog(
+        "ice",
+        **{
+            "uri": f"sqlite:///{warehouse}/catalog.db",
+            "warehouse": f"file://{warehouse}",
+        },
+    )
+    data = pa.table({
+        "id": pa.array([1, 2], pa.int64()),
+        "a": pa.array(["x", "y"]),
+    })
+    # Written by pyarrow, so the file carries no Iceberg field ids.
+    pq.write_table(data, f"{warehouse}/raw/f.parquet")
+    catalog.create_namespace_if_not_exists("db")
+    table = catalog.create_table("db.t", schema=data.schema, location=f"{warehouse}/t")
+    table.add_files([f"{warehouse}/raw/f.parquet"])
+    table = catalog.load_table("db.t")
+    # pyiceberg records the old name in schema.name-mapping.default.
+    with table.update_schema() as update:
+        update.rename_column("a", "b")
+
+
 # --- fastavro: logical types (date, timestamp, decimal) -----------------------
 def gen_avro():
     import datetime
@@ -198,6 +289,9 @@ attempt("pa_bss", gen_pa_bss)
 attempt("pa_uint", gen_pa_uint)
 attempt("drs_delta", gen_drs_delta)
 attempt("pyice", gen_pyice)
+attempt("pyice_readd", gen_pyice_readd)
+attempt("pyice_tag", gen_pyice_tag)
+attempt("pyice_mapped", gen_pyice_mapped)
 attempt("avro", gen_avro)
 attempt("spark_nested", gen_spark_nested)
 

@@ -11,7 +11,8 @@ class ColumnExpression extends Expression {
   String get qualifiedName => table != null ? '$table.$column' : column;
 
   @override
-  R accept<R>(ASTVisitor<R> visitor) => visitor.visitColumnExpression(this);
+  R accept<R>(ExpressionVisitor<R> visitor) =>
+      visitor.visitColumnExpression(this);
 }
 
 /// Literal value expression
@@ -21,7 +22,8 @@ class LiteralExpression extends Expression {
   LiteralExpression(this.value);
 
   @override
-  R accept<R>(ASTVisitor<R> visitor) => visitor.visitLiteralExpression(this);
+  R accept<R>(ExpressionVisitor<R> visitor) =>
+      visitor.visitLiteralExpression(this);
 }
 
 /// Binary operator expression
@@ -37,7 +39,8 @@ class BinaryExpression extends Expression {
   });
 
   @override
-  R accept<R>(ASTVisitor<R> visitor) => visitor.visitBinaryExpression(this);
+  R accept<R>(ExpressionVisitor<R> visitor) =>
+      visitor.visitBinaryExpression(this);
 }
 
 /// Unary operator expression
@@ -48,7 +51,8 @@ class UnaryExpression extends Expression {
   UnaryExpression({required this.operator, required this.operand});
 
   @override
-  R accept<R>(ASTVisitor<R> visitor) => visitor.visitUnaryExpression(this);
+  R accept<R>(ExpressionVisitor<R> visitor) =>
+      visitor.visitUnaryExpression(this);
 }
 
 /// Function call expression
@@ -57,18 +61,17 @@ class FunctionExpression extends Expression {
   final List<Expression> arguments;
   final bool distinct;
   final Expression? filter;
-  final WindowExpression? window;
 
   FunctionExpression({
     required this.name,
     this.arguments = const [],
     this.distinct = false,
     this.filter,
-    this.window,
   });
 
   @override
-  R accept<R>(ASTVisitor<R> visitor) => visitor.visitFunctionExpression(this);
+  R accept<R>(ExpressionVisitor<R> visitor) =>
+      visitor.visitFunctionExpression(this);
 }
 
 /// CASE expression
@@ -84,7 +87,8 @@ class CaseExpression extends Expression {
   });
 
   @override
-  R accept<R>(ASTVisitor<R> visitor) => visitor.visitCaseExpression(this);
+  R accept<R>(ExpressionVisitor<R> visitor) =>
+      visitor.visitCaseExpression(this);
 }
 
 /// WHEN clause for CASE expression
@@ -110,25 +114,7 @@ class InExpression extends Expression {
   });
 
   @override
-  R accept<R>(ASTVisitor<R> visitor) => visitor.visitInExpression(this);
-}
-
-/// BETWEEN expression
-class BetweenExpression extends Expression {
-  final Expression expression;
-  final Expression lower;
-  final Expression upper;
-  final bool negated;
-
-  BetweenExpression({
-    required this.expression,
-    required this.lower,
-    required this.upper,
-    this.negated = false,
-  });
-
-  @override
-  R accept<R>(ASTVisitor<R> visitor) => visitor.visitBetweenExpression(this);
+  R accept<R>(ExpressionVisitor<R> visitor) => visitor.visitInExpression(this);
 }
 
 /// EXISTS expression
@@ -139,7 +125,8 @@ class ExistsExpression extends Expression {
   ExistsExpression({required this.subquery, this.negated = false});
 
   @override
-  R accept<R>(ASTVisitor<R> visitor) => visitor.visitExistsExpression(this);
+  R accept<R>(ExpressionVisitor<R> visitor) =>
+      visitor.visitExistsExpression(this);
 }
 
 /// Subquery expression
@@ -149,13 +136,15 @@ class SubqueryExpression extends Expression {
   SubqueryExpression({required this.subquery});
 
   @override
-  R accept<R>(ASTVisitor<R> visitor) => visitor.visitSubqueryExpression(this);
+  R accept<R>(ExpressionVisitor<R> visitor) =>
+      visitor.visitSubqueryExpression(this);
 }
 
 /// Star (*) expression
 class StarExpression extends Expression {
   @override
-  R accept<R>(ASTVisitor<R> visitor) => visitor.visitExpression(this);
+  R accept<R>(ExpressionVisitor<R> visitor) =>
+      visitor.visitStarExpression(this);
 }
 
 /// Qualified star (table.*) expression
@@ -165,7 +154,8 @@ class QualifiedStarExpression extends Expression {
   QualifiedStarExpression({required this.table});
 
   @override
-  R accept<R>(ASTVisitor<R> visitor) => visitor.visitExpression(this);
+  R accept<R>(ExpressionVisitor<R> visitor) =>
+      visitor.visitQualifiedStarExpression(this);
 }
 
 /// CAST expression
@@ -176,50 +166,6 @@ class CastExpression extends Expression {
   CastExpression({required this.expression, required this.targetType});
 
   @override
-  R accept<R>(ASTVisitor<R> visitor) => visitor.visitCastExpression(this);
-}
-
-/// Window function expression
-class WindowExpression extends Expression {
-  final List<Expression> partitionBy;
-  final List<OrderByItem> orderBy;
-  final WindowFrame? frame;
-
-  WindowExpression({
-    this.partitionBy = const [],
-    this.orderBy = const [],
-    this.frame,
-  });
-
-  @override
-  R accept<R>(ASTVisitor<R> visitor) => visitor.visitWindowExpression(this);
-}
-
-/// Window frame specification
-class WindowFrame {
-  final WindowFrameType type;
-  final WindowFrameBound start;
-  final WindowFrameBound? end;
-
-  WindowFrame({required this.type, required this.start, this.end});
-}
-
-/// Window frame types
-enum WindowFrameType { rows, range, groups }
-
-/// Window frame bounds
-class WindowFrameBound {
-  final WindowBoundType type;
-  final Expression? offset;
-
-  WindowFrameBound({required this.type, this.offset});
-}
-
-/// Window bound types
-enum WindowBoundType {
-  unboundedPreceding,
-  preceding,
-  currentRow,
-  following,
-  unboundedFollowing,
+  R accept<R>(ExpressionVisitor<R> visitor) =>
+      visitor.visitCastExpression(this);
 }

@@ -69,7 +69,17 @@ def v_delta_partition_values():
     }
 
 
+def v_delta_nested():
+    from deltalake import DeltaTable
+    table = DeltaTable(f"{D}/delta_nested")
+    rows = sorted(table.to_pyarrow_table().to_pylist(), key=lambda r: r["id"])
+    for r in rows:
+        r["props"] = dict(r["props"])
+    return {"schema": json.loads(table.schema().to_json()), "rows": rows}
+
+
 check("delta_partitioned", v_delta_partitioned)
+check("delta_nested", v_delta_nested)
 check("delta", v_delta)
 check("delta_partition_values", v_delta_partition_values)
 
@@ -91,6 +101,21 @@ def v_iceberg_expired():
     t = _ice("ice_expired")
     arr = t.scan().to_arrow()
     return {"nsnapshots": len(t.metadata.snapshots), "rows": arr.num_rows}
+
+
+def v_iceberg_history():
+    t = _ice("ice_history")
+    snapshots = t.metadata.snapshots
+    return {
+        "metadata_log": len(t.metadata.metadata_log),
+        "history": len(t.history()),
+        "parents_linked": all(
+            s.parent_snapshot_id == snapshots[i - 1].snapshot_id
+            for i, s in enumerate(snapshots)
+            if i > 0
+        ),
+        "first_parent": snapshots[0].parent_snapshot_id,
+    }
 
 
 def v_iceberg_repartitioned():
@@ -119,6 +144,7 @@ def v_iceberg_partitioned():
 
 check("iceberg", v_iceberg)
 check("iceberg_expired", v_iceberg_expired)
+check("iceberg_history", v_iceberg_history)
 check("iceberg_repartitioned", v_iceberg_repartitioned)
 check("iceberg_partitioned", v_iceberg_partitioned)
 

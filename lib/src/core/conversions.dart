@@ -1,19 +1,76 @@
 import 'dart:typed_data';
 
+import 'decimal.dart';
+
 /// Value conversions for temporal and decimal column types, shared by the Arrow
 /// and Parquet codecs. Temporal columns hold Dart [DateTime]; decimal columns
 /// hold unscaled [BigInt] (scale lives on the Field).
 
-final DateTime _epochUtc = DateTime.utc(1970);
+final DateTime _epoch = DateTime.utc(1970);
 
 /// `date` → days since 1970-01-01 (UTC, calendar date only).
-int dateToEpochDays(DateTime d) =>
-    DateTime.utc(d.year, d.month, d.day).difference(_epochUtc).inDays;
+int dateToEpochDays(DateTime date) =>
+    DateTime.utc(date.year, date.month, date.day).difference(_epoch).inDays;
 
-DateTime dateFromEpochDays(int days) => _epochUtc.add(Duration(days: days));
+DateTime dateFromEpochDays(int days) => _epoch.add(Duration(days: days));
+
+/// The written date and time fields of ISO-8601 text, in the form
+/// [DateTime.parse] accepts.
+final _fields = RegExp(
+  r'^\s*[+-]?(\d{4,6})-?(\d\d)-?(\d\d)(?:[ T](\d\d)(?::?(\d\d)(?::?(\d\d))?)?)?',
+);
+
+/// [text] parsed as ISO-8601 into a UTC [DateTime], or null when it does not
+/// parse. Text without a zone is read as UTC, keeping its wall-clock fields;
+/// text with an offset keeps its instant. Shared by SQL CAST, temporal
+/// literals and comparisons with strings, and the DataFrame filter.
+///
+/// A field out of range (month 13, February 30, hour 24, minute 60) is null:
+/// [DateTime.tryParse] would roll it over into a different, valid date.
+DateTime? parseUtc(String text) {
+  final parsed = DateTime.tryParse(text);
+  if (parsed == null || !_inRange(text)) return null;
+  if (parsed.isUtc) return parsed;
+  return DateTime.utc(
+    parsed.year,
+    parsed.month,
+    parsed.day,
+    parsed.hour,
+    parsed.minute,
+    parsed.second,
+    parsed.millisecond,
+    parsed.microsecond,
+  );
+}
+
+/// Whether the written fields of [text] name a real date and time, which is
+/// so when building them does not roll any of them over.
+bool _inRange(String text) {
+  final match = _fields.firstMatch(text);
+  if (match == null) return true;
+  int field(int group, int fallback) =>
+      int.parse(match.group(group) ?? '$fallback');
+  final year = field(1, 0);
+  final month = field(2, 1);
+  final day = field(3, 1);
+  final hour = field(4, 0);
+  final minute = field(5, 0);
+  final second = field(6, 0);
+  final built = DateTime.utc(year, month, day, hour, minute, second);
+  return built.year == year &&
+      built.month == month &&
+      built.day == day &&
+      built.hour == hour &&
+      built.minute == minute &&
+      built.second == second;
+}
+
+/// The `date` value for [at]: its calendar day at UTC midnight.
+DateTime dateOf(DateTime at) => DateTime.utc(at.year, at.month, at.day);
 
 /// `timestamp` → microseconds since the Unix epoch (UTC).
-int timestampToEpochMicros(DateTime t) => t.toUtc().microsecondsSinceEpoch;
+int timestampToEpochMicros(DateTime time) =>
+    time.toUtc().microsecondsSinceEpoch;
 
 DateTime timestampFromEpochMicros(int micros) =>
     DateTime.fromMicrosecondsSinceEpoch(micros, isUtc: true);
@@ -28,13 +85,11 @@ DateTime timestampFromEpochNanos(int nanos) =>
 
 /// Parquet INT96 (Impala/Spark): nanos-of-day (int64 LE) + Julian day (int32 LE).
 DateTime int96ToTimestamp(List<int> bytes) {
-  final bd = ByteData.sublistView(Uint8List.fromList(bytes));
-  final nanos = bd.getInt64(0, Endian.little);
-  final julianDay = bd.getInt32(8, Endian.little);
-  const unixEpochJulianDay = 2440588;
-  return _epochUtc.add(
-    Duration(days: julianDay - unixEpochJulianDay, microseconds: nanos ~/ 1000),
-  );
+  final view = ByteData.sublistView(Uint8List.fromList(bytes));
+  final nanos = view.getInt64(0, Endian.little);
+  final day = view.getInt32(8, Endian.little);
+  const offset = 2440588;
+  return _epoch.add(Duration(days: day - offset, microseconds: nanos ~/ 1000));
 }
 
 /// Format an unscaled decimal [unscaled] with [scale] as its human/Spark-readable
@@ -47,8 +102,8 @@ String formatDecimal(BigInt unscaled, int scale) {
   final digits = unscaled.abs().toString().padLeft(scale + 1, '0');
   final cut = digits.length - scale;
   final whole = digits.substring(0, cut);
-  final frac = digits.substring(cut);
-  return '${negative ? '-' : ''}$whole.$frac';
+  final fraction = digits.substring(cut);
+  return '${negative ? '-' : ''}$whole.$fraction';
 }
 
 /// Decompose a numeric [value] into `(unscaled, scale)` via its SHORTEST
@@ -58,27 +113,28 @@ String formatDecimal(BigInt unscaled, int scale) {
 /// float would otherwise round under float64). Throws on a non-finite double.
 ({BigInt unscaled, int scale}) decimalParts(num value) {
   if (value is int) return (unscaled: BigInt.from(value), scale: 0);
-  final d = value.toDouble();
-  if (!d.isFinite) {
-    throw StateError('Cannot represent $d exactly as a decimal');
+  final number = value.toDouble();
+  if (!number.isFinite) {
+    throw StateError('Cannot represent $number exactly as a decimal');
   }
-  var s = d.toString(); // shortest round-trip representation
-  final negative = s.startsWith('-');
-  if (negative) s = s.substring(1);
-  var exp = 0;
-  final e = s.indexOf('e');
-  if (e >= 0) {
-    exp = int.parse(s.substring(e + 1));
-    s = s.substring(0, e);
+  var text = number.toString(); // shortest round-trip representation
+  final negative = text.startsWith('-');
+  if (negative) text = text.substring(1);
+  var exponent = 0;
+  final index = text.indexOf('e');
+  if (index >= 0) {
+    exponent = int.parse(text.substring(index + 1));
+    text = text.substring(0, index);
   }
   var scale = 0;
-  final dot = s.indexOf('.');
+  final dot = text.indexOf('.');
   if (dot >= 0) {
-    scale = s.length - dot - 1;
-    s = s.substring(0, dot) + s.substring(dot + 1);
+    scale = text.length - dot - 1;
+    text = text.substring(0, dot) + text.substring(dot + 1);
   }
-  scale -= exp; // a positive exponent shrinks the scale (adds trailing zeros)
-  var unscaled = BigInt.parse(s);
+  // A positive exponent shrinks the scale (adds trailing zeros).
+  scale -= exponent;
+  var unscaled = BigInt.parse(text);
   if (scale < 0) {
     unscaled *= BigInt.from(10).pow(-scale);
     scale = 0;
@@ -86,38 +142,28 @@ String formatDecimal(BigInt unscaled, int scale) {
   return (unscaled: negative ? -unscaled : unscaled, scale: scale);
 }
 
-/// The max fractional scale needed to represent every value in [values] exactly
-/// (integers contribute 0). Nulls are ignored.
-int decimalScaleOf(Iterable<num?> values) {
-  var scale = 0;
-  for (final v in values) {
-    if (v == null) continue;
-    final s = decimalParts(v).scale;
-    if (s > scale) scale = s;
-  }
-  return scale;
-}
-
 /// [value] as an unscaled [BigInt] at [scale] (pads with trailing zeros for a
 /// value of smaller natural scale). Lossless for integers and shortest-form
-/// doubles. Throws if [scale] is SMALLER than the value's natural scale — that
+/// doubles. Throws if [scale] is SMALLER than the value's natural scale; that
 /// would silently drop fractional digits, so the caller must pick a scale that
-/// covers every value (see [decimalScaleOf]).
+/// covers every value.
 BigInt toUnscaled(num value, int scale) {
-  final p = decimalParts(value);
-  final diff = scale - p.scale;
-  if (diff < 0) {
+  final parts = decimalParts(value);
+  final shift = scale - parts.scale;
+  if (shift < 0) {
     throw ArgumentError(
       'toUnscaled: target scale $scale is smaller than the natural scale '
-      '${p.scale} of $value (would lose precision)',
+      '${parts.scale} of $value (would lose precision)',
     );
   }
-  return diff == 0 ? p.unscaled : p.unscaled * BigInt.from(10).pow(diff);
+  return shift == 0
+      ? parts.unscaled
+      : parts.unscaled * BigInt.from(10).pow(shift);
 }
 
 /// Re-scale an unscaled decimal [value] from scale [from] to [to]. Widening
 /// pads (exact); narrowing is allowed only when no non-zero fractional digit
-/// is dropped — otherwise it throws rather than silently rounding a type whose
+/// is dropped; otherwise it throws rather than silently rounding a type whose
 /// whole point is exactness.
 BigInt rescaleUnscaled(BigInt value, int from, int to) {
   if (to >= from) {
@@ -133,45 +179,74 @@ BigInt rescaleUnscaled(BigInt value, int from, int to) {
   return value ~/ divisor;
 }
 
-/// Parse a `"decimal(p,s)"` type string (the Spark and Iceberg spelling) to
+/// The largest decimal precision a supported format declares: Arrow and
+/// Parquet 256-bit decimals. Delta and Iceberg allow 38.
+const maxDecimalPrecision = 76;
+
+/// [precision] and [scale] read from an untrusted schema, checked: precision
+/// 1 to [max], scale 0 to precision. Decimal formatting and rescaling allocate
+/// in proportion to the scale, so an unchecked one is a memory hazard.
+({int precision, int scale}) checkedDecimal(
+  int precision,
+  int scale, {
+  int max = maxDecimalPrecision,
+}) {
+  if (precision < 1 || precision > max || scale < 0 || scale > precision) {
+    throw FormatException('Invalid decimal($precision,$scale)');
+  }
+  return (precision: precision, scale: scale);
+}
+
+/// Parse a `"decimal(p,s)"` type string (the Spark and Iceberg form) to
 /// `(precision, scale)`, defaulting to `(38, 0)` when the string isn't that form.
-/// One source for both format schema parsers, which spelled the identical regex.
+/// One source for both format schema parsers. Both formats cap precision at
+/// 38.
 ({int precision, int scale}) decimalTypeParams(String type) {
-  final m = RegExp(r'decimal\((\d+)\s*,\s*(\d+)\)').firstMatch(type);
-  if (m == null) return (precision: 38, scale: 0);
-  return (precision: int.parse(m.group(1)!), scale: int.parse(m.group(2)!));
+  final match = RegExp(r'decimal\((\d+)\s*,\s*(\d+)\)').firstMatch(type);
+  if (match == null) return (precision: 38, scale: 0);
+  final precision = int.tryParse(match.group(1)!);
+  final scale = int.tryParse(match.group(2)!);
+  if (precision == null || scale == null) {
+    throw FormatException('Invalid decimal type: $type');
+  }
+  return checkedDecimal(precision, scale, max: 38);
 }
 
 /// Parse a decimal STRING (`"123.45"`, `"-0.99"`, `"12345678901234567890"`) to an
-/// unscaled [BigInt] at [scale], EXACTLY — never via a double, which would round
+/// unscaled [BigInt] at [scale], EXACTLY, never via a double, which would round
 /// a value past 2^53 (or throw on a clean-double round-trip through [toUnscaled]).
 /// The string inverse of [formatDecimal]. Throws [FormatException] on a non-decimal
 /// string or one carrying MORE fractional digits than [scale] can hold (the same
 /// fail-loud contract as [toUnscaled], so a foreign writer's over-precise partition
 /// value is rejected, not silently rounded).
-BigInt unscaledFromString(String s, int scale) {
-  final text = s.trim();
+BigInt unscaledFromString(String raw, int scale) {
+  final text = raw.trim();
   final negative = text.startsWith('-');
   final body = negative || text.startsWith('+') ? text.substring(1) : text;
   final dot = body.indexOf('.');
-  final intPart = dot < 0 ? body : body.substring(0, dot);
-  final fracPart = dot < 0 ? '' : body.substring(dot + 1);
-  if (intPart.isEmpty && fracPart.isEmpty) {
-    throw FormatException('Not a decimal value: "$s"');
+  final whole = dot < 0 ? body : body.substring(0, dot);
+  final fraction = dot < 0 ? '' : body.substring(dot + 1);
+  // BigInt.parse would also take a sign, a 0x prefix and the like.
+  if ((whole.isEmpty && fraction.isEmpty) ||
+      !_digits.hasMatch(whole) ||
+      !_digits.hasMatch(fraction)) {
+    throw FormatException('Not a decimal value: "$raw"');
   }
-  if (fracPart.length > scale) {
+  if (fraction.length > scale) {
     throw FormatException(
-      'Decimal "$s" has ${fracPart.length} fractional digits, more than the '
+      'Decimal "$raw" has ${fraction.length} fractional digits, more than the '
       'declared scale $scale can represent without rounding',
     );
   }
-  final digits = '$intPart${fracPart.padRight(scale, '0')}';
+  final digits = '$whole${fraction.padRight(scale, '0')}';
   final magnitude = BigInt.parse(digits.isEmpty ? '0' : digits);
   return negative ? -magnitude : magnitude;
 }
 
+final _digits = RegExp(r'^[0-9]*$');
+
 /// Decimal `(scale, precision)` for a column of numeric [values], or `null` when
-/// the values cannot be a lossless decimal (any non-finite double — NaN/∞ — which
+/// the values cannot be a lossless decimal (any non-finite double (NaN/∞) which
 /// the caller should keep as a float instead of promoting). Integers and BigInt
 /// contribute scale 0; nulls are ignored. `precision` is the max unscaled-digit
 /// count and is never less than `scale` (a decimal type requires `precision ≥
@@ -181,18 +256,22 @@ BigInt unscaledFromString(String s, int scale) {
   for (final v in values) {
     if (v == null) continue;
     if (v is double && !v.isFinite) return null; // NaN/∞ can't be a decimal
-    if (v is num) {
-      final s = decimalParts(v).scale;
-      if (s > scale) scale = s;
-    }
+    final found = switch (v) {
+      final Decimal d => d.scale,
+      final num n => decimalParts(n).scale,
+      _ => 0,
+    };
+    if (found > scale) scale = found;
   }
   var precision = 1;
-  final pow = BigInt.from(10).pow(scale);
+  final factor = BigInt.from(10).pow(scale);
   for (final v in values) {
     if (v == null) continue;
     final BigInt unscaled;
     if (v is BigInt) {
-      unscaled = v * pow; // already scale 0 → lift to the common scale
+      unscaled = v * factor; // already scale 0 → lift to the common scale
+    } else if (v is Decimal) {
+      unscaled = v.unscaled * BigInt.from(10).pow(scale - v.scale);
     } else if (v is num) {
       unscaled = toUnscaled(v, scale);
     } else {
@@ -211,37 +290,33 @@ BigInt bytesToBigInt(List<int> bytes, {required bool littleEndian}) {
       ? bytes.reversed.toList()
       : bytes; // -> big-endian
   var result = BigInt.zero;
-  for (final b in ordered) {
-    result = (result << 8) | BigInt.from(b & 0xff);
+  for (final byte in ordered) {
+    result = (result << 8) | BigInt.from(byte & 0xff);
   }
-  final bitLength = bytes.length * 8;
-  if ((result & (BigInt.one << (bitLength - 1))) != BigInt.zero) {
-    result -= BigInt.one << bitLength; // sign-extend
+  final bits = bytes.length * 8;
+  if ((result & (BigInt.one << (bits - 1))) != BigInt.zero) {
+    result -= BigInt.one << bits; // sign-extend
   }
   return result;
 }
 
 /// Encode [value] as a fixed-width two's-complement integer.
-Uint8List bigIntToBytes(
-  BigInt value,
-  int byteWidth, {
-  required bool littleEndian,
-}) {
-  // Two's-complement of [byteWidth] bytes holds [-2^(n-1), 2^(n-1)-1]. Without
+Uint8List bigIntToBytes(BigInt value, int width, {required bool littleEndian}) {
+  // Two's-complement of [width] bytes holds [-2^(n-1), 2^(n-1)-1]. Without
   // this check an out-of-range unscaled decimal would wrap silently and write a
   // corrupted value on disk; fail loud instead.
-  final bits = byteWidth * 8;
+  final bits = width * 8;
   final limit = BigInt.one << (bits - 1);
   if (value >= limit || value < -limit) {
     throw RangeError(
-      'Value $value does not fit in a $byteWidth-byte two\'s-complement integer',
+      'Value $value does not fit in a $width-byte two\'s-complement integer',
     );
   }
   var v = value;
-  if (v.isNegative) v += BigInt.one << (byteWidth * 8); // two's complement
-  final out = Uint8List(byteWidth);
+  if (v.isNegative) v += BigInt.one << (width * 8); // two's complement
+  final out = Uint8List(width);
   final mask = BigInt.from(0xff);
-  for (int i = byteWidth - 1; i >= 0; i--) {
+  for (int i = width - 1; i >= 0; i--) {
     out[i] = (v & mask).toInt();
     v = v >> 8;
   }

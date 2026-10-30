@@ -4,6 +4,7 @@ import 'package:libcompress/libcompress.dart';
 import '../thrift/parquet_thrift.dart' as thrift;
 import '../compression.dart';
 import 'file_reader.dart';
+import '../../../util/varint.dart';
 
 /// Default per-page ceiling (compressed AND decompressed). A crafted page can
 /// otherwise transiently allocate ~2× this (compressed + decompressed coexist
@@ -20,7 +21,7 @@ class PageReader {
   final bool verify;
 
   /// Per-page ceiling applied to BOTH the compressed page read and the declared
-  /// decompressed size — configurable so a memory-bounded service can lower it.
+  /// decompressed size: configurable so a memory-bounded service can lower it.
   final int maxPageBytes;
 
   int position = 0;
@@ -42,18 +43,18 @@ class PageReader {
 
     // Read page header. All reads use the absolute-offset readBytes API (never
     // the shared cursor) so the FileReader stays usable concurrently.
-    final currentOffset = offset + position;
+    final start = offset + position;
 
-    final headerResult = await readHeaderWithSize();
-    if (headerResult == null) {
+    final result = await readHeaderWithSize();
+    if (result == null) {
       return null;
     }
 
-    final header = headerResult.header;
-    final headerSize = headerResult.bytesConsumed;
+    final header = result.header;
+    final consumed = result.bytesConsumed;
 
     // Update position for header
-    position += headerSize;
+    position += consumed;
 
     // Check if we have enough space for the page data
     if (position + header.compressedPageSize > size) {
@@ -66,7 +67,7 @@ class PageReader {
     }
     // Bound the COMPRESSED page BEFORE reading it: a column chunk can be
     // multi-GB, so the chunk-bounds check above does not stop a single
-    // multi-GB page from being read whole here — defeating readBatches's
+    // multi-GB page from being read whole here: defeating readBatches's
     // bounded-memory contract. The decompressed-size guards run only later,
     // inside decompress(). Reject an implausible compressed page up front.
     if (header.compressedPageSize < 0 ||
@@ -79,21 +80,21 @@ class PageReader {
 
     // Read the page data at its absolute offset (just past the header).
     final compressed = await reader.readBytes(
-      currentOffset + headerSize,
+      start + consumed,
       header.compressedPageSize,
     );
     // A short read means the file is physically truncated below what its
-    // metadata claims — accepting it would silently decode fabricated bytes.
+    // metadata claims: accepting it would silently decode fabricated bytes.
     if (compressed.length != header.compressedPageSize) {
       throw FormatException(
-        'Truncated Parquet page at offset $currentOffset: expected '
+        'Truncated Parquet page at offset $start: expected '
         '${header.compressedPageSize} bytes, got ${compressed.length}',
       );
     }
     position += header.compressedPageSize;
 
     // Optional page integrity check: CRC32 (IEEE) over the compressed bytes.
-    // Mask both sides to 32 bits — the thrift I32 round-trip is signed.
+    // Mask both sides to 32 bits: the thrift I32 round-trip is signed.
     if (verify && header.crc != null) {
       if (Crc32.hash(compressed) != (header.crc! & 0xFFFFFFFF)) {
         throw FormatException(
@@ -123,14 +124,14 @@ class PageReader {
   static const _maxPageHeaderBytes = 8 << 20; // 8 MiB
 
   /// Reject an implausible declared uncompressed size before allocating.
-  void _guardSize(int declared, int compressedLen) {
+  void _guardSize(int declared, int compressed) {
     if (declared < 0 ||
         declared > maxPageBytes ||
-        (compressedLen > 0 &&
+        (compressed > 0 &&
             declared > _ratioFloor &&
-            declared > compressedLen * _maxDecompressRatio)) {
+            declared > compressed * _maxDecompressRatio)) {
       throw FormatException(
-        'Implausible uncompressed page size $declared for $compressedLen '
+        'Implausible uncompressed page size $declared for $compressed '
         'compressed bytes',
       );
     }
@@ -142,23 +143,22 @@ class PageReader {
   /// ISIZE) reject a payload self-declaring more than the header's [declared] size
   /// so a decompression bomb is refused before allocation. Codecs without a cheap
   /// length prefix (LZ4_RAW, zstd) fall back to [_guardSize] + the post-check.
-  void _guardCodecOutput(int declared, Uint8List codecInput) {
-    int? selfLen;
+  void _guardCodecOutput(int declared, Uint8List input) {
+    int? claimed;
     if (codecType == thrift.CompressionCodec.snappy) {
-      selfLen = _snappyUncompressedLength(codecInput);
-    } else if (codecType == thrift.CompressionCodec.gzip &&
-        codecInput.length >= 4) {
+      claimed = _snappyUncompressedLength(input);
+    } else if (codecType == thrift.CompressionCodec.gzip && input.length >= 4) {
       // gzip trailer: ISIZE = uncompressed size mod 2^32 (little-endian). The
       // 1 GiB declared guard keeps legitimate sizes well under 2^32, so a bomb
       // producing far more than `declared` shows a larger ISIZE here.
-      selfLen = ByteData.sublistView(
-        codecInput,
-        codecInput.length - 4,
+      claimed = ByteData.sublistView(
+        input,
+        input.length - 4,
       ).getUint32(0, Endian.little);
     }
-    if (selfLen != null && selfLen > declared) {
+    if (claimed != null && claimed > declared) {
       throw FormatException(
-        'Codec self-declared output $selfLen exceeds the declared page size '
+        'Codec self-declared output $claimed exceeds the declared page size '
         '$declared (decompression bomb)',
       );
     }
@@ -166,16 +166,12 @@ class PageReader {
 
   /// Decode Snappy's leading little-endian base-128 varint (the uncompressed
   /// block length), or null if it isn't cleanly present in the first 5 bytes.
-  static int? _snappyUncompressedLength(Uint8List d) {
-    var result = 0;
-    var shift = 0;
-    for (var i = 0; i < d.length && i < 5; i++) {
-      final b = d[i];
-      result |= (b & 0x7f) << shift;
-      if ((b & 0x80) == 0) return result;
-      shift += 7;
+  static int? _snappyUncompressedLength(Uint8List data) {
+    try {
+      return readVarint(data, 0, maxBytes: 5, label: 'Snappy length').value;
+    } on FormatException {
+      return null;
     }
-    return null;
   }
 
   /// Decompress a page payload.
@@ -193,12 +189,9 @@ class PageReader {
       // Build the codec bounded to THIS page's declared output so a zstd/LZ4_RAW
       // page (no cheap length prefix for the pre-guard) throws mid-decode before
       // over-allocating, rather than materializing its full real output first.
-      final out = codecFor(
-        codecType,
-        maxDecompressedSize: declared,
-      ).decompress(payload);
+      final out = codecFor(codecType, maxSize: declared).decompress(payload);
       // A codec producing more than the header declares is corruption (or a
-      // bomb) — fail loud. Producing fewer is truncation, handled downstream.
+      // bomb): fail loud. Producing fewer is truncation, handled downstream.
       if (out.length > declared) {
         throw FormatException(
           'Decompressed page ${out.length} bytes exceeds declared $declared',
@@ -206,8 +199,17 @@ class PageReader {
       }
       return out;
     }
+    if (v2.repetitionLevelsByteLength < 0 ||
+        v2.definitionLevelsByteLength < 0) {
+      throw const FormatException('Corrupt V2 page: negative level length');
+    }
     final levels =
         v2.repetitionLevelsByteLength + v2.definitionLevelsByteLength;
+    if (levels > declared) {
+      throw FormatException(
+        'Corrupt V2 page: $levels bytes of levels in a $declared-byte page',
+      );
+    }
     if (v2.isCompressed == false || levels >= payload.length) {
       return payload;
     }
@@ -217,7 +219,7 @@ class PageReader {
     _guardCodecOutput(declared - levels, valueBytes);
     final values = codecFor(
       codecType,
-      maxDecompressedSize: declared - levels,
+      maxSize: declared - levels,
     ).decompress(valueBytes);
     final data = Uint8List(levels + values.length);
     data.setRange(0, levels, payload);
@@ -255,30 +257,30 @@ class PageReader {
     while (true) {
       // Absolute-offset read (no shared cursor); consumed is returned so the
       // caller can locate the page data without seeking.
-      final headerBytes = await reader.readBytes(start, window);
-      if (headerBytes.isEmpty) {
+      final bytes = await reader.readBytes(start, window);
+      if (bytes.isEmpty) {
         return null;
       }
 
       final bounded = window < cap; // room to widen within the header cap
       try {
-        final protocol = CompactReader(headerBytes);
+        final protocol = CompactReader(bytes);
         final header = thrift.PageHeader();
         header.read(protocol);
 
         final consumed = protocol.consumed;
         return HeaderResult(header: header, bytesConsumed: consumed);
-      } on Object catch (e) {
+      } on Object catch (error) {
         // Headers are not length-prefixed, so running out of bytes mid-parse
-        // means the window is too small — widen and retry. Truncation now
+        // means the window is too small: widen and retry. Truncation now
         // surfaces as a FormatException (not RangeError), so both are treated as
         // "need more bytes" while the window can still grow; only once it spans
         // the rest of the chunk is an unparseable header truly corrupt.
-        if ((e is RangeError || e is FormatException) && bounded) {
+        if ((error is RangeError || error is FormatException) && bounded) {
           window = (window * 4) < cap ? window * 4 : cap;
           continue;
         }
-        if (e is RangeError || e is FormatException) {
+        if (error is RangeError || error is FormatException) {
           throw FormatException(
             'Parquet page header at offset $start is corrupt or truncated '
             '(read $window of $available bytes remaining, header cap '

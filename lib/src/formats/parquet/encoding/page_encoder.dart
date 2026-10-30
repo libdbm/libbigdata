@@ -5,6 +5,16 @@ import '../thrift/parquet_thrift.dart' as thrift;
 import 'rle_bitpacked.dart';
 import 'value_encoder.dart';
 
+/// The bytes [value] takes in a PLAIN page, estimated without encoding it:
+/// strings count one byte per code unit, which is exact for ASCII.
+int valueBytes(Object? value) => switch (value) {
+  null => 0,
+  String() => 4 + value.length,
+  Uint8List() => 4 + value.length,
+  List() => 4 + value.length * 8,
+  _ => 8,
+};
+
 /// Encodes data into Parquet pages
 class PageEncoder {
   final thrift.ParquetType type;
@@ -38,30 +48,30 @@ class PageEncoder {
 
   /// Encode a column as a dictionary page (PLAIN dictionary values) plus one
   /// data page of RLE/bit-packed dictionary indices, prefixed by the index bit
-  /// width — the layout DictionaryDecoder expects.
+  /// width: the layout DictionaryDecoder expects.
   List<EncodedPage> encodeDictionary(
     List<dynamic> values,
     List<int>? defLevels,
     List<int>? repLevels,
   ) {
-    final dict = <dynamic, int>{};
+    final dictionary = <dynamic, int>{};
     final indices = <int>[];
-    for (final v in values) {
-      if (v == null) continue;
-      indices.add(dict.putIfAbsent(v, () => dict.length));
+    for (final value in values) {
+      if (value == null) continue;
+      indices.add(dictionary.putIfAbsent(value, () => dictionary.length));
     }
-    final keys = dict.keys.toList();
+    final keys = dictionary.keys.toList();
 
-    final dictData = PlainEncoder(type).encode(keys);
-    final dictPage = EncodedPage(
+    final plain = PlainEncoder(type).encode(keys);
+    final dictionaryPage = EncodedPage(
       header: thrift.PageHeader()
         ..type = thrift.PageType.dictionaryPage
-        ..uncompressedPageSize = dictData.length
-        ..compressedPageSize = dictData.length
+        ..uncompressedPageSize = plain.length
+        ..compressedPageSize = plain.length
         ..dictionaryPageHeader = (thrift.DictionaryPageHeader()
           ..numValues = keys.length
           ..encoding = thrift.Encoding.plain),
-      data: dictData,
+      data: plain,
       isDictionary: true,
     );
 
@@ -87,33 +97,33 @@ class PageEncoder {
       isDictionary: false,
     );
 
-    return [dictPage, dataPage];
+    return [dictionaryPage, dataPage];
   }
 
-  /// Encode a flat numeric column straight from its typed buffer — no boxing to
+  /// Encode a flat numeric column straight from its typed buffer: no boxing to
   /// `List<dynamic>`. Only PLAIN and DELTA_BINARY_PACKED are handled here (the
   /// caller keeps dictionary/nested/logical columns on the boxed [encode] path).
   /// Page boundaries and per-page `numValues` match [encodeData] exactly, so the
   /// output is interchangeable with the boxed encoder's.
-  List<EncodedPage> encodeTyped(NumericColumn column, {List<int>? defLevels}) {
-    final n = column.length;
-    if (n == 0) {
+  List<EncodedPage> encodeTyped(NumericVector column, {List<int>? defLevels}) {
+    final count = column.length;
+    if (count == 0) {
       return [_encodeTypedPage(column, 0, 0, defLevels)];
     }
     final pages = <EncodedPage>[];
     int offset = 0;
-    while (offset < n) {
-      int batchSize = pageSize ~/ 8; // matches encodeData
-      if (offset + batchSize > n) batchSize = n - offset;
-      final defBatch = defLevels?.sublist(offset, offset + batchSize);
-      pages.add(_encodeTypedPage(column, offset, offset + batchSize, defBatch));
-      offset += batchSize;
+    while (offset < count) {
+      int size = pageSize ~/ 8; // matches encodeData
+      if (offset + size > count) size = count - offset;
+      final levels = defLevels?.sublist(offset, offset + size);
+      pages.add(_encodeTypedPage(column, offset, offset + size, levels));
+      offset += size;
     }
     return pages;
   }
 
   EncodedPage _encodeTypedPage(
-    NumericColumn column,
+    NumericVector column,
     int start,
     int end,
     List<int>? defLevels,
@@ -146,47 +156,47 @@ class PageEncoder {
   /// PLAIN-encode non-null values in `[start, end)` into one pre-sized buffer.
   /// Width comes from the physical [type] (int16/int8 columns encode as INT32),
   /// values are read unboxed from the typed buffer, written little-endian.
-  Uint8List _encodeTypedPlain(NumericColumn column, int start, int end) {
+  Uint8List _encodeTypedPlain(NumericVector column, int start, int end) {
     final width = switch (type) {
       thrift.ParquetType.int32 || thrift.ParquetType.float => 4,
       thrift.ParquetType.int64 || thrift.ParquetType.double => 8,
       _ => 0,
     };
-    final bitmap = column.rawNullBitmap;
-    var nonNull = end - start;
+    final bitmap = column.nulls;
+    var present = end - start;
     if (bitmap != null) {
-      nonNull = 0;
+      present = 0;
       for (int i = start; i < end; i++) {
-        if ((bitmap[i >> 3] & (1 << (i & 7))) == 0) nonNull++;
+        if ((bitmap[i >> 3] & (1 << (i & 7))) == 0) present++;
       }
     }
-    final out = Uint8List(nonNull * width);
-    final bd = ByteData.view(out.buffer);
-    var off = 0;
-    final buffer = column.rawBuffer;
+    final out = Uint8List(present * width);
+    final view = ByteData.view(out.buffer);
+    var offset = 0;
+    final buffer = column.raw;
     if (type == thrift.ParquetType.int32 || type == thrift.ParquetType.int64) {
       final data = buffer as List<int>;
-      final i32 = type == thrift.ParquetType.int32;
+      final int32 = type == thrift.ParquetType.int32;
       for (int i = start; i < end; i++) {
         if (bitmap != null && (bitmap[i >> 3] & (1 << (i & 7))) != 0) continue;
-        if (i32) {
-          bd.setInt32(off, data[i], Endian.little);
+        if (int32) {
+          view.setInt32(offset, data[i], Endian.little);
         } else {
-          bd.setInt64(off, data[i], Endian.little);
+          view.setInt64(offset, data[i], Endian.little);
         }
-        off += width;
+        offset += width;
       }
     } else {
       final data = buffer as List<double>;
-      final f32 = type == thrift.ParquetType.float;
+      final float32 = type == thrift.ParquetType.float;
       for (int i = start; i < end; i++) {
         if (bitmap != null && (bitmap[i >> 3] & (1 << (i & 7))) != 0) continue;
-        if (f32) {
-          bd.setFloat32(off, data[i], Endian.little);
+        if (float32) {
+          view.setFloat32(offset, data[i], Endian.little);
         } else {
-          bd.setFloat64(off, data[i], Endian.little);
+          view.setFloat64(offset, data[i], Endian.little);
         }
-        off += width;
+        offset += width;
       }
     }
     return out;
@@ -195,21 +205,21 @@ class PageEncoder {
   /// DELTA_BINARY_PACKED-encode non-null ints in `[start, end)`. Fills an
   /// `Int64List` from the raw buffer (unboxed) and hands it to the shared block
   /// packer, so the bytes match the boxed DELTA encoder for the same values.
-  Uint8List _encodeTypedDelta(NumericColumn column, int start, int end) {
-    final bitmap = column.rawNullBitmap;
-    final data = column.rawBuffer as List<int>;
-    var nonNull = end - start;
+  Uint8List _encodeTypedDelta(NumericVector column, int start, int end) {
+    final bitmap = column.nulls;
+    final data = column.raw as List<int>;
+    var present = end - start;
     if (bitmap != null) {
-      nonNull = 0;
+      present = 0;
       for (int i = start; i < end; i++) {
-        if ((bitmap[i >> 3] & (1 << (i & 7))) == 0) nonNull++;
+        if ((bitmap[i >> 3] & (1 << (i & 7))) == 0) present++;
       }
     }
-    final ints = Int64List(nonNull);
-    var k = 0;
+    final ints = Int64List(present);
+    var index = 0;
     for (int i = start; i < end; i++) {
       if (bitmap != null && (bitmap[i >> 3] & (1 << (i & 7))) != 0) continue;
-      ints[k++] = data[i];
+      ints[index++] = data[i];
     }
     return DeltaBinaryPackedEncoder(type).encodeInts(ints);
   }
@@ -228,21 +238,32 @@ class PageEncoder {
     }
 
     while (offset < values.length) {
-      // Determine batch size
-      int batchSize = pageSize ~/ 8; // Rough estimate
-      if (offset + batchSize > values.length) {
-        batchSize = values.length - offset;
+      // A page ends at [pageSize] encoded bytes (estimated) or [pageSize] / 8
+      // values, whichever comes first, so large values cannot make a page the
+      // reader refuses. Nested columns end it on a record boundary.
+      var end = offset;
+      var bytes = 0;
+      final most = math.min(values.length, offset + pageSize ~/ 8);
+      while (end < most && (end == offset || bytes < pageSize)) {
+        bytes += valueBytes(values[end]);
+        end++;
       }
+      if (repLevels != null) {
+        while (end < values.length && repLevels[end] != 0) {
+          end++;
+        }
+      }
+      final size = end - offset;
 
       // Extract batch
-      final batch = values.sublist(offset, offset + batchSize);
-      final defBatch = defLevels?.sublist(offset, offset + batchSize);
-      final repBatch = repLevels?.sublist(offset, offset + batchSize);
+      final batch = values.sublist(offset, offset + size);
+      final definitions = defLevels?.sublist(offset, offset + size);
+      final repetitions = repLevels?.sublist(offset, offset + size);
 
       // Encode page
-      pages.add(encodePage(batch, defBatch, repBatch));
+      pages.add(encodePage(batch, definitions, repetitions));
 
-      offset += batchSize;
+      offset += size;
     }
 
     return pages;
@@ -294,10 +315,6 @@ class PageEncoder {
     out.add(body);
     return out.toBytes();
   }
-
-  /// Bit width needed to store a level whose maximum value is [maxLevel].
-  static int bitWidthFor(int maxLevel) =>
-      maxLevel == 0 ? 0 : (math.log(maxLevel + 1) / math.log(2)).ceil();
 }
 
 /// Represents an encoded page

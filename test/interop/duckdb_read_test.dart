@@ -6,11 +6,13 @@ import 'dart:io';
 import 'package:libbigdata/libbigdata.dart';
 import 'package:test/test.dart';
 
+import '../support/results.dart';
+
 /// libbigdata READS Parquet written by DuckDB. DuckDB's level encoder flushes
 /// definition levels in fixed bit-packed blocks and pads the final block, which
-/// overruns the reader's declared-count guard on a NULLABLE column — a shape the
+/// overruns the reader's declared-count guard on a NULLABLE column: a shape the
 /// pyarrow/Spark fixtures don't produce. This writes that exact shape with the
-/// `duckdb` CLI and asserts a correct read. Gated behind `interop` (needs the
+/// `duckdb` CLI and asserts a correct read. Tagged `interop` (needs the
 /// duckdb CLI); skips gracefully when it's absent.
 void main() {
   bool duckdb() {
@@ -32,7 +34,7 @@ void main() {
         final path = '${tmp.path}/ddb.parquet';
         // Scattered nulls + a wide dictionary over enough rows for DuckDB's default
         // ~122880-value pages, so the def levels are bit-packed with a padded final
-        // block — the case that used to throw "RLE run length ... exceeds page
+        // block: the case that used to throw "RLE run length ... exceeds page
         // value bound".
         final gen = await Process.run('duckdb', [
           '-c',
@@ -59,7 +61,7 @@ void main() {
         final expectCount = int.parse(parts[1]);
 
         // libbigdata must read it (previously threw) with matching values.
-        final table = await ParquetReader(path).read();
+        final table = await ParquetReader(path).read().ok;
         expect(table.rowCount, 300000);
         final score = table.column('score')!;
         num sum = 0;
@@ -74,6 +76,33 @@ void main() {
         // Loose tolerance: the two engines sum ~262k doubles in different orders,
         // so the ~188M total can differ in the last few ulps.
         expect(sum, closeTo(expectSum, 1.0));
+      });
+
+      test('zstd pages with FSE-compressed Huffman weights', () async {
+        // 1000 distinct bigints make dictionary pages whose literals use about
+        // 256 byte values, so DuckDB's zstd writes long FSE-compressed Huffman
+        // weight tables. libcompress before 2.0.0 rejected 5 of this file's 18
+        // pages ("FSE weight decode: tail loop exceeded 100 iterations").
+        final path = '${tmp.path}/zstd.parquet';
+        final gen = await Process.run('duckdb', [
+          '-c',
+          "COPY (SELECT (hash(i) % 1000)::BIGINT AS q FROM range(1000000) t(i)) "
+              "TO '$path' (FORMAT parquet, COMPRESSION zstd);",
+        ]);
+        expect(gen.exitCode, 0, reason: gen.stderr.toString());
+        final truth = await Process.run('duckdb', [
+          '-noheader',
+          '-list',
+          '-c',
+          "SELECT SUM(q), COUNT(DISTINCT q) FROM read_parquet('$path');",
+        ]);
+        final parts = (truth.stdout as String).trim().split('|');
+
+        final table = await ParquetReader(path).read().ok;
+        expect(table.rowCount, 1000000);
+        final values = table.column('q')!.toList().cast<int>();
+        expect(values.fold<int>(0, (sum, v) => sum + v), int.parse(parts[0]));
+        expect(values.toSet(), hasLength(int.parse(parts[1])));
       });
     },
     skip: duckdb() ? false : 'duckdb CLI not installed',

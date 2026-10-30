@@ -3,6 +3,9 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 import '../thrift/parquet_thrift.dart' as thrift;
 import 'rle_bitpacked.dart';
+import '../../../core/failure.dart';
+import '../../../core/result.dart';
+import '../../../util/varint.dart';
 
 /// Throw if [value] does not fit a Parquet INT32.
 ///
@@ -13,7 +16,8 @@ import 'rle_bitpacked.dart';
 /// point before the bytes hit the file, so it fails loud rather than truncate.
 void checkInt32(int value) {
   if (value < -2147483648 || value > 2147483647) {
-    throw ArgumentError(
+    throw Failure.of(
+      Kind.invalid,
       'Parquet INT32 cannot hold $value; the column is declared int32 but '
       'carries a wider value (writing it would truncate to '
       '${value.toSigned(32)})',
@@ -46,8 +50,8 @@ class PlainEncoder extends ValueEncoder {
     // PLAIN booleans are bit-packed (LSB first), 1 bit per non-null value.
     if (type == thrift.ParquetType.boolean) {
       final bools = [
-        for (final v in values)
-          if (v != null) v as bool,
+        for (final value in values)
+          if (value != null) value as bool,
       ];
       final bytes = Uint8List((bools.length + 7) ~/ 8);
       for (int i = 0; i < bools.length; i++) {
@@ -57,7 +61,7 @@ class PlainEncoder extends ValueEncoder {
     }
 
     // Fixed-width numeric: write straight into ONE pre-sized buffer via a single
-    // ByteData view — no per-value Uint8List/ByteData allocation and no
+    // ByteData view: no per-value Uint8List/ByteData allocation and no
     // BytesBuilder copy (this is the PLAIN hot path for float/double columns,
     // which are never dictionary-encoded).
     final width = switch (type) {
@@ -66,27 +70,27 @@ class PlainEncoder extends ValueEncoder {
       _ => 0,
     };
     if (width != 0) {
-      var nonNull = 0;
-      for (final v in values) {
-        if (v != null) nonNull++;
+      var present = 0;
+      for (final value in values) {
+        if (value != null) present++;
       }
-      final out = Uint8List(nonNull * width);
-      final bd = ByteData.view(out.buffer);
-      var off = 0;
-      for (final v in values) {
-        if (v == null) continue;
+      final out = Uint8List(present * width);
+      final view = ByteData.view(out.buffer);
+      var offset = 0;
+      for (final value in values) {
+        if (value == null) continue;
         switch (type) {
           case thrift.ParquetType.int32:
-            checkInt32(v as int);
-            bd.setInt32(off, v, Endian.little);
+            checkInt32(value as int);
+            view.setInt32(offset, value, Endian.little);
           case thrift.ParquetType.int64:
-            bd.setInt64(off, v as int, Endian.little);
+            view.setInt64(offset, value as int, Endian.little);
           case thrift.ParquetType.float:
-            bd.setFloat32(off, (v as num).toDouble(), Endian.little);
+            view.setFloat32(offset, (value as num).toDouble(), Endian.little);
           default: // double
-            bd.setFloat64(off, (v as num).toDouble(), Endian.little);
+            view.setFloat64(offset, (value as num).toDouble(), Endian.little);
         }
-        off += width;
+        offset += width;
       }
       return out;
     }
@@ -136,11 +140,9 @@ class PlainEncoder extends ValueEncoder {
               ? Uint8List.fromList(value)
               : Uint8List.fromList(utf8.encode(value.toString()));
           // Write length prefix
-          final lenBytes = Uint8List(4);
-          ByteData.view(
-            lenBytes.buffer,
-          ).setInt32(0, bytes.length, Endian.little);
-          buffer.add(lenBytes);
+          final prefix = Uint8List(4);
+          ByteData.view(prefix.buffer).setInt32(0, bytes.length, Endian.little);
+          buffer.add(prefix);
           buffer.add(bytes);
           break;
 
@@ -166,14 +168,14 @@ class PlainEncoder extends ValueEncoder {
 class DeltaBinaryPackedEncoder extends ValueEncoder {
   static const int _blockSize = 128;
   static const int _miniblocks = 4;
-  static const int _valuesPerMini = _blockSize ~/ _miniblocks; // 32
+  static const int _valuesPerMiniblock = _blockSize ~/ _miniblocks; // 32
 
   /// The column's physical type. Delta arithmetic wraps in the TYPE's width, not
   /// always 64 bits: the spec says overflow "should be allowed and handled as
   /// wrapping around in 2's complement notation", and parquet-mr/Arrow implement
   /// INT32 accordingly (Arrow's `min_delta_` is an `int32_t` read via a uint32
   /// VLQ capped at 5 bytes). A 64-bit delta on an int32 column therefore emits a
-  /// varint those readers cannot consume — pyarrow fails the whole file with
+  /// varint those readers cannot consume: pyarrow fails the whole file with
   /// "Unexpected end of stream: InitBlock EOF".
   final thrift.ParquetType type;
 
@@ -191,8 +193,8 @@ class DeltaBinaryPackedEncoder extends ValueEncoder {
   @override
   Uint8List encode(List<dynamic> values) {
     final ints = [
-      for (final v in values)
-        if (v != null) v as int,
+      for (final value in values)
+        if (value != null) value as int,
     ];
     return encodeInts(ints);
   }
@@ -219,56 +221,50 @@ class DeltaBinaryPackedEncoder extends ValueEncoder {
 
     int i = 0;
     while (i < deltas.length) {
-      final blockLen = math.min(_blockSize, deltas.length - i);
+      final block = math.min(_blockSize, deltas.length - i);
       int minDelta = deltas[i];
-      for (int j = 1; j < blockLen; j++) {
+      for (int j = 1; j < block; j++) {
         if (deltas[i + j] < minDelta) minDelta = deltas[i + j];
       }
       _zigzag(out, minDelta);
 
-      final usedMini = (blockLen + _valuesPerMini - 1) ~/ _valuesPerMini;
+      final used = (block + _valuesPerMiniblock - 1) ~/ _valuesPerMiniblock;
       final widths = List<int>.filled(_miniblocks, 0);
       final bodies = <Uint8List>[];
-      for (int mb = 0; mb < usedMini; mb++) {
-        final start = mb * _valuesPerMini;
-        final end = math.min(start + _valuesPerMini, blockLen);
-        final mini = List<int>.filled(_valuesPerMini, 0);
+      for (int miniblock = 0; miniblock < used; miniblock++) {
+        final start = miniblock * _valuesPerMiniblock;
+        final end = math.min(start + _valuesPerMiniblock, block);
+        final values = List<int>.filled(_valuesPerMiniblock, 0);
         // The spec makes `delta - minDelta` a UINT64, so its width must be
         // measured unsigned. A spread reaching 2^63 wraps to a negative Dart
         // int; comparing those signed let the max stay 0, the width stay 0, and
-        // the block encode as zero bytes — every delta then decoded as minDelta.
+        // the block encode as zero bytes: every delta then decoded as minDelta.
         // Tracking the WIDTH rather than the value avoids an unsigned compare
-        // entirely (a negative d is, as a uint64, exactly 64 bits wide).
-        int bw = 0;
+        // entirely (a negative delta is, as a uint64, exactly 64 bits wide).
+        int widest = 0;
         for (int j = start; j < end; j++) {
-          final d = _wrap(deltas[i + j] - minDelta);
-          mini[j - start] = d;
-          final width = d < 0 ? _bits : d.bitLength;
-          if (width > bw) bw = width;
+          final delta = _wrap(deltas[i + j] - minDelta);
+          values[j - start] = delta;
+          final width = delta < 0 ? _bits : delta.bitLength;
+          if (width > widest) widest = width;
         }
-        widths[mb] = bw;
-        bodies.add(RleBitpackedHybrid.packBits(mini, bw));
+        widths[miniblock] = widest;
+        bodies.add(RleBitpackedHybrid.packBits(values, widest));
       }
-      for (final w in widths) {
-        out.addByte(w);
+      for (final width in widths) {
+        out.addByte(width);
       }
-      for (final b in bodies) {
-        out.add(b);
+      for (final body in bodies) {
+        out.add(body);
       }
-      i += blockLen;
+      i += block;
     }
     return out.toBytes();
   }
 
-  void _uleb(BytesBuilder out, int value) {
-    while ((value & ~0x7f) != 0) {
-      out.addByte((value & 0x7f) | 0x80);
-      value >>>= 7;
-    }
-    out.addByte(value & 0x7f);
-  }
+  void _uleb(BytesBuilder out, int value) => writeVarint(out, value);
 
-  void _zigzag(BytesBuilder out, int n) => _uleb(out, (n << 1) ^ (n >> 63));
+  void _zigzag(BytesBuilder out, int value) => writeVarint(out, zigzag(value));
 }
 
 /// Factory for creating encoders

@@ -1,8 +1,12 @@
 import 'dart:typed_data';
 import '../../../core/column.dart';
+import '../../../core/failure.dart';
+import '../../../core/result.dart';
+import '../compression.dart' show ParquetCodec;
 import '../thrift/parquet_thrift.dart' as thrift;
 import '../parquet_writer.dart';
 import 'file_writer.dart';
+import '../encoding/page_encoder.dart' show valueBytes;
 import 'page_writer.dart';
 
 /// Writes a column to a Parquet file
@@ -25,20 +29,21 @@ class ColumnWriter {
     // required columns carry none.
     final optional =
         element.repetitionType == thrift.FieldRepetitionType.optional;
+    if (!optional && values.contains(null)) _required();
     final defLevels = optional
-        ? [for (final v in values) v == null ? 0 : 1]
+        ? [for (final value in values) value == null ? 0 : 1]
         : null;
 
     // Create page writer
     final pageWriter = PageWriter(
       writer: writer,
-      codecType: options.compression,
+      codecType: options.compression.codec,
       checksums: options.writeChecksums,
       writeStats: options.writeStatistics,
     );
 
     // Write column with pages. Statistics honor writeStatistics inside
-    // PageWriter (the single gate for flat and nested columns alike).
+    // PageWriter (the single check for flat and nested columns alike).
     final metadata = await pageWriter.writeColumn(
       element.name!,
       element.type!,
@@ -54,7 +59,7 @@ class ColumnWriter {
   /// Write a flat numeric column from its typed buffer, skipping the boxing that
   /// [write] does. Low-cardinality numeric columns (dictionary) fall back to the
   /// boxed path; PLAIN/DELTA encode straight from the buffer.
-  Future<thrift.ColumnChunk> writeTyped(NumericColumn column) async {
+  Future<thrift.ColumnChunk> writeTyped(NumericVector column) async {
     final encoding = chooseEncodingTyped(column);
     if (encoding == thrift.Encoding.rleDictionary) {
       return write(column.toList());
@@ -65,13 +70,17 @@ class ColumnWriter {
 
     final optional =
         element.repetitionType == thrift.FieldRepetitionType.optional;
+    final nulls = column.nulls;
+    if (!optional && nulls != null && nulls.any((byte) => byte != 0)) {
+      _required();
+    }
     List<int>? defLevels;
     if (optional) {
-      final n = column.length;
-      final levels = Uint8List(n)..fillRange(0, n, 1);
-      final bitmap = column.rawNullBitmap;
+      final count = column.length;
+      final levels = Uint8List(count)..fillRange(0, count, 1);
+      final bitmap = column.nulls;
       if (bitmap != null) {
-        for (int i = 0; i < n; i++) {
+        for (int i = 0; i < count; i++) {
           if ((bitmap[i >> 3] & (1 << (i & 7))) != 0) levels[i] = 0;
         }
       }
@@ -80,7 +89,7 @@ class ColumnWriter {
 
     final pageWriter = PageWriter(
       writer: writer,
-      codecType: options.compression,
+      codecType: options.compression.codec,
       checksums: options.writeChecksums,
       writeStats: options.writeStatistics,
     );
@@ -99,28 +108,28 @@ class ColumnWriter {
   /// Cardinality/encoding decision for a typed numeric column, probing the raw
   /// buffer without boxing. Mirrors [chooseEncoding]: dictionary for low-card
   /// integers, DELTA for other integers, PLAIN for floats.
-  thrift.Encoding chooseEncodingTyped(NumericColumn column) {
+  thrift.Encoding chooseEncodingTyped(NumericVector column) {
     final type = element.type!;
     final isInt =
         type == thrift.ParquetType.int32 || type == thrift.ParquetType.int64;
     if (!isInt) return thrift.Encoding.plain;
 
-    final data = column.rawBuffer as List<int>;
-    final bitmap = column.rawNullBitmap;
-    final n = column.length;
+    final data = column.raw as List<int>;
+    final bitmap = column.nulls;
+    final length = column.length;
     const cap = 4096;
     final unique = <int>{};
     int count = 0;
-    bool highCard = false;
-    for (int i = 0; i < n; i++) {
+    bool varied = false;
+    for (int i = 0; i < length; i++) {
       if (bitmap != null && (bitmap[i >> 3] & (1 << (i & 7))) != 0) continue;
       count++;
-      if (!highCard) {
+      if (!varied) {
         unique.add(data[i]);
-        if (unique.length > cap) highCard = true;
+        if (unique.length > cap) varied = true;
       }
     }
-    if (!highCard && count > 0 && unique.length <= count ~/ 2) {
+    if (!varied && count > 0 && unique.length <= count ~/ 2) {
       return thrift.Encoding.rleDictionary;
     }
     return thrift.Encoding.deltaBinaryPacked;
@@ -132,34 +141,38 @@ class ColumnWriter {
     final type = element.type!;
     final isInt =
         type == thrift.ParquetType.int32 || type == thrift.ParquetType.int64;
-    final dictable = isInt || type == thrift.ParquetType.byteArray;
-    if (!dictable) return thrift.Encoding.plain;
+    final eligible = isInt || type == thrift.ParquetType.byteArray;
+    if (!eligible) return thrift.Encoding.plain;
 
     // Cheap cardinality probe; bail out once it is clearly high. A few thousand
-    // distinct is plenty to decide dictionary-vs-not — a high-cardinality column
+    // distinct is plenty to decide dictionary-vs-not: a high-cardinality column
     // (id/timestamp) then stops hashing after ~[cap] values instead of 64k.
+    // The dictionary is one page, so its values share the page byte budget.
     const cap = 4096;
+    const budget = 1 << 20;
     final unique = <dynamic>{};
+    var size = 0;
     int count = 0;
-    bool highCard = false;
-    for (final v in values) {
-      if (v == null) continue;
+    bool varied = false;
+    for (final value in values) {
+      if (value == null) continue;
       count++;
-      if (!highCard) {
-        unique.add(v);
-        if (unique.length > cap) highCard = true;
+      if (!varied && unique.add(value)) {
+        size += valueBytes(value);
+        if (unique.length > cap || size > budget) varied = true;
       }
     }
 
-    if (!highCard && count > 0 && unique.length <= count ~/ 2) {
+    if (!varied && count > 0 && unique.length <= count ~/ 2) {
       return thrift.Encoding.rleDictionary;
     }
     return isInt ? thrift.Encoding.deltaBinaryPacked : thrift.Encoding.plain;
   }
 
-  /// Check if encoding is dictionary-based
-  bool isDictionary(thrift.Encoding encoding) {
-    return encoding == thrift.Encoding.plainDictionary ||
-        encoding == thrift.Encoding.rleDictionary;
-  }
+  /// A required column holds no nulls: it is written without definition
+  /// levels, so a null would leave the page short of values.
+  Never _required() => throw Failure.of(
+    Kind.invalid,
+    'Column ${element.name} is required but holds a null',
+  );
 }

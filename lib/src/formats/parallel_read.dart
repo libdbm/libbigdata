@@ -2,7 +2,7 @@ import '../core/table.dart';
 import '../core/row_filter.dart';
 import 'scan.dart';
 
-/// A fully-serializable description of one file read — safe to send to an
+/// A fully-serializable description of one file read: safe to send to an
 /// isolate ([path] is a String, [filter] a closure-free [RowFilter] tree).
 class ReadSpec {
   final String path;

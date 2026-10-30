@@ -1,9 +1,9 @@
 # https://dart.dev/guides/libraries/private-files
 #
 # NOTE: this file governs GitHub. It does NOT govern the published pub.dev
-# archive — `.pubignore` takes precedence over `.gitignore` and is what keeps
-# the archive at ~450 KB. Both files are load-bearing; editing one does not
-# change the other.
+# archive: `.pubignore` takes precedence over `.gitignore` and is what keeps
+# the archive at ~450 KB. Each file governs its own target; editing one does
+# not change the other.
 
 # Created by `dart pub`
 .dart_tool/

@@ -1,49 +1,69 @@
 import 'package:petitparser/petitparser.dart';
+import '../../core/conversions.dart' show parseUtc;
 import '../ast/ast.dart';
+import 'limits.dart';
 
 /// SQL Parser using PetitParser
 class SqlParser {
   late final Parser<Statement> _parser;
+  late final Parser<Expression> _expression;
 
   SqlParser() {
     _parser = _buildParser();
+    final grammar = SqlGrammarDefinition();
+    _expression = grammar
+        .buildFrom(grammar.expression().end())
+        .cast<Expression>();
   }
 
   /// Cap on raw statement length and parenthesis nesting depth. The grammar is
-  /// recursive-descent, so deeply nested parens would overflow the native stack
-  /// (an uncatchable crash) — bound them before parsing turns untrusted SQL into
-  /// a DoS surface.
+  /// recursive-descent, so deeply nested parens would overflow the stack. Both
+  /// are bounded before parsing so untrusted SQL is not a DoS surface; a
+  /// [StackOverflowError] the depth scan does not model is still caught and
+  /// reported as a [FormatException].
   static const _maxSqlLength = 1 << 20; // 1 MiB of SQL text
   static const _maxNestingDepth = 256;
 
+  /// Parse [text] as one complete expression, such as a constraint predicate.
+  /// Nothing may follow it, so text that closes a surrounding parenthesis is
+  /// rejected with a [FormatException].
+  Expression parseExpression(String text) => _run(text, _expression);
+
   /// Parse SQL string into AST
-  Statement parse(String sql) {
+  Statement parse(String sql) => _run(sql, _parser);
+
+  T _run<T>(String sql, Parser<T> parser) {
     if (sql.length > _maxSqlLength) {
       throw FormatException(
         'SQL statement too large: ${sql.length} chars '
         '(limit $_maxSqlLength)',
       );
     }
-    _guardDepth(sql);
+    final text = _blankComments(sql);
+    _guardDepth(text);
 
-    final Result<Statement> result;
+    final Result<T> result;
     try {
-      result = _parser.parse(sql);
+      result = parser.parse(text);
+    } on StackOverflowError {
+      // Backstop for nesting the depth scan does not model.
+      throw FormatException('SQL nesting too deep', sql);
     } on FormatException catch (e) {
       // A numeric literal that overflows 64 bits is rejected by int.parse inside
       // the grammar; surface it in the normal parse-error shape rather than a
       // raw FormatException leaking from deep in the parser.
       throw FormatException('SQL Parse Error: ${e.message}', sql);
     }
-    if (result is Success<Statement>) {
+    if (result is Success<T>) {
+      checkLimits(result.value as Object);
       return result.value;
     }
 
     // Improved error reporting
     final failure = result as Failure;
-    final lineAndCol = _getLineAndColumn(sql, failure.position);
+    final location = _getLineAndColumn(sql, failure.position);
     throw FormatException(
-      'SQL Parse Error at line ${lineAndCol.line}, column ${lineAndCol.column}: ${failure.message}',
+      'SQL Parse Error at line ${location.line}, column ${location.column}: ${failure.message}',
       sql,
       failure.position,
     );
@@ -54,18 +74,74 @@ class SqlParser {
     return builder.build().cast<Statement>();
   }
 
-  /// Reject pathologically nested parentheses before recursive-descent parsing
-  /// overflows the stack. All three grammar string/identifier quotes (`'`, `"`,
-  /// backtick) are skipped so parens inside quoted text don't trip the guard.
+  /// [sql] with each `--` line comment and `/* */` block comment replaced by
+  /// spaces (newlines kept), so the grammar sees whitespace and every position
+  /// in an error message still points into the original text. Quoted text is
+  /// left alone.
+  static String _blankComments(String sql) {
+    final out = StringBuffer();
+    var quote = 0; // 0 = not in quoted text; else the opening quote code unit
+    var i = 0;
+    while (i < sql.length) {
+      final c = sql.codeUnitAt(i);
+      final next = i + 1 < sql.length ? sql.codeUnitAt(i + 1) : 0;
+      if (quote != 0) {
+        if (c == quote) quote = 0; // a doubled quote re-opens next iteration
+      } else if (c == 0x27 || c == 0x22 || c == 0x60) {
+        quote = c; // ' " `
+      } else if (c == 0x2D && next == 0x2D) {
+        // -- to the end of the line
+        while (i < sql.length && sql.codeUnitAt(i) != 0x0A) {
+          out.write(' ');
+          i++;
+        }
+        continue;
+      } else if (c == 0x2F && next == 0x2A) {
+        // /* to the next */
+        final end = sql.indexOf('*/', i + 2);
+        if (end < 0) {
+          throw FormatException('Unterminated /* comment', sql, i);
+        }
+        for (var k = i; k < end + 2; k++) {
+          out.write(sql.codeUnitAt(k) == 0x0A ? '\n' : ' ');
+        }
+        i = end + 2;
+        continue;
+      }
+      out.writeCharCode(c);
+      i++;
+    }
+    return out.toString();
+  }
+
+  /// Reject pathologically nested parentheses and CASE ... END blocks before
+  /// recursive-descent parsing overflows the stack. All three grammar
+  /// string/identifier quotes (`'`, `"`, backtick) are skipped so text inside
+  /// them doesn't trip the guard.
   void _guardDepth(String sql) {
     int depth = 0, max = 0;
     int quote = 0; // 0 = not in a string; else the opening quote code unit
-    for (int i = 0; i < sql.length; i++) {
-      final c = sql.codeUnitAt(i);
+    int word = -1; // start of the current bare word, or -1
+    for (int i = 0; i <= sql.length; i++) {
+      final c = i < sql.length ? sql.codeUnitAt(i) : 0x20;
       if (quote != 0) {
         // closing quote (a doubled quote re-opens next iter)
         if (c == quote) quote = 0;
         continue;
+      }
+      if (_isWordChar(c)) {
+        if (word < 0) word = i;
+        continue;
+      }
+      if (word >= 0) {
+        final token = sql.substring(word, i).toUpperCase();
+        word = -1;
+        if (token == 'CASE') {
+          depth++;
+          if (depth > max) max = depth;
+        } else if (token == 'END' && depth > 0) {
+          depth--;
+        }
       }
       if (c == 0x27 || c == 0x22 || c == 0x60) {
         quote = c; // opening '  "  or  `
@@ -80,6 +156,12 @@ class SqlParser {
       throw FormatException('SQL nesting too deep: $max levels', sql);
     }
   }
+
+  static bool _isWordChar(int c) =>
+      (c >= 0x30 && c <= 0x39) || // 0-9
+      (c >= 0x41 && c <= 0x5A) || // A-Z
+      (c >= 0x61 && c <= 0x7A) || // a-z
+      c == 0x5F; // _
 
   /// Get line and column from position
   ({int line, int column}) _getLineAndColumn(String text, int position) {
@@ -104,7 +186,7 @@ class SqlGrammarDefinition extends GrammarDefinition {
   @override
   Parser start() => ref0(statement).end();
 
-  // Main statement parser — DML/DDL first, else a query.
+  // Main statement parser: DML/DDL first, else a query.
   Parser<Statement> statement() =>
       (ref0(updateStatement) |
               ref0(insertStatement) |
@@ -131,9 +213,10 @@ class SqlGrammarDefinition extends GrammarDefinition {
                       char(')').trim())
                   .optional() &
               ref1(keyword, 'AS') &
-              char('(').trim() &
-              ref0(selectStatement) &
-              char(')').trim())
+              // The body may be parenthesised or bare, as in other engines.
+              ((char('(').trim() & ref0(selectStatement) & char(')').trim())
+                      .pick(1) |
+                  ref0(selectStatement)))
           .map((values) {
             final orReplace = values[1] != null;
             final ifNotExists = values[3] != null;
@@ -141,7 +224,7 @@ class SqlGrammarDefinition extends GrammarDefinition {
             final columns = values[5] != null
                 ? (values[5][1] as List).cast<String>()
                 : <String>[];
-            final query = values[8] as SelectStatement;
+            final query = values[7] as SelectStatement;
             return CreateViewStatement(
               name: name,
               columns: columns,
@@ -235,13 +318,27 @@ class SqlGrammarDefinition extends GrammarDefinition {
                       char('*').trim())
                   .optional())
           .map((values) {
+            final path = values[2] as String;
             final source = values[5];
             final action = values[12] as String;
+            // Each ON pair is (target, source): a pair written the other way
+            // round names the source's qualifier first, or the target's last.
+            final target = _mergeName(values[3]) ?? _basename(path);
+            final named = _mergeName(values[6]) ?? _sourceName(source);
+            final pairs = [
+              for (final (left, right)
+                  in (values[8] as List)
+                      .cast<((String?, String), (String?, String))>())
+                left.$1 == named || (right.$1 == target && left.$1 != target)
+                    ? (right.$2, left.$2)
+                    : (left.$2, right.$2),
+            ];
             return MergeStatement(
-              targetPath: values[2] as String,
+              targetPath: path,
               sourcePath: source is String ? source : null,
               sourceQuery: source is SelectStatement ? source : null,
-              onKeys: (values[8] as List).cast<String>(),
+              onKeys: [for (final pair in pairs) pair.$1],
+              sourceKeys: [for (final pair in pairs) pair.$2],
               matchedUpdateAll: action == 'update',
               matchedDelete: action == 'delete',
               notMatchedInsert: values[13] != null,
@@ -250,27 +347,65 @@ class SqlGrammarDefinition extends GrammarDefinition {
 
   Parser mergeAlias() => ref1(keyword, 'AS').optional() & ref0(identifier);
 
+  /// A MERGE source: a file path, a parenthesized SELECT, or a table name
+  /// (read as `SELECT * FROM name`, as in the SQL.md example).
   Parser mergeSource() =>
       (ref0(filePathLiteral) |
       (char('(').trim() & ref0(selectStatement) & char(')').trim()).map(
         (v) => v[1],
+      ) |
+      ref0(identifier).map(
+        (name) => SelectStatement(
+          selectList: [StarSelectItem()],
+          from: [SimpleTable(table: name as String)],
+        ),
       ));
 
-  Parser<List<String>> mergeCondition() => ref0(mergeEquality)
-      .plusSeparated(ref1(keyword, 'AND'))
-      .map((eqs) => eqs.elements.cast<String>());
+  Parser<List<((String?, String), (String?, String))>> mergeCondition() =>
+      ref0(mergeEquality)
+          .plusSeparated(ref1(keyword, 'AND'))
+          .map(
+            (pairs) =>
+                pairs.elements.cast<((String?, String), (String?, String))>(),
+          );
 
-  Parser<String> mergeEquality() =>
-      (ref0(qualifiedColumn) & char('=').trim() & ref0(qualifiedColumn)).map(
-        (values) => values[0] as String,
-      );
+  /// One ON equality, both sides kept: `t.id = s.key` merges on two names.
+  Parser<((String?, String), (String?, String))> mergeEquality() =>
+      (ref0(qualifiedColumn) &
+              (string('==') | char('=')).trim() &
+              ref0(qualifiedColumn))
+          .map(
+            (values) => (
+              values[0] as (String?, String),
+              values[2] as (String?, String),
+            ),
+          );
 
-  Parser<String> qualifiedColumn() =>
+  Parser<(String?, String)> qualifiedColumn() =>
       (ref0(identifier) & (char('.') & ref0(identifier)).optional()).map(
         (values) => values[1] != null
-            ? (values[1] as List)[1] as String
-            : values[0] as String,
+            ? (values[0] as String?, (values[1] as List)[1] as String)
+            : (null, values[0] as String),
       );
+
+  /// The alias a [mergeAlias] parse holds, or null when absent.
+  static String? _mergeName(Object? alias) =>
+      alias is List ? alias.last as String : null;
+
+  /// A MERGE source's default qualifier: a path's basename or a table's name.
+  static String? _sourceName(Object? source) => switch (source) {
+    final String path => _basename(path),
+    SelectStatement(from: [SimpleTable(:final table, isFilePath: false)]) =>
+      table,
+    _ => null,
+  };
+
+  /// The basename of [path] without its extension (`data/a.csv` is `a`).
+  static String _basename(String path) {
+    final name = path.split(RegExp(r'[/\\]')).last;
+    final dot = name.lastIndexOf('.');
+    return dot > 0 ? name.substring(0, dot) : name;
+  }
 
   Parser<String> matchedAction() =>
       ((ref1(keyword, 'UPDATE') & ref1(keyword, 'SET') & char('*').trim()).map(
@@ -389,7 +524,7 @@ class SqlGrammarDefinition extends GrammarDefinition {
               orderBy: orderBy ?? const [],
               limit: limitOffset?[0],
               offset: limitOffset?[1],
-              setOps: tails,
+              operations: tails,
             );
           });
 
@@ -404,9 +539,9 @@ class SqlGrammarDefinition extends GrammarDefinition {
   Parser<SelectItem> selectItem() =>
       (ref0(expression) & (ref1(keyword, 'AS') & ref0(identifier)).optional())
           .map((values) {
-            final expr = values[0] as Expression;
+            final term = values[0] as Expression;
             final alias = values[1]?[1] as String?;
-            return SelectItem(expression: expr, alias: alias);
+            return SelectItem(expression: term, alias: alias);
           });
 
   // FROM clause
@@ -417,10 +552,14 @@ class SqlGrammarDefinition extends GrammarDefinition {
               ).plusSeparated(char(',').trim()).map((l) => l.elements))
           .map((values) => (values[1] as List).cast<TableReference>());
 
+  // One table followed by any joins. Trying "table plus joins" before "table"
+  // re-parsed the table on backtrack, doubling the work per nesting level.
   Parser<TableReference> tableReference() =>
-      (ref0(joinedTable).cast<TableReference>() |
-              ref0(simpleTable).cast<TableReference>())
-          .cast<TableReference>();
+      (ref0(simpleTable) & ref0(joinClause).star()).map((values) {
+        final left = values[0] as TableReference;
+        final joins = (values[1] as List).cast<JoinClause>();
+        return joins.isEmpty ? left : JoinedTable(left: left, joins: joins);
+      });
 
   Parser<TableReference> simpleTable() =>
       (ref0(filePath).cast<TableReference>() |
@@ -433,12 +572,13 @@ class SqlGrammarDefinition extends GrammarDefinition {
   Parser<SimpleTable> filePath() =>
       (ref0(filePathLiteral) & ref0(tableAlias).optional()).map((values) {
         final path = values[0] as String;
-        final aliasInfo = values[1] as List?;
+        final suffix = values[1] as List?;
 
         return SimpleTable(
           table: path,
-          alias: aliasInfo?[0] as String?,
+          alias: suffix?[0] as String?,
           isFilePath: true,
+          columns: suffix?[1] as List<String>?,
         );
       });
 
@@ -449,9 +589,13 @@ class SqlGrammarDefinition extends GrammarDefinition {
   Parser<SimpleTable> tableName() =>
       (ref0(identifier) & ref0(tableAlias).optional()).map((values) {
         final name = values[0] as String;
-        final aliasInfo = values[1] as List?;
+        final suffix = values[1] as List?;
 
-        return SimpleTable(table: name, alias: aliasInfo?[0] as String?);
+        return SimpleTable(
+          table: name,
+          alias: suffix?[0] as String?,
+          columns: suffix?[1] as List<String>?,
+        );
       });
 
   Parser<List> tableAlias() =>
@@ -480,11 +624,12 @@ class SqlGrammarDefinition extends GrammarDefinition {
               ref0(tableAlias))
           .map((values) {
             final subquery = values[1] as SelectStatement;
-            final aliasInfo = values[3] as List;
+            final suffix = values[3] as List;
 
             return SubqueryTable(
               subquery: subquery,
-              alias: aliasInfo[0] as String,
+              alias: suffix[0] as String,
+              columns: suffix[1] as List<String>?,
             );
           });
 
@@ -496,12 +641,12 @@ class SqlGrammarDefinition extends GrammarDefinition {
               ref0(tableAlias).optional())
           .map((values) {
             final rows = (values[1] as List).cast<List<Expression>>();
-            final aliasInfo = values[2] as List?;
+            final suffix = values[2] as List?;
 
             return ValuesTable(
               values: rows,
-              alias: aliasInfo?[0] as String?,
-              columnAliases: aliasInfo?[1] as List<String>?,
+              alias: suffix?[0] as String?,
+              columnAliases: suffix?[1] as List<String>?,
             );
           });
 
@@ -514,26 +659,29 @@ class SqlGrammarDefinition extends GrammarDefinition {
           .map((values) => (values[1] as List).cast<Expression>());
 
   // JOIN support
-  Parser<JoinedTable> joinedTable() =>
-      (ref0(simpleTable) & ref0(joinClause).plus()).map((values) {
-        final left = values[0] as TableReference;
-        final joins = (values[1] as List).cast<JoinClause>();
-
-        return JoinedTable(left: left, joins: joins);
-      });
-
   Parser<JoinClause> joinClause() =>
       (ref0(joinType) &
               ref1(keyword, 'JOIN') &
               ref0(simpleTable) &
               ref0(joinCondition).optional())
-          .map(
-            (values) => JoinClause(
-              type: values[0] as JoinType,
+          .map((values) {
+            final type = values[0] as JoinType;
+            final condition = values[3] as JoinCondition?;
+            // Only CROSS JOIN takes no condition, as in PostgreSQL and DuckDB;
+            // any other join without one is an error, never a silent cross
+            // join.
+            if (condition == null && type != JoinType.cross) {
+              throw FormatException(
+                '${type.name.toUpperCase()} JOIN needs ON or USING '
+                '(write CROSS JOIN for every pairing of rows)',
+              );
+            }
+            return JoinClause(
+              type: type,
               right: values[2] as TableReference,
-              condition: values[3] as JoinCondition?,
-            ),
-          );
+              condition: condition,
+            );
+          });
 
   Parser<JoinType> joinType() =>
       (ref1(keyword, 'INNER') |
@@ -616,20 +764,18 @@ class SqlGrammarDefinition extends GrammarDefinition {
                       (ref1(keyword, 'FIRST') | ref1(keyword, 'LAST')))
                   .optional())
           .map((values) {
-            final expr = values[0] as Expression;
+            final term = values[0] as Expression;
             // keyword() flattens the ORIGINAL (case-preserved) text, so a
             // lowercase `asc` would fail an `== 'ASC'` check and sort DESCENDING.
-            final dir = (values[1] as String?)?.toUpperCase();
-            final ascending = dir == null || dir == 'ASC';
+            final direction = (values[1] as String?)?.toUpperCase();
+            final ascending = direction == null || direction == 'ASC';
             final nulls = (values[2] as List?)?[1] as String?;
-            // Explicit NULLS FIRST/LAST wins; otherwise default to the SQL
-            // convention (NULLS FIRST for DESC, NULLS LAST for ASC), matching
-            // Postgres/DuckDB.
-            final nullsFirst = nulls != null
-                ? nulls.toUpperCase() == 'FIRST'
-                : !ascending;
+            // Explicit NULLS FIRST/LAST wins; otherwise NULLS LAST in both
+            // directions, as in DuckDB (the default was NULLS FIRST for DESC,
+            // which is Postgres's).
+            final nullsFirst = nulls?.toUpperCase() == 'FIRST';
             return OrderByItem(
-              expression: expr,
+              expression: term,
               ascending: ascending,
               nullsFirst: nullsFirst,
             );
@@ -660,7 +806,7 @@ class SqlGrammarDefinition extends GrammarDefinition {
           .map((values) {
             // keyword() flattens the ORIGINAL (case-preserved) text, so without
             // normalizing, a lowercase `union`/`intersect` fails every branch and
-            // falls to the `except` default — silently returning wrong results.
+            // falls to the `except` default: silently returning wrong results.
             // Collapse interior whitespace too: `UNION  ALL` (two spaces, or a
             // newline) failed startsWith('UNION ALL') and silently DEDUPED as
             // plain UNION.
@@ -670,7 +816,7 @@ class SqlGrammarDefinition extends GrammarDefinition {
                 .replaceAll(RegExp(r'\s+'), ' ');
             final core = values[1] as SelectStatement;
 
-            final setOpType = switch (operator) {
+            final kind = switch (operator) {
               final String s when s.startsWith('UNION ALL') =>
                 SetOperationType.unionAll,
               final String s when s.startsWith('UNION') =>
@@ -679,7 +825,7 @@ class SqlGrammarDefinition extends GrammarDefinition {
               _ => SetOperationType.except,
             };
 
-            return SetOperation(type: setOpType, right: core);
+            return SetOperation(type: kind, right: core);
           });
 
   // Expressions
@@ -687,8 +833,8 @@ class SqlGrammarDefinition extends GrammarDefinition {
 
   Parser<Expression> orExpression() =>
       ref0(andExpression).plusSeparated(ref1(keyword, 'OR')).map((values) {
-        final exprs = values.elements.cast<Expression>();
-        return exprs.reduce(
+        final operands = values.elements.cast<Expression>();
+        return operands.reduce(
           (left, right) =>
               BinaryExpression(left: left, operator: 'OR', right: right),
         );
@@ -696,8 +842,8 @@ class SqlGrammarDefinition extends GrammarDefinition {
 
   Parser<Expression> andExpression() =>
       ref0(notExpression).plusSeparated(ref1(keyword, 'AND')).map((values) {
-        final exprs = values.elements.cast<Expression>();
-        return exprs.reduce(
+        final operands = values.elements.cast<Expression>();
+        return operands.reduce(
           (left, right) =>
               BinaryExpression(left: left, operator: 'AND', right: right),
         );
@@ -708,14 +854,16 @@ class SqlGrammarDefinition extends GrammarDefinition {
         values,
       ) {
         final not = values[0] != null;
-        final expr = values[1] as Expression;
-        return not ? UnaryExpression(operator: 'NOT', operand: expr) : expr;
+        final operand = values[1] as Expression;
+        return not
+            ? UnaryExpression(operator: 'NOT', operand: operand)
+            : operand;
       });
 
   Parser comparisonExpression() =>
       (ref0(additiveExpression) &
               (ref0(betweenPredicate) |
-                      ref0(inListPredicate) |
+                      ref0(inPredicate) |
                       ref0(comparisonOperator))
                   .optional())
           .map((values) {
@@ -766,13 +914,9 @@ class SqlGrammarDefinition extends GrammarDefinition {
                 );
               case 'IN':
               case 'NOT IN':
-                // The value-list form is taken by `inListPredicate` above, so
-                // reaching here means a subquery: `x IN (SELECT …)`.
                 return InExpression(
                   expression: left,
-                  subquery: tail[1] is SubqueryExpression
-                      ? (tail[1] as SubqueryExpression).subquery
-                      : null,
+                  subquery: tail[1] as SelectStatement,
                   negated: tag == 'NOT IN',
                 );
               default: // comparisonOperator: [op, right]
@@ -784,7 +928,7 @@ class SqlGrammarDefinition extends GrammarDefinition {
             }
           });
 
-  // `x [NOT] BETWEEN lo AND hi` — bounds are additive (so the `AND` isn't eaten
+  // `x [NOT] BETWEEN lo AND hi`: bounds are additive (so the `AND` isn't eaten
   // by the enclosing AND-expression). Normalized to [tag, lo, hi].
   Parser betweenPredicate() =>
       (((ref1(keyword, 'NOT') & ref1(keyword, 'BETWEEN')).map(
@@ -796,24 +940,33 @@ class SqlGrammarDefinition extends GrammarDefinition {
               ref0(additiveExpression))
           .map((v) => [v[0], v[1], v[3]]);
 
-  // `x [NOT] IN (v1, v2, …)` — a VALUE list (a subquery `IN (SELECT …)` fails the
-  // `expression` element and falls through to the subquery IN in
-  // [comparisonOperator]). Normalized to [tag, List<Expression>].
-  Parser inListPredicate() =>
-      (((ref1(keyword, 'NOT') & ref1(keyword, 'IN')).map((_) => 'NOT_IN_LIST') |
-                  ref1(keyword, 'IN').map((_) => 'IN_LIST')) &
+  // `x [NOT] IN (SELECT …)` or `x [NOT] IN (v1, v2, …)`. The parenthesis is
+  // consumed once and the subquery tried before the list, so a malformed
+  // list is not re-parsed as a subquery (nested lists were exponential).
+  // Normalized to [tag, SelectStatement] or [tag, List<Expression>].
+  Parser inPredicate() =>
+      (((ref1(keyword, 'NOT') & ref1(keyword, 'IN')).map((_) => 'NOT') |
+                  ref1(keyword, 'IN').map((_) => '')) &
               char('(').trim() &
-              ref0(
-                expression,
-              ).plusSeparated(char(',').trim()).map((l) => l.elements) &
+              (ref0(selectStatement).map((query) => ['IN', query]) |
+                  ref0(expression)
+                      .plusSeparated(char(',').trim())
+                      .map((l) => ['IN_LIST', l.elements])) &
               char(')').trim())
-          .map((v) => [v[0], (v[2] as List).cast<Expression>()]);
+          .map((v) {
+            final body = v[2] as List;
+            final tag = v[0] == 'NOT'
+                ? (body[0] == 'IN' ? 'NOT IN' : 'NOT_IN_LIST')
+                : body[0] as String;
+            return [tag, body[1]];
+          });
 
   Parser comparisonOperator() =>
       ((string('<=') |
                   string('>=') |
                   string('<>') |
                   string('!=') |
+                  string('==').map((_) => '=') |
                   char('<') |
                   char('>') |
                   char('=')) |
@@ -821,10 +974,6 @@ class SqlGrammarDefinition extends GrammarDefinition {
                 (_) => 'NOT LIKE',
               )) |
               (ref1(keyword, 'LIKE').map((_) => 'LIKE')) |
-              ((ref1(keyword, 'NOT') & ref1(keyword, 'IN')).map(
-                (_) => 'NOT IN',
-              )) |
-              (ref1(keyword, 'IN').map((_) => 'IN')) |
               ((ref1(keyword, 'IS') & ref1(keyword, 'NOT')).map(
                 (_) => 'IS NOT',
               )) |
@@ -832,7 +981,7 @@ class SqlGrammarDefinition extends GrammarDefinition {
           .trim() &
       ref0(additiveExpression);
 
-  /// Folds `a OP b OP c` left — `(a OP b) OP c` — taking each operator from the
+  /// Folds `a OP b OP c` left (`(a OP b) OP c`) taking each operator from the
   /// separator it was parsed from. `foldLeft` returns a lone element untouched,
   /// so a single operand yields no [BinaryExpression].
   Expression _foldLeft(SeparatedList<Expression, String> chain) =>
@@ -855,14 +1004,14 @@ class SqlGrammarDefinition extends GrammarDefinition {
       ((char('+') | char('-')).trim().optional() & ref0(primaryExpression)).map(
         (values) {
           final sign = values[0] as String?;
-          final expr = values[1] as Expression;
+          final operand = values[1] as Expression;
 
           if (sign == '-') {
-            return UnaryExpression(operator: '-', operand: expr);
+            return UnaryExpression(operator: '-', operand: operand);
           } else if (sign == '+') {
-            return UnaryExpression(operator: '+', operand: expr);
+            return UnaryExpression(operator: '+', operand: operand);
           }
-          return expr;
+          return operand;
         },
       );
 
@@ -944,20 +1093,20 @@ class SqlGrammarDefinition extends GrammarDefinition {
               char(')').trim())
           .map((values) {
             final name = values[0] as String;
-            final argsInfo = values[2] as List?;
+            final parts = values[2] as List?;
 
-            if (argsInfo == null) {
+            if (parts == null) {
               return FunctionExpression(name: name, arguments: []);
             }
 
-            final distinct = argsInfo[0] != null;
-            final args = argsInfo[1] is List
-                ? (argsInfo[1] as List).cast<Expression>()
+            final distinct = parts[0] != null;
+            final arguments = parts[1] is List
+                ? (parts[1] as List).cast<Expression>()
                 : <Expression>[];
 
             return FunctionExpression(
               name: name,
-              arguments: args,
+              arguments: arguments,
               distinct: distinct,
             );
           });
@@ -970,16 +1119,16 @@ class SqlGrammarDefinition extends GrammarDefinition {
               ref0(elseClause).optional() &
               ref1(keyword, 'END'))
           .map((values) {
-            final expr = values[1] as Expression?;
+            final subject = values[1] as Expression?;
             // `.plus()` yields a List<dynamic>; a direct `as List<WhenClause>`
             // is a failing downcast, so build a properly-typed view.
             final whenClauses = (values[2] as List).cast<WhenClause>();
-            final elseExpr = values[3] as Expression?;
+            final fallback = values[3] as Expression?;
 
             return CaseExpression(
-              expression: expr,
+              expression: subject,
               whenClauses: whenClauses,
-              elseExpression: elseExpr,
+              elseExpression: fallback,
             );
           });
 
@@ -1008,23 +1157,41 @@ class SqlGrammarDefinition extends GrammarDefinition {
               ref0(dataType) &
               char(')').trim())
           .map((values) {
-            final expr = values[2] as Expression;
+            final operand = values[2] as Expression;
             final type = values[4] as String;
-            return CastExpression(expression: expr, targetType: type);
+            return CastExpression(expression: operand, targetType: type);
           });
 
   // Literals
   Parser literal() =>
       (ref0(nullLiteral) |
       ref0(booleanLiteral) |
+      ref0(temporalLiteral) |
       ref0(numericLiteral) |
       ref0(stringLiteral));
+
+  // `DATE '2024-01-01'` / `TIMESTAMP '2024-01-01 10:00'`: a CAST of the text,
+  // checked here so a malformed literal is a parse error rather than NULL.
+  Parser temporalLiteral() =>
+      ((ref1(keyword, 'DATE') | ref1(keyword, 'TIMESTAMP')) &
+              _quoted("'").trim())
+          .map((values) {
+            final type = (values[0] as String).toUpperCase();
+            final text = values[1] as String;
+            if (parseUtc(text) == null) {
+              throw FormatException("Invalid $type literal '$text'");
+            }
+            return CastExpression(
+              expression: LiteralExpression(text),
+              targetType: type,
+            );
+          });
 
   Parser nullLiteral() =>
       ref1(keyword, 'NULL').map((_) => LiteralExpression(null));
 
   // No .flatten() here: keyword() trims surrounding whitespace, and a flatten
-  // OVER it captures that whitespace too — `'TRUE '.toUpperCase() == 'TRUE'`
+  // OVER it captures that whitespace too: `'TRUE '.toUpperCase() == 'TRUE'`
   // is false, so `SELECT true` literally returned false whenever the literal
   // was followed by a space. keyword() already yields the bare token text.
   Parser booleanLiteral() =>
@@ -1032,9 +1199,37 @@ class SqlGrammarDefinition extends GrammarDefinition {
         (value) => LiteralExpression((value as String).toUpperCase() == 'TRUE'),
       );
 
-  Parser numericLiteral() => (ref0(floatingPoint) | ref0(integer)).map(
-    (value) => LiteralExpression(value),
-  );
+  Parser numericLiteral() =>
+      (ref0(decimalLiteral) |
+      (ref0(floatingPoint) | ref0(integer)).map(
+        (value) => LiteralExpression(value),
+      ));
+
+  /// A number with a point and no exponent is an exact DECIMAL, as in DuckDB:
+  /// `1.50` is DECIMAL(3,2) and `0.1 + 0.2` is exactly 0.3 (it was a double).
+  /// Precision is the digit count without leading zeros, scale the digits
+  /// after the point. Past 38 digits it stays a double, as in DuckDB.
+  Parser decimalLiteral() =>
+      (((digit().plus() & char('.') & digit().star()) |
+                      (char('.') & digit().plus()))
+                  .flatten() &
+              anyOf('eE').not())
+          .pick(0)
+          .trim()
+          .map((text) {
+            final value = text as String;
+            final point = value.indexOf('.');
+            final whole = value
+                .substring(0, point)
+                .replaceFirst(RegExp('^0+'), '');
+            final scale = value.length - point - 1;
+            final precision = whole.length + scale;
+            if (precision > 38) return LiteralExpression(double.parse(value));
+            return CastExpression(
+              expression: LiteralExpression(value),
+              targetType: 'DECIMAL(${precision < 1 ? 1 : precision},$scale)',
+            );
+          });
 
   /// Match a [q]-quoted string in which a doubled quote (`''` / `""`) is an
   /// escaped literal quote (standard SQL); yields the unescaped content.
@@ -1044,8 +1239,8 @@ class SqlGrammarDefinition extends GrammarDefinition {
               char(q))
           .map((v) => (v[1] as List).cast<String>().join());
 
-  Parser stringLiteral() =>
-      (_quoted("'") | _quoted('"')).map((s) => LiteralExpression(s));
+  // Single quotes only: `"..."` is a quoted identifier (standard SQL).
+  Parser stringLiteral() => _quoted("'").map((s) => LiteralExpression(s));
 
   // Reserved keywords that cannot be used as identifiers
   static const reservedKeywords = {
@@ -1129,17 +1324,21 @@ class SqlGrammarDefinition extends GrammarDefinition {
                   ref1(keyword, 'INT') |
                   ref1(keyword, 'BIGINT') |
                   ref1(keyword, 'SMALLINT') |
+                  ref1(keyword, 'TINYINT') |
                   ref1(keyword, 'FLOAT') |
                   ref1(keyword, 'DOUBLE') |
+                  ref1(keyword, 'REAL') |
                   ref1(keyword, 'DECIMAL') |
                   ref1(keyword, 'NUMERIC') |
                   ref1(keyword, 'VARCHAR') |
                   ref1(keyword, 'TEXT') |
                   ref1(keyword, 'BOOLEAN') |
+                  ref1(keyword, 'BOOL') |
+                  ref1(keyword, 'DATETIME') |
                   ref1(keyword, 'DATE') |
-                  ref1(keyword, 'TIME') |
-                  ref1(keyword, 'TIMESTAMP')) &
-              // Optional `(p[,s])` — DECIMAL(10,2), VARCHAR(30), ...
+                  ref1(keyword, 'TIMESTAMP') |
+                  ref1(keyword, 'TIME')) &
+              // Optional `(p[,s])`: DECIMAL(10,2), VARCHAR(30), ...
               (char('(').trim() &
                       ref0(integer) &
                       (char(',').trim() & ref0(integer)).optional() &
@@ -1165,12 +1364,12 @@ class SqlGrammarDefinition extends GrammarDefinition {
   // still falls through to [integer].
   Parser floatingPoint() {
     final digits = digit().plus();
-    final exp = anyOf('eE') & anyOf('+-').optional() & digits;
-    final withDot =
+    final exponent = anyOf('eE') & anyOf('+-').optional() & digits;
+    final fractional =
         ((digits & char('.') & digit().star()) | (char('.') & digits)) &
-        exp.optional();
-    final intWithExp = digits & exp;
-    return (withDot | intWithExp).flatten().trim().map(
+        exponent.optional();
+    final scientific = digits & exponent;
+    return (fractional | scientific).flatten().trim().map(
       (value) => double.parse(value),
     );
   }

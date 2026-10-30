@@ -2,7 +2,7 @@ import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 
-/// A minimal, self-contained FlatBuffers writer/reader — just enough to encode
+/// A minimal, self-contained FlatBuffers writer/reader, just enough to encode
 /// and decode the Apache Arrow IPC metadata messages (Message, Schema, Field,
 /// RecordBatch, Footer and their struct vectors).
 ///
@@ -20,77 +20,77 @@ import 'dart:typed_data';
 // ---------------------------------------------------------------------------
 
 class FbBuilder {
-  ByteData _buf;
-  int _tail = 0; // bytes written, measured from the end of _buf
-  int _maxAlign = 1;
+  ByteData _buffer;
+  int _tail = 0; // bytes written, measured from the end of _buffer
+  int _alignment = 1;
   bool _finished = false;
 
   // Current table state.
-  Uint32List? _fieldTails; // per-field tail location (pre-finish)
-  int _fieldCount = 0;
-  int _tableStart = 0;
+  Uint32List? _tails; // per-field tail location (pre-finish)
+  int _count = 0;
+  int _start = 0;
   final List<int> _vtables = []; // tails of previously written vtables (dedup)
 
-  FbBuilder([int initialSize = 1024]) : _buf = ByteData(initialSize);
+  FbBuilder([int size = 1024]) : _buffer = ByteData(size);
 
-  int get _capacity => _buf.lengthInBytes;
+  int get _capacity => _buffer.lengthInBytes;
 
-  int _size() => _tail + ((-_tail) & (_maxAlign - 1));
+  int _size() => _tail + ((-_tail) & (_alignment - 1));
 
   /// The finished buffer (call [finish] first).
   Uint8List finish(int root) {
     final before = _size();
-    _prepare(max(4, _maxAlign), 1);
+    _prepare(max(4, _alignment), 1);
     final finished = _size();
     _setU32(finished, finished - root);
     for (int i = before + 1; i <= finished - 4; i++) {
       _setU8(i, 0);
     }
     _finished = true;
-    return _buf.buffer.asUint8List(
-      _buf.offsetInBytes + _capacity - finished,
+    return _buffer.buffer.asUint8List(
+      _buffer.offsetInBytes + _capacity - finished,
       finished,
     );
   }
 
   // ---- tables -------------------------------------------------------------
 
-  void startTable(int numFields) {
-    _fieldTails = Uint32List(numFields);
-    _fieldCount = numFields;
-    _tableStart = _tail;
+  void startTable(int count) {
+    _tails = Uint32List(count);
+    _count = count;
+    _start = _tail;
   }
 
-  void addBool(int field, bool value, [bool def = false]) {
-    if (value == def) return;
+  void addBool(int field, bool value, [bool fallback = false]) {
+    if (value == fallback) return;
     _prepare(1, 1);
     _track(field);
-    _buf.setUint8(_capacity - _tail, value ? 1 : 0);
+    _buffer.setUint8(_capacity - _tail, value ? 1 : 0);
   }
 
-  void addUint8(int field, int value, [int def = 0]) {
-    if (value == def) return;
+  void addUint8(int field, int value, [int fallback = 0]) {
+    if (value == fallback) return;
     _prepare(1, 1);
     _track(field);
-    _buf.setUint8(_capacity - _tail, value);
+    _buffer.setUint8(_capacity - _tail, value);
   }
 
-  void addInt16(int field, int value, [int def = 0]) {
-    if (value == def) return;
+  void addInt16(int field, int value, [int fallback = 0]) {
+    if (value == fallback) return;
     _prepare(2, 1);
     _track(field);
     _setI16(_tail, value);
   }
 
-  void addInt32(int field, int value, [int def = 0]) {
-    if (value == def) return;
+  void addInt32(int field, int value, [int fallback = 0]) {
+    if (value == fallback) return;
     _prepare(4, 1);
     _track(field);
     _setI32(_tail, value);
   }
 
-  void addInt64(int field, int value, [int def = 0]) {
-    if (value == def) return;
+  void addInt64(int field, int value, [int fallback = 0]) {
+    if (value == fallback) return;
     _prepare(8, 1);
     _track(field);
     _setI64(_tail, value);
@@ -104,57 +104,57 @@ class FbBuilder {
     _setU32(_tail, _tail - offset);
   }
 
-  void _track(int field) => _fieldTails![field] = _tail;
+  void _track(int field) => _tails![field] = _tail;
 
   int endTable() {
     _prepare(4, 1); // space for the soffset to the vtable
-    final tableTail = _tail;
-    final tableSize = tableTail - _tableStart;
+    final table = _tail;
+    final size = table - _start;
 
     // Field offsets relative to the table tail.
-    final n = _fieldCount;
-    final rel = Uint16List(n);
+    final n = _count;
+    final offsets = Uint16List(n);
     for (int i = 0; i < n; i++) {
-      final t = _fieldTails![i];
-      rel[i] = t == 0 ? 0 : tableTail - t;
+      final tail = _tails![i];
+      offsets[i] = tail == 0 ? 0 : table - tail;
     }
-    final vtUint16 = 2 + n; // [vtSize, tableSize, fields...]
-    final vtBytes = vtUint16 * 2;
+    final slots = 2 + n; // [vtable size, table size, fields...]
+    final bytes = slots * 2;
 
     // Try to reuse an identical vtable.
-    int? vtableTail;
-    for (final cand in _vtables) {
-      final start = _capacity - cand;
-      if (_buf.getUint16(start, Endian.little) != vtBytes) continue;
+    int? vtable;
+    for (final candidate in _vtables) {
+      final start = _capacity - candidate;
+      if (_buffer.getUint16(start, Endian.little) != bytes) continue;
       var ok = true;
       for (int i = 0; i < n; i++) {
-        if (_buf.getUint16(start + 4 + 2 * i, Endian.little) != rel[i]) {
+        if (_buffer.getUint16(start + 4 + 2 * i, Endian.little) != offsets[i]) {
           ok = false;
           break;
         }
       }
       if (ok) {
-        vtableTail = cand;
+        vtable = candidate;
         break;
       }
     }
 
-    if (vtableTail == null) {
-      _prepare(2, vtUint16);
-      vtableTail = _tail;
+    if (vtable == null) {
+      _prepare(2, slots);
+      vtable = _tail;
       final at = _capacity - _tail;
-      _buf.setUint16(at, vtBytes, Endian.little);
-      _buf.setUint16(at + 2, tableSize, Endian.little);
+      _buffer.setUint16(at, bytes, Endian.little);
+      _buffer.setUint16(at + 2, size, Endian.little);
       for (int i = 0; i < n; i++) {
-        _buf.setUint16(at + 4 + 2 * i, rel[i], Endian.little);
+        _buffer.setUint16(at + 4 + 2 * i, offsets[i], Endian.little);
       }
-      _vtables.add(vtableTail);
+      _vtables.add(vtable);
     }
 
     // The table's soffset points back to its vtable.
-    _setI32(tableTail, vtableTail - tableTail);
-    _fieldTails = null;
-    return tableTail;
+    _setI32(table, vtable - table);
+    _tails = null;
+    return table;
   }
 
   // ---- strings / vectors --------------------------------------------------
@@ -165,9 +165,9 @@ class FbBuilder {
     _setU32(_tail, bytes.length);
     final at = _capacity - _tail + 4;
     for (int i = 0; i < bytes.length; i++) {
-      _buf.setUint8(at + i, bytes[i]);
+      _buffer.setUint8(at + i, bytes[i]);
     }
-    _buf.setUint8(at + bytes.length, 0); // null terminator
+    _buffer.setUint8(at + bytes.length, 0); // null terminator
     return _tail;
   }
 
@@ -175,12 +175,12 @@ class FbBuilder {
   int writeOffsetVector(List<int> offsets) {
     _prepare(4, 1 + offsets.length);
     final result = _tail;
-    var t = _tail;
-    _setU32(t, offsets.length);
-    t -= 4;
+    var tail = _tail;
+    _setU32(tail, offsets.length);
+    tail -= 4;
     for (final offset in offsets) {
-      _setU32(t, t - offset);
-      t -= 4;
+      _setU32(tail, tail - offset);
+      tail -= 4;
     }
     return result;
   }
@@ -196,12 +196,12 @@ class FbBuilder {
     return _tail;
   }
 
-  void _putRaw(Uint8List src, int align) {
-    final n = src.length;
+  void _putRaw(Uint8List bytes, int align) {
+    final n = bytes.length;
     _prepare(align, n ~/ align);
     final at = _capacity - _tail;
     for (int i = 0; i < n; i++) {
-      _buf.setUint8(at + i, src[i]);
+      _buffer.setUint8(at + i, bytes[i]);
     }
   }
 
@@ -209,40 +209,40 @@ class FbBuilder {
 
   void _prepare(int size, int count, {int extra = 0}) {
     assert(!_finished);
-    if (_maxAlign < size) _maxAlign = size;
-    final dataSize = size * count + extra;
-    final alignDelta = (-(_tail + dataSize)) & (size - 1);
-    _ensure(alignDelta + dataSize);
-    for (int i = _tail + 1; i <= _tail + alignDelta; i++) {
+    if (_alignment < size) _alignment = size;
+    final bytes = size * count + extra;
+    final padding = (-(_tail + bytes)) & (size - 1);
+    _ensure(padding + bytes);
+    for (int i = _tail + 1; i <= _tail + padding; i++) {
       _setU8(i, 0);
     }
-    _tail += alignDelta + dataSize;
+    _tail += padding + bytes;
   }
 
   void _ensure(int extra) {
     if (_tail + extra <= _capacity) return;
-    int cap = _capacity * 2;
-    while (_tail + extra > cap) {
-      cap *= 2;
+    int size = _capacity * 2;
+    while (_tail + extra > size) {
+      size *= 2;
     }
-    final nb = ByteData(cap);
-    final old = _buf.buffer.asUint8List(
-      _buf.offsetInBytes + _capacity - _tail,
+    final grown = ByteData(size);
+    final old = _buffer.buffer.asUint8List(
+      _buffer.offsetInBytes + _capacity - _tail,
       _tail,
     );
-    nb.buffer.asUint8List(cap - _tail, _tail).setAll(0, old);
-    _buf = nb;
+    grown.buffer.asUint8List(size - _tail, _tail).setAll(0, old);
+    _buffer = grown;
   }
 
-  void _setU8(int tail, int v) => _buf.setUint8(_capacity - tail, v);
-  void _setI16(int tail, int v) =>
-      _buf.setInt16(_capacity - tail, v, Endian.little);
-  void _setI32(int tail, int v) =>
-      _buf.setInt32(_capacity - tail, v, Endian.little);
-  void _setU32(int tail, int v) =>
-      _buf.setUint32(_capacity - tail, v, Endian.little);
-  void _setI64(int tail, int v) =>
-      _buf.setInt64(_capacity - tail, v, Endian.little);
+  void _setU8(int tail, int value) => _buffer.setUint8(_capacity - tail, value);
+  void _setI16(int tail, int value) =>
+      _buffer.setInt16(_capacity - tail, value, Endian.little);
+  void _setI32(int tail, int value) =>
+      _buffer.setInt32(_capacity - tail, value, Endian.little);
+  void _setU32(int tail, int value) =>
+      _buffer.setUint32(_capacity - tail, value, Endian.little);
+  void _setI64(int tail, int value) =>
+      _buffer.setInt64(_capacity - tail, value, Endian.little);
 }
 
 // ---------------------------------------------------------------------------
@@ -265,87 +265,99 @@ class FbReader {
   /// Position of the root table.
   int get root => deref(0);
 
-  int u8(int o) => _data.getUint8(o);
-  int i16(int o) => _data.getInt16(o, Endian.little);
-  int u16(int o) => _data.getUint16(o, Endian.little);
-  int i32(int o) => _data.getInt32(o, Endian.little);
-  int u32(int o) => _data.getUint32(o, Endian.little);
-  int i64(int o) => _data.getInt64(o, Endian.little);
+  // Every offset comes from the untrusted message, so each read is checked and
+  // a corrupt one raises FormatException instead of a RangeError.
+  int u8(int position) => _data.getUint8(_check(position, 1));
+  int i16(int position) => _data.getInt16(_check(position, 2), Endian.little);
+  int u16(int position) => _data.getUint16(_check(position, 2), Endian.little);
+  int i32(int position) => _data.getInt32(_check(position, 4), Endian.little);
+  int u32(int position) => _data.getUint32(_check(position, 4), Endian.little);
+  int i64(int position) => _data.getInt64(_check(position, 8), Endian.little);
 
-  /// Follow a uoffset at [o] to the object it references.
-  int deref(int o) => o + u32(o);
+  int _check(int position, int size) {
+    if (position < 0 || position + size > _data.lengthInBytes) {
+      throw FormatException(
+        'FlatBuffer read of $size bytes at $position runs past the '
+        '${_data.lengthInBytes}-byte message',
+      );
+    }
+    return position;
+  }
+
+  /// Follow a uoffset at [position] to the object it references.
+  int deref(int position) => position + u32(position);
 
   /// Absolute location of table [field] (index), or 0 if absent.
-  int fieldLoc(int table, int field) {
+  int locate(int table, int field) {
     final vtable = table - i32(table);
-    final vtSize = u16(vtable);
-    final byteOff = 4 + 2 * field;
-    if (byteOff >= vtSize) return 0;
-    final rel = u16(vtable + byteOff);
-    return rel == 0 ? 0 : table + rel;
+    final size = u16(vtable);
+    final slot = 4 + 2 * field;
+    if (slot >= size) return 0;
+    final offset = u16(vtable + slot);
+    return offset == 0 ? 0 : table + offset;
   }
 
-  int i16Field(int table, int field, [int def = 0]) {
-    final loc = fieldLoc(table, field);
-    return loc == 0 ? def : i16(loc);
+  int i16Field(int table, int field, [int fallback = 0]) {
+    final location = locate(table, field);
+    return location == 0 ? fallback : i16(location);
   }
 
-  int i32Field(int table, int field, [int def = 0]) {
-    final loc = fieldLoc(table, field);
-    return loc == 0 ? def : i32(loc);
+  int i32Field(int table, int field, [int fallback = 0]) {
+    final location = locate(table, field);
+    return location == 0 ? fallback : i32(location);
   }
 
-  int i64Field(int table, int field, [int def = 0]) {
-    final loc = fieldLoc(table, field);
-    return loc == 0 ? def : i64(loc);
+  int i64Field(int table, int field, [int fallback = 0]) {
+    final location = locate(table, field);
+    return location == 0 ? fallback : i64(location);
   }
 
-  bool boolField(int table, int field, [bool def = false]) {
-    final loc = fieldLoc(table, field);
-    return loc == 0 ? def : u8(loc) != 0;
+  bool boolField(int table, int field, [bool fallback = false]) {
+    final location = locate(table, field);
+    return location == 0 ? fallback : u8(location) != 0;
   }
 
-  int u8Field(int table, int field, [int def = 0]) {
-    final loc = fieldLoc(table, field);
-    return loc == 0 ? def : u8(loc);
+  int u8Field(int table, int field, [int fallback = 0]) {
+    final location = locate(table, field);
+    return location == 0 ? fallback : u8(location);
   }
 
   /// Referenced object position (table/vector/string) for an offset field, or 0.
   int offsetField(int table, int field) {
-    final loc = fieldLoc(table, field);
-    return loc == 0 ? 0 : deref(loc);
+    final location = locate(table, field);
+    return location == 0 ? 0 : deref(location);
   }
 
   String? stringField(int table, int field) {
-    final loc = fieldLoc(table, field);
-    if (loc == 0) return null;
-    final s = deref(loc);
-    final length = u32(s);
-    if (s + 4 + length > _data.lengthInBytes) {
+    final location = locate(table, field);
+    if (location == 0) return null;
+    final start = deref(location);
+    final length = u32(start);
+    if (start + 4 + length > _data.lengthInBytes) {
       throw const FormatException('FlatBuffer string runs past the message');
     }
     return utf8.decode(
-      _data.buffer.asUint8List(_data.offsetInBytes + s + 4, length),
+      _data.buffer.asUint8List(_data.offsetInBytes + start + 4, length),
     );
   }
 
   /// Number of elements in the vector referenced by [field], or 0.
   int vectorLength(int table, int field) {
-    final v = offsetField(table, field);
-    return v == 0 ? 0 : u32(v);
+    final vector = offsetField(table, field);
+    return vector == 0 ? 0 : u32(vector);
   }
 
   /// Position of element [i] in a vector of forward offsets (e.g. tables),
   /// dereferenced to the element object.
   int offsetVectorElement(int table, int field, int i) {
-    final v = offsetField(table, field);
-    final element = v + 4 + 4 * i;
+    final vector = offsetField(table, field);
+    final element = vector + 4 + 4 * i;
     return deref(element);
   }
 
   /// Position of element [i] (inline struct of [structSize] bytes).
   int structVectorElement(int table, int field, int i, int structSize) {
-    final v = offsetField(table, field);
-    return v + 4 + structSize * i;
+    final vector = offsetField(table, field);
+    return vector + 4 + structSize * i;
   }
 }

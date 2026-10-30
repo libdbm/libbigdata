@@ -10,6 +10,14 @@ import 'package:libbigdata/libbigdata.dart';
 
 late final String out;
 
+/// The value of a library [Result]; an [Err] throws, so [attempt] reports it.
+extension<T> on Future<Result<T, ErrorDetails>> {
+  Future<T> get ok async => switch (await this) {
+    Ok(:final value) => value,
+    Err(:final error) => throw StateError('$error'),
+  };
+}
+
 Future<void> attempt(String name, Future<void> Function() fn) async {
   try {
     await fn();
@@ -77,7 +85,7 @@ Future<void> main(List<String> args) async {
         str('s', ['alpha', 'beta']),
       ],
     );
-    await ParquetWriter('$out/flat.parquet').write(t);
+    await ParquetWriter('$out/flat.parquet').write(t).ok;
   });
 
   // 2. nested Parquet: list / struct / map
@@ -136,7 +144,7 @@ Future<void> main(List<String> args) async {
         ),
       ],
     );
-    await ParquetWriter('$out/nested.parquet').write(t);
+    await ParquetWriter('$out/nested.parquet').write(t).ok;
   });
 
   // 3. multi-level nested: array<array<bigint>>, array<struct<a,b>>
@@ -198,7 +206,7 @@ Future<void> main(List<String> args) async {
         ),
       ],
     );
-    await ParquetWriter('$out/deep.parquet').write(t);
+    await ParquetWriter('$out/deep.parquet').write(t).ok;
   });
 
   // 4. int32 DELTA with a delta over 2^31 (read back by pyarrow's uint32 VLQ)
@@ -217,7 +225,7 @@ Future<void> main(List<String> args) async {
       [f('v', DataType.int32)],
       [NumericColumn.int32(name: 'v', values: v, nullable: false)],
     );
-    await ParquetWriter('$out/int32delta.parquet').write(t);
+    await ParquetWriter('$out/int32delta.parquet').write(t).ok;
   });
 
   // 5. all-required nested struct (no definition levels to the leaf)
@@ -237,7 +245,7 @@ Future<void> main(List<String> args) async {
         ),
       ],
     );
-    await ParquetWriter('$out/required_nested.parquet').write(t);
+    await ParquetWriter('$out/required_nested.parquet').write(t).ok;
   });
 
   // 6. partitioned Delta (region), 4 rows
@@ -249,7 +257,68 @@ Future<void> main(List<String> args) async {
         str('region', ['us', 'eu', 'us', 'eu']),
       ],
     );
-    await DeltaWriter('$out/delta_part').write(t, partitionBy: ['region']);
+    await DeltaWriter('$out/delta_part').write(t, partitionBy: ['region']).ok;
+  });
+
+  // Delta with struct, array and map columns.
+  await attempt('delta_nested', () async {
+    final t = table(
+      [
+        f('id', DataType.int64),
+        f(
+          'tags',
+          DataType.list,
+          children: [f('element', DataType.int64, nullable: true)],
+        ),
+        f(
+          'info',
+          DataType.struct,
+          children: [f('a', DataType.int64), f('b', DataType.string)],
+        ),
+        f(
+          'props',
+          DataType.map,
+          children: [
+            f(
+              'key_value',
+              DataType.struct,
+              children: [f('key', DataType.string), f('value', DataType.int64)],
+            ),
+          ],
+        ),
+      ],
+      [
+        i64('id', [1, 2]),
+        ListColumn(
+          name: 'tags',
+          dataType: DataType.list,
+          data: [
+            [1, 2],
+            [9],
+          ],
+          nullable: false,
+        ),
+        ListColumn(
+          name: 'info',
+          dataType: DataType.struct,
+          data: [
+            {'a': 1, 'b': 'x'},
+            {'a': 2, 'b': 'y'},
+          ],
+          nullable: false,
+        ),
+        ListColumn(
+          name: 'props',
+          dataType: DataType.map,
+          data: [
+            {'k1': 1},
+            {'k2': 2},
+          ],
+          nullable: false,
+        ),
+      ],
+    );
+    await DeltaWriter('$out/delta_nested').write(t).ok;
   });
 
   // 7. Delta with decimal(10,2)
@@ -269,7 +338,7 @@ Future<void> main(List<String> args) async {
         ]),
       ],
     );
-    await DeltaWriter('$out/delta_dec').write(t);
+    await DeltaWriter('$out/delta_dec').write(t).ok;
   });
 
   // 8. Delta null + date partition values
@@ -291,7 +360,9 @@ Future<void> main(List<String> args) async {
         ),
       ],
     );
-    await DeltaWriter('$out/delta_pv').write(t, partitionBy: ['region', 'd']);
+    await DeltaWriter(
+      '$out/delta_pv',
+    ).write(t, partitionBy: ['region', 'd']).ok;
   });
 
   // 9. Iceberg with decimal(10,2), 4 rows
@@ -311,23 +382,43 @@ Future<void> main(List<String> args) async {
         ]),
       ],
     );
-    await IcebergWriter('$out/ice_dec/t').write(t);
+    await IcebergWriter('$out/ice_dec/t').write(t).ok;
   });
 
   // 10. Iceberg with expired snapshots: 3 appends of 4 rows -> expire to 1
   await attempt('iceberg_expired', () async {
     final w = IcebergWriter('$out/ice_expired/t');
     for (var b = 0; b < 3; b++) {
-      await w.write(
-        table(
-          [f('id', DataType.int64)],
-          [
-            i64('id', [for (var i = 0; i < 4; i++) b * 4 + i]),
-          ],
-        ),
-      );
+      await w
+          .write(
+            table(
+              [f('id', DataType.int64)],
+              [
+                i64('id', [for (var i = 0; i < 4; i++) b * 4 + i]),
+              ],
+            ),
+          )
+          .ok;
     }
-    await w.expireSnapshots(retain: 1);
+    await w.expireSnapshots(retain: 1).ok;
+  });
+
+  // Iceberg history: three commits, so metadata-log and parent-snapshot-id
+  // have something to record.
+  await attempt('iceberg_history', () async {
+    final w = IcebergWriter('$out/ice_history/t');
+    for (var b = 0; b < 3; b++) {
+      await w
+          .write(
+            table(
+              [f('id', DataType.int64)],
+              [
+                i64('id', [b]),
+              ],
+            ),
+          )
+          .ok;
+    }
   });
 
   // 11. Iceberg repartitioned: region spec (0) then country spec (1)
@@ -345,12 +436,14 @@ Future<void> main(List<String> args) async {
         str('region', ['eu', 'eu', 'us']),
       ],
     );
-    await w.write(rows(['de', 'fr', 'ca']), partitionBy: ['region']);
-    await w.write(
-      rows(['de', 'fr', 'ca']),
-      mode: IcebergWriteMode.overwrite,
-      partitionBy: ['country'],
-    );
+    await w.write(rows(['de', 'fr', 'ca']), partitionBy: ['region']).ok;
+    await w
+        .write(
+          rows(['de', 'fr', 'ca']),
+          mode: IcebergWriteMode.overwrite,
+          partitionBy: ['country'],
+        )
+        .ok;
   });
 
   // 12. Iceberg partitioned by one identity field, 4 rows
@@ -362,7 +455,7 @@ Future<void> main(List<String> args) async {
         str('p', ['a', 'a', 'b', 'b']),
       ],
     );
-    await IcebergWriter('$out/ice_part/t').write(t, partitionBy: ['p']);
+    await IcebergWriter('$out/ice_part/t').write(t, partitionBy: ['p']).ok;
   });
 
   // 13. CSV with scaled decimals
@@ -377,7 +470,7 @@ Future<void> main(List<String> args) async {
         dec('dec', [BigInt.from(12345), BigInt.from(6789)]),
       ],
     );
-    await CsvWriter().writeTable(t, '$out/data.csv');
+    await CsvWriter().writeTable(t, '$out/data.csv').ok;
   });
 
   // 14. JSON Lines
@@ -401,7 +494,7 @@ Future<void> main(List<String> args) async {
     );
     await JsonWriter(
       JsonOptions.jsonLines(),
-    ).writeFile(Stream.value(t), '$out/data.jsonl');
+    ).writeFile(Stream.value(t), '$out/data.jsonl').ok;
   });
 
   print('DONE');

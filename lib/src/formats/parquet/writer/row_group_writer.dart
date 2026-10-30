@@ -1,6 +1,7 @@
 import '../../../core/column.dart';
 import '../../../core/data_type.dart';
 import '../../../core/schema.dart' as core;
+import '../compression.dart' show ParquetCodec;
 import '../thrift/parquet_thrift.dart' as thrift;
 import '../parquet_writer.dart';
 import '../schema/schema_converter.dart';
@@ -27,47 +28,44 @@ class RowGroupWriter {
   Future<thrift.RowGroup> write(
     Map<String, List<dynamic>> data,
     int rows, {
-    Map<String, NumericColumn> typed = const {},
+    Map<String, NumericVector> typed = const {},
   }) async {
     final rowGroup = thrift.RowGroup();
     rowGroup.numRows = rows;
     rowGroup.fileOffset = writer.position;
     rowGroup.columns = [];
 
-    int totalSize = 0;
-    int compressedSize = 0;
+    int total = 0;
+    int compressed = 0;
 
     void account(thrift.ColumnChunk chunk) {
       rowGroup.columns.add(chunk);
-      totalSize += chunk.metaData!.totalUncompressedSize;
-      compressedSize += chunk.metaData!.totalCompressedSize;
+      total += chunk.metaData!.totalUncompressedSize;
+      compressed += chunk.metaData!.totalCompressedSize;
     }
 
     final fields = coreFields;
     if (fields == null) {
       // Legacy flat path.
       for (final column in getColumns()) {
-        final cw = ColumnWriter(writer, column.element, options);
+        final columnWriter = ColumnWriter(writer, column.element, options);
         final fast = typed[column.name];
         account(
           fast != null
-              ? await cw.writeTyped(fast)
-              : await cw.write(data[column.name] ?? []),
+              ? await columnWriter.writeTyped(fast)
+              : await columnWriter.write(data[column.name] ?? []),
         );
       }
     } else {
       // The file metadata schema ([schema]) is the single source of truth for a
       // column's repetition type (the writer may refine a no-null column to
-      // `required`). The per-column encoder must agree with it — otherwise it
+      // `required`). The per-column encoder must agree with it; otherwise it
       // writes definition levels the reader won't expect (or vice versa),
       // corrupting the page. So take repetition from [schema], not from
-      // `scalarElement`'s field-derived default.
-      final repByName = {
-        for (final e in schema)
-          if (e.type != null && e.repetitionType != null)
-            e.name: e.repetitionType!,
-      };
-      for (final field in fields) {
+      // `scalarElement`'s field-derived default. Each field's element is found
+      // by position: a nested leaf can share a top-level column's name.
+      final elements = _topLevel(schema);
+      for (final (index, field) in fields.indexed) {
         if (isNestedField(field)) {
           final column = _asColumn(field.name, data[field.name] ?? const []);
           for (final leaf in shred(field, column)) {
@@ -75,22 +73,42 @@ class RowGroupWriter {
           }
         } else {
           final element = SchemaConverter().scalarElement(field);
-          final rep = repByName[field.name];
-          if (rep != null) element.repetitionType = rep;
-          final cw = ColumnWriter(writer, element, options);
+          final repetition = elements[index].repetitionType;
+          if (repetition != null) element.repetitionType = repetition;
+          final columnWriter = ColumnWriter(writer, element, options);
           final fast = typed[field.name];
           account(
             fast != null
-                ? await cw.writeTyped(fast)
-                : await cw.write(data[field.name] ?? []),
+                ? await columnWriter.writeTyped(fast)
+                : await columnWriter.write(data[field.name] ?? []),
           );
         }
       }
     }
 
-    rowGroup.totalByteSize = totalSize;
-    rowGroup.totalCompressedSize = compressedSize;
+    rowGroup.totalByteSize = total;
+    rowGroup.totalCompressedSize = compressed;
     return rowGroup;
+  }
+
+  /// Each top-level field's element in [schema], in field order: the elements
+  /// after the root, skipping each field's subtree.
+  static List<thrift.SchemaElement> _topLevel(
+    List<thrift.SchemaElement> schema,
+  ) {
+    int end(int at) {
+      var next = at + 1;
+      for (var i = 0; i < (schema[at].numChildren ?? 0); i++) {
+        next = end(next);
+      }
+      return next;
+    }
+
+    final elements = <thrift.SchemaElement>[];
+    for (var at = 1; at < schema.length; at = end(at)) {
+      elements.add(schema[at]);
+    }
+    return elements;
   }
 
   /// Write one shredded nested leaf (PLAIN-encoded with rep/def levels).
@@ -99,7 +117,7 @@ class RowGroupWriter {
     chunk.fileOffset = writer.position;
     final pageWriter = PageWriter(
       writer: writer,
-      codecType: options.compression,
+      codecType: options.compression.codec,
       checksums: options.writeChecksums,
       writeStats: options.writeStatistics,
     );
@@ -117,8 +135,8 @@ class RowGroupWriter {
     return chunk;
   }
 
-  // Wrap raw nested values as a Column for the shredder (dataType is irrelevant
-  // — the shredder reads structure from the core Field, only values from here).
+  // Wrap raw nested values as a Column for the shredder (dataType is irrelevant:
+  // the shredder reads structure from the core Field, only values from here).
   Column _asColumn(String name, List<dynamic> values) => ListColumn(
     name: name,
     dataType: DataType.list,

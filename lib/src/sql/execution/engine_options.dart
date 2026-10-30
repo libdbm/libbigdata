@@ -8,7 +8,7 @@ import '../../core/limits.dart';
 /// input exceeds [spillThresholdBytes], bounding peak memory. The default budget
 /// is large enough that ordinary queries stay fully in memory; set
 /// [spillThresholdBytes] to `0` to disable spilling entirely.
-class EngineOptions {
+final class EngineOptions {
   /// Memory budget (bytes) a blocking operator may buffer before spilling.
   /// `0` disables spilling (always in-memory).
   final int spillThresholdBytes;
@@ -17,7 +17,7 @@ class EngineOptions {
   final String? spillDir;
 
   /// Ceiling on rows an unbounded blocking operator (CROSS JOIN, set ops) may
-  /// produce/buffer — exceeding it throws (a running guard) rather than OOMing.
+  /// produce/buffer: exceeding it throws (a running guard) rather than OOMing.
   /// Fail-closed by DEFAULT ([defaultMaxMaterializedRows]); `null` = unbounded
   /// (see [EngineOptions.unbounded]).
   final int? maxOutputRows;
@@ -25,24 +25,28 @@ class EngineOptions {
   /// Optional shared budget bounding the COMBINED in-memory footprint of all
   /// blocking operators that see this options instance (one per plan, shared
   /// across queries on one engine). `null` (default) keeps per-operator budgets
-  /// only — no global coordination.
+  /// only: no global coordination.
   final MemoryManager? memory;
 
   /// Optional ceiling on the COMBINED on-disk size of live spill files across
   /// this engine's blocking operators. `null` (default) = unbounded: spilling is
   /// the OOM relief valve, so a wrong default would convert working large queries
-  /// into failures — set it explicitly to bound disk use (fails fast rather than
+  /// into failures: set it explicitly to bound disk use (fails fast rather than
   /// filling the disk).
   final SpillBudget? spillBudget;
 
   /// Caps the rows / bytes a fully-materialized result may reach before failing
   /// loud (stop-at-cap, never buffer-then-throw). Used where a result must be
-  /// buffered whole — notably the MERGE source, which the Delta writer builds
+  /// buffered whole: notably the MERGE source, which the Delta writer builds
   /// into an in-memory hash. `null` falls back to the library default
   /// (`defaultMaxMaterializedRows`/`Bytes`); a server can lower these to bound a
   /// single statement's footprint.
   final int? maxMaterializedRows;
   final int? maxMaterializedBytes;
+
+  /// Default deadline for each query; a `timeout:` passed to a call overrides
+  /// it. `null` (default) lets queries run to completion.
+  final Duration? timeout;
 
   const EngineOptions({
     this.spillThresholdBytes = 256 << 20,
@@ -52,6 +56,7 @@ class EngineOptions {
     this.spillBudget,
     this.maxMaterializedRows,
     this.maxMaterializedBytes,
+    this.timeout,
   });
 
   /// Explicit "unbounded / offline analytics" opt-out: no output-row cap and no

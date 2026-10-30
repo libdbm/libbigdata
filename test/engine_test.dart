@@ -5,11 +5,12 @@ import 'package:libbigdata/libbigdata.dart';
 import 'package:libbigdata/src/core/limits.dart';
 import 'package:libbigdata/src/formats/arrow/arrow_reader.dart';
 import 'package:libbigdata/src/formats/arrow/arrow_writer.dart';
-import 'package:libbigdata/src/sql/execution/engine_options.dart';
-import 'package:libbigdata/src/sql/execution/memory_manager.dart';
+import 'package:libbigdata/src/sql/catalog/table_catalog.dart';
 import 'package:libbigdata/src/sql/operators/spill.dart';
 import 'package:libbigdata/src/util/parallel.dart';
 import 'package:test/test.dart';
+
+import 'support/results.dart';
 
 void main() {
   /// a shared opt-in MemoryManager bounds the COMBINED
@@ -95,9 +96,9 @@ void main() {
 
       // In-memory reference (no spilling at all).
       Future<List<Map<String, dynamic>>> inMemory(String sql) async {
-        final e = SqlEngine(spillThresholdBytes: 0);
+        final e = SqlEngine.open(spillThresholdBytes: 0).ok;
         e.registerTable('t', data(rows));
-        return (await e.execute(sql)).toRows();
+        return (await e.execute(sql).ok).toRows();
       }
 
       // Budgeted: local threshold huge (never trips), tiny shared budget forces
@@ -107,13 +108,13 @@ void main() {
         String sql,
       ) async {
         final spillDir = '${root.path}/sub';
-        final e = SqlEngine(
+        final e = SqlEngine.open(
           spillThresholdBytes: 1 << 30, // 1 GiB → local spill never triggers
           memoryBudgetBytes: 4096, // tiny shared pool → forces spilling
           spillDir: spillDir,
-        );
+        ).ok;
         e.registerTable('t', data(rows));
-        final out = (await e.execute(sql)).toRows();
+        final out = (await e.execute(sql).ok).toRows();
         return (rows: out, spilled: Directory(spillDir).existsSync());
       }
 
@@ -135,17 +136,17 @@ void main() {
         // If the first query leaked its reservation the pool would stay full;
         // both queries must succeed and match in-memory.
         final spillDir = '${root.path}/sub2';
-        final e = SqlEngine(
+        final e = SqlEngine.open(
           spillThresholdBytes: 1 << 30,
           memoryBudgetBytes: 4096,
           spillDir: spillDir,
-        );
+        ).ok;
         e.registerTable('t', data(rows));
         const sql = 'SELECT id FROM t ORDER BY id';
         final ref = await inMemory(sql);
-        expect((await e.execute(sql)).toRows(), ref);
+        expect((await e.execute(sql).ok).toRows(), ref);
         expect(
-          (await e.execute(sql)).toRows(),
+          (await e.execute(sql).ok).toRows(),
           ref,
         ); // second run, post-release
       });
@@ -153,7 +154,7 @@ void main() {
   });
 
   /// crash-orphaned spill files (left by a SIGKILL that runs no
-  /// `finally`) are reclaimed by an age-gated startup sweep. Age-gated so it is
+  /// `finally`) are reclaimed by a startup sweep limited by age, so it is
   /// safe over the shared system-temp spill dir (never deletes a live sibling
   /// engine's in-use file).
   group('spill orphan sweep', () {
@@ -163,7 +164,7 @@ void main() {
 
     // A per-session spill dir with a spill file and a `.live` marker.
     Directory session(String token, {bool marker = true}) {
-      final d = Directory('${dir.path}/$sessionDirPrefix$token')..createSync();
+      final d = Directory('${dir.path}/$sessionPrefix$token')..createSync();
       File('${d.path}/spill-x.parquet').writeAsBytesSync([0]);
       if (marker) File('${d.path}/.live').writeAsBytesSync([0]);
       return d;
@@ -208,26 +209,28 @@ void main() {
 
   group('parallel', () {
     Future<void> writeParquet(String path, List<int> ids) async {
-      await ParquetWriter(path).write(
-        Table(
-          name: 't',
-          columns: [
-            NumericColumn.int64(name: 'id', values: ids, nullable: false),
-            ListColumn<String>(
-              name: 'v',
-              dataType: DataType.string,
-              data: [for (final i in ids) 'v$i'],
-              nullable: false,
+      await ParquetWriter(path)
+          .write(
+            Table(
+              name: 't',
+              columns: [
+                NumericColumn.int64(name: 'id', values: ids, nullable: false),
+                ListColumn<String>(
+                  name: 'v',
+                  dataType: DataType.string,
+                  data: [for (final i in ids) 'v$i'],
+                  nullable: false,
+                ),
+              ],
+              schema: Schema(
+                fields: [
+                  Field(name: 'id', dataType: DataType.int64, nullable: false),
+                  Field(name: 'v', dataType: DataType.string, nullable: false),
+                ],
+              ),
             ),
-          ],
-          schema: Schema(
-            fields: [
-              Field(name: 'id', dataType: DataType.int64, nullable: false),
-              Field(name: 'v', dataType: DataType.string, nullable: false),
-            ],
-          ),
-        ),
-      );
+          )
+          .ok;
     }
 
     group('parallelMap', () {
@@ -304,11 +307,11 @@ void main() {
 
           final serial = await (await DataFrameIO.readDataset(
             dir.path,
-          )).execute();
+          ).ok).execute().ok;
           final parallel = await (await DataFrameIO.readDataset(
             dir.path,
             concurrency: 4,
-          )).execute();
+          ).ok).execute().ok;
 
           expect(parallel.rowCount, serial.rowCount);
           expect(
@@ -334,7 +337,7 @@ void main() {
         final t = await (await DataFrameIO.readDataset(
           dir.path,
           concurrency: 3,
-        )).execute();
+        ).ok).execute().ok;
         expect(t.column('id')!.toList(), [1, 2, 3, 4, 5, 6]);
       });
     });
@@ -348,58 +351,61 @@ void main() {
     setUp(() => dir = Directory.systemTemp.createTempSync('sizeguard_'));
     tearDown(() => dir.deleteSync(recursive: true));
 
-    test('CSV readBatches(size: 0) throws ArgumentError', () async {
+    test('CSV readBatches(batchSize: 0) throws at the call', () async {
       final p = '${dir.path}/a.csv';
       File(p).writeAsStringSync('id\n1\n2\n');
-      await expectLater(
-        CsvReader().readBatches(p, size: 0).toList(),
-        throwsA(isA<ArgumentError>()),
+      expect(
+        () => CsvReader().readBatches(p, batchSize: 0),
+        throwsArgumentError,
       );
     });
 
-    test('JSON readBatches(size: 0) throws ArgumentError', () async {
+    test('JSON readBatches(batchSize: 0) throws at the call', () async {
       final p = '${dir.path}/a.jsonl';
       File(p).writeAsStringSync('{"id":1}\n{"id":2}\n');
-      await expectLater(
-        JsonReader(
+      expect(
+        () => JsonReader(
           const JsonOptions(jsonLines: true),
-        ).readBatches(p, size: 0).toList(),
-        throwsA(isA<ArgumentError>()),
+        ).readBatches(p, batchSize: 0),
+        throwsArgumentError,
       );
     });
 
-    test('Parquet readBatches(size: 0) throws ArgumentError', () async {
+    test('Parquet readBatches(batchSize: 0) throws at the call', () async {
       final p = '${dir.path}/a.parquet';
-      await ParquetWriter(p).write(
-        Table(
-          name: 't',
-          columns: [
-            NumericColumn.int64(name: 'id', values: [1, 2], nullable: false),
-          ],
-          schema: Schema(
-            fields: [
-              Field(name: 'id', dataType: DataType.int64, nullable: false),
-            ],
-          ),
-        ),
+      await ParquetWriter(p)
+          .write(
+            Table(
+              name: 't',
+              columns: [
+                NumericColumn.int64(
+                  name: 'id',
+                  values: [1, 2],
+                  nullable: false,
+                ),
+              ],
+              schema: Schema(
+                fields: [
+                  Field(name: 'id', dataType: DataType.int64, nullable: false),
+                ],
+              ),
+            ),
+          )
+          .ok;
+      expect(
+        () => ParquetReader(p).readBatches(batchSize: 0),
+        throwsArgumentError,
       );
-      await expectLater(
-        ParquetReader(p).readBatches(size: 0).toList(),
-        throwsA(isA<ArgumentError>()),
-      );
-      await expectLater(
-        ParquetReader(p).readBatches(size: -5).toList(),
-        throwsA(isA<ArgumentError>()),
+      expect(
+        () => ParquetReader(p).readBatches(batchSize: -5),
+        throwsArgumentError,
       );
     });
 
-    test('Dataset readBatches(size: 0) throws ArgumentError', () async {
+    test('Dataset readBatches(batchSize: 0) throws at the call', () async {
       final p = '${dir.path}/a.csv';
       File(p).writeAsStringSync('id\n1\n');
-      await expectLater(
-        Dataset(p).readBatches(size: 0).toList(),
-        throwsA(isA<ArgumentError>()),
-      );
+      expect(() => Dataset(p).readBatches(batchSize: 0), throwsArgumentError);
     });
   });
 
@@ -426,26 +432,26 @@ void main() {
 
     group('SqlEngine.execute', () {
       test('throws past maxRows, returns full result when null', () async {
-        final e = SqlEngine();
+        final e = SqlEngine.open().ok;
         e.registerTable('t', ids(100));
         await expectLater(
           e.execute('SELECT * FROM t', maxRows: 10),
-          throwsA(isA<StateError>()),
+          failsWith(Kind.limit),
         );
-        final all = await e.execute('SELECT * FROM t', maxRows: null);
+        final all = await e.execute('SELECT * FROM t', maxRows: null).ok;
         expect(all.rowCount, 100);
       });
 
       test(
         'throws past maxBytes (memory cap), independent of row count',
         () async {
-          final e = SqlEngine();
+          final e = SqlEngine.open().ok;
           e.registerTable('t', ids(100)); // 100 int64 rows = ~800 bytes
           await expectLater(
             e.execute('SELECT * FROM t', maxBytes: 64),
-            throwsA(isA<StateError>()),
+            failsWith(Kind.limit),
           );
-          final all = await e.execute('SELECT * FROM t', maxBytes: null);
+          final all = await e.execute('SELECT * FROM t', maxBytes: null).ok;
           expect(all.rowCount, 100);
         },
       );
@@ -456,7 +462,7 @@ void main() {
         expect(eagerReadOverheadFactor, greaterThan(1.0));
       });
 
-      test('CSV maxBytes gates on the overhead-adjusted size', () async {
+      test('CSV maxBytes applies to the overhead-adjusted size', () async {
         final dir = Directory.systemTemp.createTempSync('capf_');
         addTearDown(() => dir.deleteSync(recursive: true));
         final p = '${dir.path}/n.csv';
@@ -466,16 +472,16 @@ void main() {
         }
         File(p).writeAsStringSync(sb.toString());
 
-        final full = await CsvReader().readFile(p, maxBytes: null);
+        final full = await CsvReader().readFile(p, maxBytes: null).ok;
         final mu = full.memoryUsage;
-        // A cap ABOVE raw memoryUsage but BELOW raw×factor is now rejected —
-        // the gate predicts the transient peak, not just raw buffer bytes.
+        // A cap ABOVE raw memoryUsage but BELOW raw×factor is now rejected:
+        // the check predicts the transient peak, not just raw buffer bytes.
         await expectLater(
           CsvReader().readFile(p, maxBytes: (mu * 1.5).toInt()),
-          throwsA(isA<StateError>()),
+          failsWith(Kind.limit),
         );
         // Comfortably above raw×factor → still succeeds.
-        final ok = await CsvReader().readFile(p, maxBytes: mu * 3);
+        final ok = await CsvReader().readFile(p, maxBytes: mu * 3).ok;
         expect(ok.rowCount, 1000);
       });
     });
@@ -494,11 +500,11 @@ void main() {
           JsonReader(
             const JsonOptions(jsonLines: true),
           ).readFile(p, maxRows: 10),
-          throwsA(isA<StateError>()),
+          failsWith(Kind.limit),
         );
         final df = await JsonReader(
           const JsonOptions(jsonLines: true),
-        ).readFile(p, maxRows: null);
+        ).readFile(p, maxRows: null).ok;
         expect(df.rowCount, 100);
       });
 
@@ -510,10 +516,10 @@ void main() {
         // Bounded: must throw without buffering the whole array.
         await expectLater(
           JsonReader().readFile(p, maxRows: 10),
-          throwsA(isA<StateError>()),
+          failsWith(Kind.limit),
         );
         // Unbounded opt-out reads it all.
-        final df = await JsonReader().readFile(p, maxRows: null);
+        final df = await JsonReader().readFile(p, maxRows: null).ok;
         expect(df.rowCount, 100);
       });
 
@@ -526,7 +532,7 @@ void main() {
           );
           final rows = [
             for (final batch
-                in await JsonReader().readBatches(p, size: 2).toList())
+                in await JsonReader().readBatches(p, batchSize: 2).ok.toList())
               ...batch.toRows(),
           ];
           expect(rows.length, 3);
@@ -548,9 +554,11 @@ void main() {
         );
         await expectLater(
           CsvReader().readFile(p, maxRows: 10),
-          throwsA(isA<StateError>()),
+          failsWith(Kind.limit),
         );
-        final df = await CsvReader().readFile(p, maxRows: null, maxBytes: null);
+        final df = await CsvReader()
+            .readFile(p, maxRows: null, maxBytes: null)
+            .ok;
         expect(df.rowCount, 100);
       });
 
@@ -563,23 +571,28 @@ void main() {
         const opts = CsvOptions(lineTerminator: '\r\n');
         await expectLater(
           CsvReader(options: opts).readFile(p, maxBytes: 8),
-          throwsA(isA<StateError>()),
+          failsWith(Kind.limit),
         );
         final df = await CsvReader(
           options: opts,
-        ).readFile(p, maxRows: null, maxBytes: null);
+        ).readFile(p, maxRows: null, maxBytes: null).ok;
         expect(df.rowCount, 100);
       });
     });
 
-    group('shared sql singleton', () {
-      test('has a non-null lockTimeout (self-heals abandoned streams)', () {
-        expect(sql.lockTimeout, isNotNull);
+    group('shared sql function', () {
+      test('runs a query and reports a failure as an Err', () async {
+        final table = await sql('SELECT 1 AS x').ok;
+        expect(table.column('x')!.toList(), [1]);
+        await expectLater(
+          sql('SELECT * FROM nowhere'),
+          failsWith(Kind.missing),
+        );
       });
     });
   });
 
-  /// out-of-core I/O — Arrow `readBatches` reads each
+  /// out-of-core I/O: Arrow `readBatches` reads each
   /// record-batch block on demand (not the whole file), and CSV `readFile` honors
   /// an opt-in size ceiling.
   group('out of core', () {
@@ -654,13 +667,13 @@ void main() {
           CsvReader(
             options: CsvOptions(maxFileBytes: size ~/ 2),
           ).readFile(path),
-          throwsA(isA<FormatException>()),
+          failsWith(Kind.corrupt),
         );
       });
 
       test('reads normally when maxFileBytes is unset (default)', () async {
         final path = writeCsv(100);
-        final df = await CsvReader().readFile(path);
+        final df = await CsvReader().readFile(path).ok;
         expect(df.rowCount, 100);
       });
 
@@ -668,7 +681,7 @@ void main() {
         final path = writeCsv(100);
         final df = await CsvReader(
           options: const CsvOptions(maxFileBytes: 1 << 20),
-        ).readFile(path);
+        ).readFile(path).ok;
         expect(df.rowCount, 100);
       });
     });
@@ -681,7 +694,7 @@ void main() {
 
     test('dispose() removes the per-session spill dir', () async {
       final base = Directory('${dir.path}/spill')..createSync();
-      final engine = SqlEngine(spillDir: base.path);
+      final engine = SqlEngine.open(spillDir: base.path).ok;
       final sessions = base.listSync().whereType<Directory>().where(
         (d) => d.path.contains('libbigdata-session-'),
       );
@@ -696,7 +709,14 @@ void main() {
     test('a non-creatable spill dir fails fast at construction', () {
       // A regular file where a directory is expected: createSync under it throws.
       final file = File('${dir.path}/not-a-dir')..writeAsStringSync('');
-      expect(() => SqlEngine(spillDir: file.path), throwsA(isA<StateError>()));
+      expect(
+        SqlEngine.open(spillDir: file.path),
+        isA<Err<SqlEngine, ErrorDetails>>().having(
+          (err) => err.error.kind,
+          'kind',
+          Kind.io,
+        ),
+      );
     });
   });
 
@@ -706,13 +726,13 @@ void main() {
     tearDown(() => dir.deleteSync(recursive: true));
 
     test('use-after-dispose throws', () async {
-      final engine = SqlEngine(spillDir: dir.path);
+      final engine = SqlEngine.open(spillDir: dir.path).ok;
       await engine.dispose();
       expect(() => engine.execute('SELECT 1'), throwsStateError);
     });
 
     test('dispose is idempotent', () async {
-      final engine = SqlEngine(spillDir: dir.path);
+      final engine = SqlEngine.open(spillDir: dir.path).ok;
       await engine.dispose();
       await engine.dispose(); // no throw on the second call
     });
@@ -732,16 +752,16 @@ void main() {
     );
 
     test('dispose fails fast when an operation is pinned', () async {
-      final engine = SqlEngine(spillDir: dir.path);
+      final engine = SqlEngine.open(spillDir: dir.path).ok;
       engine.registerTable('t', ids(List.generate(5000, (i) => i)));
       // Subscribe but pause: the stream suspends at a yield with the operation
       // still in flight, so _active stays > 0.
-      final sub = engine.executeStream('SELECT * FROM t').listen((_) {});
+      final sub = engine.executeStream('SELECT * FROM t').ok.listen((_) {});
       sub.pause();
       await Future<void>.delayed(const Duration(milliseconds: 50));
       await expectLater(
         engine.dispose(timeout: const Duration(milliseconds: 100)),
-        throwsA(isA<StateError>()),
+        failsWith(Kind.timeout),
       );
       await sub.cancel();
     });
@@ -763,7 +783,10 @@ void main() {
     test('a live session that spills re-establishes its .live marker', () async {
       // A small positive threshold enables spilling and trips almost immediately
       // (0 would DISABLE spilling: spills => spillThresholdBytes > 0).
-      final engine = SqlEngine(spillThresholdBytes: 1, spillDir: dir.path);
+      final engine = SqlEngine.open(
+        spillThresholdBytes: 1,
+        spillDir: dir.path,
+      ).ok;
       final session = Directory(dir.path)
           .listSync()
           .whereType<Directory>()
@@ -773,9 +796,9 @@ void main() {
         't',
         intTable('a', [for (var i = 0; i < 5000; i++) 5000 - i]),
       );
-      await engine.execute(
-        'SELECT a FROM t ORDER BY a',
-      ); // spills (threshold 0)
+      await engine
+          .execute('SELECT a FROM t ORDER BY a')
+          .ok; // spills (threshold 0)
       expect(File('${session.path}/.live').existsSync(), isTrue); // recreated
       engine.dispose();
     });
@@ -799,15 +822,15 @@ void main() {
     test('an undrained executeStream does not block later queries', () async {
       // The deadlock cause is gone: executeStream releases the engine
       // lock after planning, not after the consumer drains. So an undrained
-      // stream no longer strands later queries — they run promptly, without
+      // stream no longer strands later queries; they run promptly, without
       // relying on a lockTimeout safety valve. (Richer concurrency/cancel
       // coverage lives in sql_stream_test.dart.)
-      final engine = SqlEngine();
+      final engine = SqlEngine.open().ok;
       engine.registerTable('a', nums());
 
       final started = Completer<void>();
       late StreamSubscription<Table> sub;
-      sub = engine.executeStream('SELECT v FROM a').listen((_) {
+      sub = engine.executeStream('SELECT v FROM a').ok.listen((_) {
         sub.pause(); // never drain, never cancel
         if (!started.isCompleted) started.complete();
       });
@@ -816,6 +839,7 @@ void main() {
       // A second query runs immediately rather than hanging/timing out.
       final t = await engine
           .execute('SELECT COUNT(*) AS n FROM a')
+          .ok
           .timeout(const Duration(seconds: 5));
       expect(t.toRows().single['n'], 5);
       await sub.cancel();
@@ -845,7 +869,7 @@ void main() {
     late SqlEngine engine;
     setUp(() {
       dir = Directory.systemTemp.createTempSync('catrace_');
-      engine = SqlEngine(spillDir: dir.path, allowExternalPaths: true);
+      engine = SqlEngine.open(spillDir: dir.path, allowExternalPaths: true).ok;
       engine.registerTable('base', _ints('base', [1, 2, 3]));
     });
     tearDown(() async {
@@ -855,7 +879,7 @@ void main() {
 
     test('registerTable during a CTE query is not dropped by cleanup', () async {
       // The CTE 'x' materializes from an in-memory table (immediately), then the
-      // main query does real file I/O over many rows — a wide window in which
+      // main query does real file I/O over many rows: a wide window in which
       // the synchronous registration lands AFTER the CTE was registered but
       // BEFORE the query's teardown. 'x' deliberately collides with the CTE.
       final csv = '${dir.path}/big.csv';
@@ -869,9 +893,10 @@ void main() {
       engine.registerTable('x', _ints('x', [9]));
       await query;
       expect(engine.listTables(), contains('x'));
-      expect((await engine.execute('SELECT n FROM x')).column('n')!.toList(), [
-        9,
-      ]);
+      expect(
+        (await engine.execute('SELECT n FROM x').ok).column('n')!.toList(),
+        [9],
+      );
     });
 
     test(
@@ -889,13 +914,13 @@ void main() {
           "WITH x AS (SELECT n FROM base) SELECT m FROM '$big' LIMIT 1",
         );
         await Future<void>.delayed(const Duration(milliseconds: 1));
-        await engine.registerFile('x', csv);
+        await engine.registerFile('x', csv).ok;
         await query;
         expect(engine.listTables(), contains('x'));
         // The LazySource registered alongside the table must still resolve; the
         // old teardown removed the table but stranded the source.
         expect(
-          (await engine.execute('SELECT n FROM x')).column('n')!.toList(),
+          (await engine.execute('SELECT n FROM x').ok).column('n')!.toList(),
           [7],
         );
       },
@@ -905,22 +930,124 @@ void main() {
       // The normal case must be untouched: registered BEFORE the query, the
       // table is shadowed for the query's duration, then restored.
       engine.registerTable('x', _ints('x', [42]));
-      final r = await engine.execute(
-        'WITH x AS (SELECT n FROM base) SELECT n FROM x',
-      );
+      final r = await engine
+          .execute('WITH x AS (SELECT n FROM base) SELECT n FROM x')
+          .ok;
       expect(r.column('n')!.toList(), [1, 2, 3]); // the CTE won
       expect(
-        (await engine.execute('SELECT n FROM x')).column('n')!.toList(),
+        (await engine.execute('SELECT n FROM x').ok).column('n')!.toList(),
         [42], // restored
       );
     });
 
     test('an ordinary CTE is still torn down', () async {
-      await engine.execute(
-        'WITH tmp AS (SELECT n FROM base) SELECT n FROM tmp',
-      );
+      await engine
+          .execute('WITH tmp AS (SELECT n FROM base) SELECT n FROM tmp')
+          .ok;
       expect(engine.listTables(), isNot(contains('tmp')));
     });
+  });
+
+  group('SqlEngine reports every failure as an Err', () {
+    late SqlEngine engine;
+    setUp(() {
+      engine = SqlEngine.open(spillThresholdBytes: 0).ok;
+      engine.registerTable('t', _ints('t', [1, 2]));
+    });
+    tearDown(() => engine.dispose());
+
+    for (final (query, kind) in [
+      ('SELEC n FROM t', Kind.invalid),
+      ("SELECT * FROM '/etc/hosts'", Kind.denied),
+      ('SELECT * FROM nowhere', Kind.missing),
+      ('SELECT 9223372036854775807 + n FROM t', Kind.invalid),
+      (
+        'WITH RECURSIVE r AS (SELECT n FROM t) SELECT * FROM r',
+        Kind.unsupported,
+      ),
+    ]) {
+      test('$kind: $query', () async {
+        await expectLater(engine.execute(query), failsWith(kind));
+        await expectLater(engine.executeStream(query).last, failsWith(kind));
+      });
+    }
+
+    test('a result over maxRows is a limit', () async {
+      await expectLater(
+        engine.execute('SELECT n FROM t', maxRows: 1),
+        failsWith(Kind.limit),
+      );
+    });
+
+    test('a query past its deadline is a timeout', () async {
+      engine.registerTable('a', _ints('a', List.generate(1000, (i) => i)));
+      await expectLater(
+        engine.execute(
+          'SELECT x.n FROM a x, a y, a z',
+          timeout: const Duration(milliseconds: 50),
+        ),
+        failsWith(Kind.timeout),
+      );
+    });
+
+    test('a runtime StateError keeps the error as its cause', () async {
+      final error = await engine
+          .execute('SELECT 9223372036854775807 + n FROM t')
+          .err;
+      expect(error.cause, isA<StateError>());
+    });
+  });
+  group('engine details', () {
+    test('file tables are keyed by exact path, table names by any case', () {
+      final catalog = TableCatalog();
+      final upper = Table.fromRows('u', [
+        {'a': 1},
+      ]);
+      final lower = Table.fromRows('l', [
+        {'a': 2},
+      ]);
+      catalog.registerTable(fileKey('/data/A.csv'), upper);
+      catalog.registerTable(fileKey('/data/a.csv'), lower);
+      expect(catalog.table(fileKey('/data/A.csv')), same(upper));
+      expect(catalog.table(fileKey('/data/a.csv')), same(lower));
+      catalog.registerTable('People', upper);
+      expect(catalog.table('PEOPLE'), same(upper));
+      expect(catalog.table(fileKey('/data/people')), isNull);
+    });
+
+    test('an executeStream deadline counts from the call', () async {
+      final engine = SqlEngine.open().ok;
+      addTearDown(engine.dispose);
+      final stream = engine.executeStream(
+        'SELECT 1 AS n',
+        timeout: const Duration(milliseconds: 20),
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 60));
+      final first = await stream.first;
+      expect(first, isA<Err>());
+      expect((first as Err).error.kind, Kind.timeout);
+    });
+
+    test(
+      'executeStream on a disposed engine throws, as execute does',
+      () async {
+        final engine = SqlEngine.open().ok;
+        await engine.dispose();
+        expect(() => engine.executeStream('SELECT 1'), throwsStateError);
+      },
+    );
+
+    test(
+      'an engine disposed before the stream is listened to is an Err',
+      () async {
+        final engine = SqlEngine.open().ok;
+        final stream = engine.executeStream('SELECT 1');
+        await engine.dispose();
+        final first = await stream.first;
+        expect(first, isA<Err>());
+        expect((first as Err).error.kind, Kind.invalid);
+      },
+    );
   });
 }
 

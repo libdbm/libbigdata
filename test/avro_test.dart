@@ -1,11 +1,15 @@
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:libbigdata/src/core/conversions.dart';
+import 'package:libbigdata/src/core/result.dart';
 import 'package:libbigdata/src/formats/avro/avro_decoder.dart';
 import 'package:libbigdata/src/formats/avro/avro_ocf_reader.dart';
 import 'package:libbigdata/src/formats/avro/avro_ocf_writer.dart';
 import 'package:test/test.dart';
+
+import 'support/results.dart';
 
 void main() {
   group('OCF read/write', () {
@@ -74,7 +78,7 @@ void main() {
       // A tiny compressed-input budget aborts before decoding the whole file.
       expect(
         () => AvroOcfReader.readPath(path, maxCompressedBytes: 4),
-        throwsA(isA<StateError>()),
+        throwsFailure(Kind.limit, contains('maxCompressedBytes')),
       );
       // Async path streams the same content correctly with the default budget.
       expect(
@@ -223,14 +227,13 @@ void main() {
       ], codec: 'null');
       expect(
         () => AvroOcfReader.read(bytes, maxRecords: 5),
-        throwsA(isA<StateError>()),
+        throwsFailure(Kind.limit, contains('maxRecords=5')),
       );
       expect(AvroOcfReader.read(bytes, maxRecords: null).length, 10);
     });
 
     // a deflate block that would decompress past the byte budget is
-    // rejected DURING inflation (a domain FormatException), not after it is fully
-    // materialized.
+    // rejected DURING inflation (a limit), not after it is fully materialized.
     test('a deflate block over the byte budget throws before full inflation', () {
       const strSchema =
           '{"type":"record","name":"r","fields":[{"name":"s","type":"string"}]}';
@@ -240,10 +243,20 @@ void main() {
       ], codec: 'deflate');
       expect(
         () => AvroOcfReader.read(bytes, maxBytes: 1024),
-        throwsA(isA<FormatException>()),
+        throwsFailure(Kind.limit),
       );
       // Uncapped it reads fine.
       expect(AvroOcfReader.read(bytes, maxBytes: null).length, 200);
+    });
+
+    test('a highly compressible deflate OCF from the writer reads back', () {
+      const strSchema =
+          '{"type":"record","name":"r","fields":[{"name":"s","type":"string"}]}';
+      // 2 MB of repeated text deflates far past 200x.
+      final bytes = AvroOcfWriter.write(strSchema, [
+        for (var i = 0; i < 2000; i++) {'s': 'x' * 1000},
+      ], codec: 'deflate');
+      expect(AvroOcfReader.read(bytes).length, 2000);
     });
   });
 
@@ -361,7 +374,7 @@ void main() {
     });
 
     test('a value matching no union branch throws', () {
-      // Was silently written as null (branch 0) — the worst possible answer for
+      // Was silently written as null (branch 0): the worst possible answer for
       // a value the caller believed it had stored.
       final schema = nullable('n', '"int"');
       expect(
@@ -403,14 +416,59 @@ void main() {
 
     test('an array declaring a huge null count throws before expansion', () {
       final schema = AvroSchema.parse('{"type":"array","items":"null"}');
-      // A single block declaring 20M null items — 0 payload bytes each — must be
-      // rejected against the per-record value budget (10M) before the loop runs.
+      // A single block declaring 20M null items (0 payload bytes each) must be
+      // rejected against the value budget (10M) before the loop runs.
       final reader = AvroReader(avroLong(20000000));
       expect(() => schema.decode(reader), throwsA(isA<FormatException>()));
     });
 
+    test('the value budget spans the file, not each record', () {
+      const schema =
+          '{"type":"record","name":"r","fields":['
+          '{"name":"a","type":{"type":"array","items":"null"}}]}';
+      // Two records of 6M nulls each: each fits a per-record budget of 10M,
+      // together they exceed the file's.
+      final record = [...avroLong(6000000), ...avroLong(0)];
+      final block = [...record, ...record];
+      final sync = List.filled(16, 7);
+      final bytes = Uint8List.fromList([
+        0x4F, 0x62, 0x6A, 0x01, // magic
+        ...avroLong(1),
+        ...avroLong(11), ...'avro.schema'.codeUnits,
+        ...avroLong(schema.length), ...schema.codeUnits,
+        ...avroLong(0),
+        ...sync,
+        ...avroLong(2), ...avroLong(block.length), ...block, ...sync,
+      ]);
+      expect(bytes.length, lessThan(250));
+      expect(() => AvroOcfReader.read(bytes), throwsA(isA<FormatException>()));
+    });
+
+    group('schema nesting', () {
+      String nested(int depth) =>
+          '${'{"type":"array","items":' * depth}"null"${'}' * depth}';
+
+      test('a schema nested past the depth limit throws', () {
+        expect(
+          () => AvroSchema.parse(nested(200)),
+          throwsA(isA<FormatException>()),
+        );
+      });
+
+      test('a very deeply nested schema throws, not stack-overflow', () {
+        expect(
+          () => AvroSchema.parse(nested(100000)),
+          throwsA(isA<FormatException>()),
+        );
+      });
+
+      test('a schema within the limit parses', () {
+        expect(AvroSchema.parse(nested(50)).root, isA<AvroArray>());
+      });
+    });
+
     group('recursive schema depth (finding 5)', () {
-      // A self-referential record — the shape of optional nested / Iceberg
+      // A self-referential record: the shape of optional nested / Iceberg
       // manifest schemas. The depth guard used to cover only array/map blocks,
       // so record→union→ref recursion here would stack-overflow the isolate.
       const linkedList =
@@ -437,6 +495,64 @@ void main() {
         );
         expect(decoded, isA<Map>());
       });
+    });
+  });
+
+  group('named types and codecs', () {
+    test('named types resolve by full name across namespaces', () {
+      const schema = '''
+{"type": "record", "name": "Outer", "namespace": "a", "fields": [
+  {"name": "x", "type": {"type": "record", "name": "Item",
+    "fields": [{"name": "v", "type": "int"}]}},
+  {"name": "y", "type": {"type": "record", "name": "Item", "namespace": "b",
+    "fields": [{"name": "s", "type": "string"}]}},
+  {"name": "z", "type": "Item"},
+  {"name": "w", "type": "b.Item"},
+  {"name": "e", "type": {"type": "enum", "name": "Color", "namespace": "c",
+    "symbols": ["RED"]}},
+  {"name": "f", "type": "c.Color"}
+]}''';
+      final record = {
+        'x': {'v': 1},
+        'y': {'s': 'p'},
+        'z': {'v': 2},
+        'w': {'s': 'q'},
+        'e': 'RED',
+        'f': 'RED',
+      };
+      final bytes = AvroOcfWriter.write(schema, [record], codec: 'null');
+      expect(AvroOcfReader.read(bytes), [record]);
+    });
+
+    test('a zstandard OCF reads', () {
+      final rows = AvroOcfReader.read(
+        File('test/fixtures/avro/zstandard.avro').readAsBytesSync(),
+      );
+      expect(rows, [
+        {'id': 0, 's': 'v0'},
+        {'id': 1, 's': 'v1'},
+        {'id': 2, 's': 'v2'},
+      ]);
+    });
+
+    test('an unknown codec is unsupported', () {
+      final bytes = AvroOcfWriter.write(
+        '{"type":"record","name":"r","fields":[{"name":"a","type":"long"}]}',
+        [
+          {'a': 1},
+        ],
+        codec: 'null',
+      );
+      // Rename the codec in the header from `null` to the unknown `xzzz`,
+      // which keeps every length intact.
+      final text = latin1.decode(bytes);
+      final patched = latin1.encode(
+        text.replaceFirst('avro.codec\u0008null', 'avro.codec\u0008xzzz'),
+      );
+      expect(
+        () => AvroOcfReader.read(patched),
+        throwsFailure(Kind.unsupported, contains('xzzz')),
+      );
     });
   });
 }

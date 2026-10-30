@@ -19,9 +19,9 @@ class SchemaLevels {
     int index,
     SchemaNode parent,
   ) {
-    final numChildren = parent.element.numChildren ?? 0;
+    final count = parent.element.numChildren ?? 0;
 
-    for (int i = 0; i < numChildren; i++) {
+    for (int i = 0; i < count; i++) {
       if (index >= elements.length) break;
 
       final element = elements[index];
@@ -45,13 +45,13 @@ class SchemaLevels {
     int columnIndex,
   ) {
     final tree = buildSchemaTree(elements);
-    final columnNode = _findNode(tree, columnIndex);
+    final node = _findNode(tree, columnIndex);
 
-    if (columnNode == null) {
+    if (node == null) {
       throw ArgumentError('Column not found at index $columnIndex');
     }
 
-    return _calculateNodeLevels(columnNode);
+    return _calculateNodeLevels(node);
   }
 
   /// Find node by index
@@ -68,8 +68,8 @@ class SchemaLevels {
 
   /// Calculate levels for a node
   static LevelInfo _calculateNodeLevels(SchemaNode node) {
-    int maxDef = 0;
-    int maxRep = 0;
+    int definition = 0;
+    int repetition = 0;
 
     // Walk up the tree from leaf to root
     SchemaNode? current = node;
@@ -78,20 +78,20 @@ class SchemaLevels {
 
       // Increment definition level for optional fields
       if (element.repetitionType == thrift.FieldRepetitionType.optional) {
-        maxDef++;
+        definition++;
       }
 
       // Increment repetition level for repeated fields
       if (element.repetitionType == thrift.FieldRepetitionType.repeated) {
-        maxRep++;
+        repetition++;
         // Repeated fields also add to definition level
-        maxDef++;
+        definition++;
       }
 
       current = current.parent;
     }
 
-    return LevelInfo(maxDefinition: maxDef, maxRepetition: maxRep);
+    return LevelInfo(maxDefinition: definition, maxRepetition: repetition);
   }
 
   /// Ordered dotted paths of every leaf (primitive) column, in document order.
@@ -112,65 +112,50 @@ class SchemaLevels {
     walk(tree, []);
     return paths;
   }
+}
 
-  /// Get the leaf column path for nested types
-  static List<String> getColumnPath(
-    List<thrift.SchemaElement> elements,
-    int columnIndex,
-  ) {
-    final tree = buildSchemaTree(elements);
-    final node = _findNode(tree, columnIndex);
+/// Each leaf column's dotted path and levels, from one walk of the schema
+/// tree. A reader builds this once per file: looking levels up per column with
+/// [SchemaLevels.calculateLevels] rebuilds and searches the tree each time,
+/// which is quadratic in the column count.
+class SchemaLayout {
+  /// Dotted paths of every leaf column, in document order.
+  final List<String> paths = [];
+  final Map<int, LevelInfo> _levels = {};
 
-    if (node == null) return [];
-
-    final path = <String>[];
-    SchemaNode? current = node;
-
-    while (current != null && current.parent != null) {
-      path.insert(0, current.element.name ?? '');
-      current = current.parent;
-    }
-
-    return path;
-  }
-
-  /// Check if schema element is part of a LIST
-  static bool isListElement(List<thrift.SchemaElement> elements, int index) {
-    if (index <= 0) return false;
-
-    // Check parent
-    for (int i = index - 1; i >= 0; i--) {
-      final element = elements[i];
-      if (element.convertedType == thrift.ConvertedType.list) {
-        // Check if this element is a descendant
-        final numChildren = element.numChildren ?? 0;
-        if (i + numChildren >= index) {
-          return true;
+  SchemaLayout(List<thrift.SchemaElement> elements) {
+    void walk(SchemaNode node, String prefix, int definition, int repetition) {
+      for (final child in node.children) {
+        final name = child.element.name ?? '';
+        final path = prefix.isEmpty ? name : '$prefix.$name';
+        final repeated =
+            child.element.repetitionType == thrift.FieldRepetitionType.repeated;
+        final optional =
+            child.element.repetitionType == thrift.FieldRepetitionType.optional;
+        final maxDefinition = definition + (repeated || optional ? 1 : 0);
+        final maxRepetition = repetition + (repeated ? 1 : 0);
+        if (child.isLeaf) {
+          paths.add(path);
+          _levels[child.index] = LevelInfo(
+            maxDefinition: maxDefinition,
+            maxRepetition: maxRepetition,
+          );
+        } else {
+          walk(child, path, maxDefinition, maxRepetition);
         }
       }
     }
 
-    return false;
+    walk(SchemaLevels.buildSchemaTree(elements), '', 0, 0);
   }
 
-  /// Check if schema element is part of a MAP
-  static bool isMapElement(List<thrift.SchemaElement> elements, int index) {
-    if (index <= 0) return false;
-
-    // Check parent
-    for (int i = index - 1; i >= 0; i--) {
-      final element = elements[i];
-      if (element.convertedType == thrift.ConvertedType.map ||
-          element.convertedType == thrift.ConvertedType.mapKeyValue) {
-        // Check if this element is a descendant
-        final numChildren = element.numChildren ?? 0;
-        if (i + numChildren >= index) {
-          return true;
-        }
-      }
+  /// Levels of the leaf at schema element [index].
+  LevelInfo levels(int index) {
+    final found = _levels[index];
+    if (found == null) {
+      throw ArgumentError('Column not found at index $index');
     }
-
-    return false;
+    return found;
   }
 }
 
@@ -199,13 +184,13 @@ class SchemaNode {
   }
 
   int get depth {
-    int d = 0;
+    int count = 0;
     SchemaNode? current = parent;
     while (current != null) {
-      d++;
+      count++;
       current = current.parent;
     }
-    return d;
+    return count;
   }
 }
 

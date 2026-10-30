@@ -30,13 +30,13 @@ Example: `docker run --rm -e OPS=read -e REPS=3 libbigdata-bench`
 
 ## What it measures
 
-- **Read** — fully decode every column and compute one deterministic aggregate
+- **Read**: fully decode every column and compute one deterministic aggregate
   (sum of numeric columns + string lengths + counts). Using per-column
   aggregates (not `COUNT(*)`) forces DuckDB to actually decode the data. Each
   engine prints its aggregate and the harness asserts they all match
   (`RESULT_CHECK PASS`), so the benchmark also guards correctness.
-- **Write** — convert the generated `gen.csv` to Parquet with each codec; report
-  time and output size. (Timing includes CSV parsing — it measures a realistic
+- **Write**: convert the generated `gen.csv` to Parquet with each codec; report
+  time and output size. (Timing includes CSV parsing, so it measures a realistic
   "CSV → Parquet" conversion.)
 
 Datasets: a deterministic generated set (`gen`, written to a neutral Parquet by
@@ -74,3 +74,19 @@ Each engine emits machine-parseable lines that `report.py` consumes:
 ```
 RESULT <engine> <op> <dataset> <codec> <ms> <rows> <bytes> <ints> <floats>
 ```
+
+## In-process benchmarks
+
+The other benchmarks in `benchmark/` measure libbigdata alone and run with the
+Dart SDK, from the repository root:
+
+| benchmark | command | measures |
+|---|---|---|
+| `sql_bench.dart` | `dart run benchmark/sql_bench.dart [rows=1000000] [reps=3]` | SQL engine operators over synthesized tables |
+| `dataframe_bench.dart` | `dart run benchmark/dataframe_bench.dart [rows=1000000] [reps=3]` | DataFrame pipelines in memory and over `benchmark/work/gen.snappy.parquet` when present |
+| `exec_bench.dart` | `dart run benchmark/exec_bench.dart [rows] [reps]` | vectorized against per-row filter and projection |
+| `format_bench.dart` | `dart run benchmark/format_bench.dart [rows] [reps] [csvPath]` | write time, read time and size across CSV, JSON, JSON Lines, Arrow IPC and Parquet |
+| `column_bench.dart` | `dart run benchmark/column_bench.dart <path> [reps]` | per-column Parquet read times |
+
+`synth.dart` (data synthesis) and `results.dart` (unwrapping a `Result` or
+stopping the run) are shared helpers, not benchmarks.

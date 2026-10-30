@@ -5,7 +5,8 @@ import 'dart:convert';
 import 'package:args/args.dart';
 import 'package:libbigdata/libbigdata.dart';
 
-const String version = '1.0.0';
+/// Must match `version:` in pubspec.yaml (test/cli_test.dart checks).
+const String version = '2.0.0';
 
 void main(List<String> arguments) async {
   final parser = ArgParser()
@@ -30,6 +31,12 @@ void main(List<String> arguments) async {
       help: 'Load Parquet file as table (format: name:path)',
     )
     ..addOption(
+      'root',
+      help:
+          'Directory SQL and loaded files may read from, by absolute or '
+          'relative path (default: the current directory, relative paths only)',
+    )
+    ..addOption(
       'output',
       abbr: 'o',
       help: 'Output format',
@@ -44,7 +51,7 @@ void main(List<String> arguments) async {
     )
     ..addFlag(
       'verbose',
-      help: 'Show verbose output including query plan',
+      help: 'Show each statement and load as it runs',
       defaultsTo: false,
     );
 
@@ -64,47 +71,71 @@ void main(List<String> arguments) async {
 
     // Initialize SQL engine. Own its lifetime in try/finally so the per-session
     // spill directory is always cleaned up (dispose), even on an error or exit.
-    final engine = SqlEngine();
+    // --root widens the path sandbox to a chosen directory. The CLI's user
+    // is the operator, so writes stay allowed as they are without it.
+    final root = results['root'] as String?;
+    if (root != null && !Directory(root).existsSync()) {
+      stderr.writeln('Error: --root "$root" is not a directory');
+      exit(1);
+    }
+    final SqlEngine engine;
+    switch (SqlEngine.open(sandboxRoot: root, readOnly: false)) {
+      case Ok(:final value):
+        engine = value;
+      case Err(:final error):
+        stderr.writeln('Error: $error');
+        exit(1);
+    }
     try {
       final verbose = results['verbose'] as bool;
       final timing = results['timing'] as bool;
-      final outputFormat = results['output'] as String;
+      final format = results['output'] as String;
 
-      // Load data files if specified
-      if (results['csv'] != null) {
-        await loadCsvFile(engine, results['csv'] as String, verbose);
+      // Load data files if specified. A failed load prints its kind and
+      // message and exits non-zero (after the finally below disposes).
+      for (final (option, load) in [
+        ('csv', loadCsvFile),
+        ('parquet', loadParquetFile),
+      ]) {
+        if (results[option] == null) continue;
+        final loaded = await load(engine, results[option] as String, verbose);
+        if (loaded case Err(:final error)) {
+          stderr.writeln('Error: $error');
+          exitCode = 1;
+          return;
+        }
       }
 
-      if (results['parquet'] != null) {
-        await loadParquetFile(engine, results['parquet'] as String, verbose);
-      }
-
-      // Execute SQL
+      // Execute SQL. A failed statement sets a non-zero exit code; exitCode
+      // (not exit()) lets the finally below dispose the engine first.
       if (results['execute'] != null) {
         // Execute single statement
         final sql = results['execute'] as String;
-        await executeQuery(engine, sql, outputFormat, timing, verbose);
+        if (!await executeQuery(engine, sql, format, timing, verbose)) {
+          exitCode = 1;
+        }
       } else if (results['file'] != null) {
         // Execute from file
-        final filePath = results['file'] as String;
-        final sql = await File(filePath).readAsString();
-        await executeSqlScript(engine, sql, outputFormat, timing, verbose);
-      } else if (results['interactive'] ||
-          (results.rest.isEmpty &&
-              results['csv'] == null &&
-              results['parquet'] == null)) {
-        // Start interactive mode
-        await runInteractiveMode(engine, outputFormat, timing, verbose);
+        final path = results['file'] as String;
+        final sql = await File(path).readAsString();
+        if (!await executeSqlScript(engine, sql, format, timing, verbose)) {
+          exitCode = 1;
+        }
+      } else if (results['interactive'] || results.rest.isEmpty) {
+        // No SQL to run, so open the REPL (on the loaded files, if any).
+        await runInteractiveMode(engine, format, timing, verbose);
       } else if (results.rest.isNotEmpty) {
         // Treat remaining arguments as SQL
         final sql = results.rest.join(' ');
-        await executeQuery(engine, sql, outputFormat, timing, verbose);
+        if (!await executeQuery(engine, sql, format, timing, verbose)) {
+          exitCode = 1;
+        }
       }
     } finally {
       await engine.dispose();
     }
-  } catch (e) {
-    stderr.writeln('Error: $e');
+  } catch (error) {
+    stderr.writeln('Error: $error');
     exit(1);
   }
 }
@@ -113,32 +144,35 @@ void printUsage(ArgParser parser) {
   print('''
 BigData SQL CLI - A pure Dart SQL engine for data analysis
 
-Usage: sql [options] [SQL statement]
+Usage: libbigdata [options] [SQL statement]
 
 Options:
 ${parser.usage}
 
 Examples:
   # Execute a single query
-  sql -e "SELECT * FROM employees WHERE age > 30"
+  libbigdata -e "SELECT * FROM employees WHERE age > 30"
   
   # Load CSV and query it
-  sql -c employees:data.csv -e "SELECT COUNT(*) FROM employees"
+  libbigdata -c employees:data.csv -e "SELECT COUNT(*) FROM employees"
   
   # Load Parquet file
-  sql -p sales:sales.parquet -e "SELECT SUM(amount) FROM sales"
+  libbigdata -p sales:sales.parquet -e "SELECT SUM(amount) FROM sales"
+
+  # Read files under /data by absolute path
+  libbigdata --root /data -e "SELECT COUNT(*) FROM '/data/sales.parquet'"
   
   # Execute SQL script
-  sql -f queries.sql
+  libbigdata -f queries.sql
   
   # Interactive mode
-  sql -i
+  libbigdata -i
   
   # With timing and verbose output
-  sql -tv -e "SELECT * FROM employees ORDER BY salary DESC"
+  libbigdata -t --verbose -e "SELECT * FROM employees ORDER BY salary DESC"
   
   # Output as JSON
-  sql -o json -e "SELECT * FROM employees"
+  libbigdata -o json -e "SELECT * FROM employees"
 
 Interactive Mode Commands:
   .help          Show help
@@ -153,52 +187,65 @@ Interactive Mode Commands:
 ''');
 }
 
-Future<void> loadCsvFile(SqlEngine engine, String spec, bool verbose) async {
-  final parts = spec.split(':');
-  if (parts.length != 2) {
-    throw ArgumentError('CSV spec must be in format name:path');
-  }
-
-  final tableName = parts[0];
-  final filePath = parts[1];
-
-  if (verbose) print('Loading CSV file: $filePath as table "$tableName"...');
-
-  await engine.registerFile(tableName, filePath);
-
-  if (verbose) {
-    print('Successfully loaded CSV file as table "$tableName"');
-  }
-}
-
-Future<void> loadParquetFile(
+/// Register the CSV file named by [spec] (`name:path`) on [engine].
+Future<Result<void, ErrorDetails>> loadCsvFile(
   SqlEngine engine,
   String spec,
   bool verbose,
+) => _load(engine, spec, 'CSV', '.csv', verbose);
+
+/// Register the Parquet file named by [spec] (`name:path`) on [engine].
+Future<Result<void, ErrorDetails>> loadParquetFile(
+  SqlEngine engine,
+  String spec,
+  bool verbose,
+) => _load(engine, spec, 'Parquet', '.parquet', verbose);
+
+/// Register the [format] file named by [spec] on [engine]. The name ends at
+/// the FIRST colon, so a path may hold more (`C:\data.csv`), and the path
+/// must have the format's [extension]: the engine reads by extension, so a
+/// `--csv` of a Parquet file was read as Parquet.
+Future<Result<void, ErrorDetails>> _load(
+  SqlEngine engine,
+  String spec,
+  String format,
+  String extension,
+  bool verbose,
 ) async {
-  final parts = spec.split(':');
-  if (parts.length != 2) {
-    throw ArgumentError('Parquet spec must be in format name:path');
+  final colon = spec.indexOf(':');
+  if (colon <= 0 || colon == spec.length - 1) {
+    return Err(
+      ErrorDetails(Kind.invalid, '$format spec must be in format name:path'),
+    );
   }
 
-  final tableName = parts[0];
-  final filePath = parts[1];
+  final name = spec.substring(0, colon);
+  final path = spec.substring(colon + 1);
+  if (!path.toLowerCase().endsWith(extension)) {
+    return Err(
+      ErrorDetails(
+        Kind.invalid,
+        '$path is not a $format file (expected a $extension extension)',
+      ),
+    );
+  }
 
   if (verbose) {
-    print('Loading Parquet file: $filePath as table "$tableName"...');
+    print('Loading $format file: $path as table "$name"...');
   }
 
-  await engine.registerFile(tableName, filePath);
-
-  if (verbose) {
-    print('Successfully loaded Parquet file as table "$tableName"');
+  final loaded = await engine.registerFile(name, path);
+  if (verbose && loaded is Ok) {
+    print('Successfully loaded $format file as table "$name"');
   }
+  return loaded;
 }
 
-Future<void> executeQuery(
+/// Run [sql] and print its result; false when the query failed.
+Future<bool> executeQuery(
   SqlEngine engine,
   String sql,
-  String outputFormat,
+  String format,
   bool timing,
   bool verbose,
 ) async {
@@ -209,99 +256,122 @@ Future<void> executeQuery(
 
   final stopwatch = timing ? (Stopwatch()..start()) : null;
 
-  try {
-    final result = await engine.execute(sql);
-
-    if (stopwatch != null) {
-      stopwatch.stop();
-      print('Execution time: ${stopwatch.elapsedMilliseconds}ms');
-      print('');
-    }
-
-    // Convert Table to DataChunk for output
-    final chunks = result.toChunks();
-    if (chunks.isEmpty) {
-      print('(0 rows)');
-    } else {
-      // Merge all chunks into a single DataChunk for output
-      final allColumns = <Column>[];
-      for (int i = 0; i < result.schema.fields.length; i++) {
-        final columnData = <dynamic>[];
-        for (final chunk in chunks) {
-          if (i < chunk.columns.length) {
-            columnData.addAll(chunk.columns[i].toList());
-          }
-        }
-        allColumns.add(
-          ListColumn(
-            name: result.schema.fields[i].name,
-            data: columnData,
-            dataType: result.schema.fields[i].dataType,
-          ),
-        );
+  switch (await engine.execute(sql)) {
+    case Ok(:final value):
+      if (stopwatch != null) {
+        stopwatch.stop();
+        print('Execution time: ${stopwatch.elapsedMilliseconds}ms');
+        print('');
       }
-      final mergedChunk = DataChunk(columns: allColumns, schema: result.schema);
-      outputResult(mergedChunk, outputFormat);
-    }
-  } catch (e) {
-    stderr.writeln('Query failed: $e');
+      outputResult(value, format);
+      return true;
+    case Err(:final error):
+      stderr.writeln('Query failed: $error');
+      return false;
   }
 }
 
-Future<void> executeSqlScript(
+/// Run each statement in [script]; false when any of them failed.
+Future<bool> executeSqlScript(
   SqlEngine engine,
   String script,
-  String outputFormat,
+  String format,
   bool timing,
   bool verbose,
 ) async {
-  // Split script into individual statements (simple split on semicolon)
-  final statements = script
-      .split(';')
-      .map((s) => s.trim())
-      .where((s) => s.isNotEmpty)
-      .toList();
+  final list = statements(script);
 
-  for (final sql in statements) {
+  var succeeded = true;
+  for (final (index, sql) in list.indexed) {
     if (verbose) {
-      print(
-        '\nExecuting statement ${statements.indexOf(sql) + 1}/${statements.length}',
-      );
+      print('\nExecuting statement ${index + 1}/${list.length}');
     }
-    await executeQuery(engine, sql, outputFormat, timing, verbose);
+    if (!await executeQuery(engine, sql, format, timing, verbose)) {
+      succeeded = false;
+    }
   }
+  return succeeded;
+}
+
+/// The statements of [script], split on semicolons outside quoted strings,
+/// quoted identifiers and comments (a plain split cut `'a;b'` in two). A
+/// piece holding only comments is dropped.
+List<String> statements(String script) {
+  final out = <String>[];
+  final current = StringBuffer();
+  var code = false; // whether [current] holds more than comments and spaces
+  void end() {
+    if (code) out.add(current.toString().trim());
+    current.clear();
+    code = false;
+  }
+
+  var i = 0;
+  while (i < script.length) {
+    final char = script[i];
+    var stop = i + 1;
+    if (char == "'" || char == '"') {
+      // A doubled quote is an escaped one.
+      while (stop < script.length &&
+          (script[stop] != char ||
+              (stop + 1 < script.length && script[stop + 1] == char))) {
+        stop += script[stop] == char ? 2 : 1;
+      }
+      stop = stop < script.length ? stop + 1 : stop;
+      code = true;
+    } else if (script.startsWith('--', i)) {
+      final line = script.indexOf('\n', i);
+      stop = line < 0 ? script.length : line;
+    } else if (script.startsWith('/*', i)) {
+      final close = script.indexOf('*/', i + 2);
+      stop = close < 0 ? script.length : close + 2;
+    } else if (char == ';') {
+      end();
+      i = stop;
+      continue;
+    } else if (char.trim().isNotEmpty) {
+      code = true;
+    }
+    current.write(script.substring(i, stop));
+    i = stop;
+  }
+  end();
+  return out;
 }
 
 Future<void> runInteractiveMode(
   SqlEngine engine,
-  String outputFormat,
+  String format,
   bool timing,
   bool verbose,
 ) async {
   print('BigData SQL Interactive Mode v$version');
   print('Type ".help" for help, ".quit" to exit\n');
 
-  var currentOutputFormat = outputFormat;
-  var currentTiming = timing;
-  var currentVerbose = verbose;
+  var output = format;
+  var timed = timing;
+  var detailed = verbose;
 
   while (true) {
     stdout.write('sql> ');
     final input = stdin.readLineSync();
 
-    if (input == null || input.trim().isEmpty) continue;
+    if (input == null) break; // end of input: leave cleanly
+    if (input.trim().isEmpty) continue;
 
     final trimmed = input.trim();
 
     // Handle special commands
     if (trimmed.startsWith('.')) {
-      await handleCommand(
+      final quit = await handleCommand(
         trimmed,
         engine,
-        (format) => currentOutputFormat = format,
-        (value) => currentTiming = value,
-        (value) => currentVerbose = value,
+        output,
+        (value) => output = value,
+        (value) => timed = value,
+        (value) => detailed = value,
       );
+      if (quit) break; // return to main, which disposes the engine
       continue;
     }
 
@@ -309,36 +379,32 @@ Future<void> runInteractiveMode(
     var sql = trimmed;
     while (!sql.endsWith(';') && !sql.startsWith('.')) {
       stdout.write('   > ');
-      final nextLine = stdin.readLineSync();
-      if (nextLine == null) break;
-      sql += '\n$nextLine';
+      final line = stdin.readLineSync();
+      if (line == null) break;
+      sql += '\n$line';
     }
 
     if (sql.endsWith(';')) {
       sql = sql.substring(0, sql.length - 1);
     }
 
-    await executeQuery(
-      engine,
-      sql,
-      currentOutputFormat,
-      currentTiming,
-      currentVerbose,
-    );
+    await executeQuery(engine, sql, output, timed, detailed);
   }
 }
 
-Future<void> handleCommand(
+/// Run one `.command`; true when it asks the REPL to stop.
+Future<bool> handleCommand(
   String command,
   SqlEngine engine,
+  String current,
   Function(String) setOutputFormat,
   Function(bool) setTiming,
   Function(bool) setVerbose,
 ) async {
   final parts = command.split(' ');
-  final cmd = parts[0].toLowerCase();
+  final keyword = parts[0].toLowerCase();
 
-  switch (cmd) {
+  switch (keyword) {
     case '.help':
       print('''
 Interactive Mode Commands:
@@ -355,14 +421,16 @@ Interactive Mode Commands:
       break;
 
     case '.tables':
-      final tables = engine.getTables().keys.toList()..sort();
+      final tables = engine.tables.keys.toList()..sort();
       if (tables.isEmpty) {
         print('No tables loaded');
       } else {
         print('Tables:');
+        // A loaded file is read lazily, so its row count is not known here;
+        // the catalog's placeholder reported 0 rows.
         for (final table in tables) {
-          final t = engine.getTables()[table]!;
-          print('  $table (${t.rowCount} rows)');
+          final loaded = engine.tables[table]!;
+          print('  $table (${loaded.schema.fields.length} columns)');
         }
       }
       break;
@@ -370,15 +438,15 @@ Interactive Mode Commands:
     case '.schema':
       if (parts.length < 2) {
         print('Usage: .schema TABLE');
-        return;
+        return false;
       }
-      final tableName = parts[1];
-      final table = engine.getTables()[tableName];
+      final name = parts[1];
+      final table = engine.tables[name];
       if (table == null) {
-        print('Table "$tableName" not found');
-        return;
+        print('Table "$name" not found');
+        return false;
       }
-      print('Schema for $tableName:');
+      print('Schema for $name:');
       for (final field in table.schema.fields) {
         print('  ${field.name}: ${field.dataType}');
       }
@@ -387,27 +455,26 @@ Interactive Mode Commands:
     case '.load':
       if (parts.length < 3) {
         print('Usage: .load csv|parquet NAME:PATH');
-        return;
+        return false;
       }
       final type = parts[1].toLowerCase();
       final spec = parts.sublist(2).join(' ');
-      try {
-        if (type == 'csv') {
-          await loadCsvFile(engine, spec, true);
-        } else if (type == 'parquet') {
-          await loadParquetFile(engine, spec, true);
-        } else {
-          print('Unknown file type: $type');
-        }
-      } catch (e) {
-        print('Failed to load file: $e');
+      final loaded = switch (type) {
+        'csv' => await loadCsvFile(engine, spec, true),
+        'parquet' => await loadParquetFile(engine, spec, true),
+        _ => null,
+      };
+      if (loaded == null) {
+        print('Unknown file type: $type');
+      } else if (loaded case Err(:final error)) {
+        print('Failed to load file: $error');
       }
       break;
 
     case '.output':
       if (parts.length < 2) {
-        print('Current output format: $setOutputFormat');
-        return;
+        print('Current output format: $current');
+        return false;
       }
       final format = parts[1].toLowerCase();
       if (['table', 'json', 'csv'].contains(format)) {
@@ -421,7 +488,7 @@ Interactive Mode Commands:
     case '.timing':
       if (parts.length < 2) {
         print('Usage: .timing on|off');
-        return;
+        return false;
       }
       final value = parts[1].toLowerCase() == 'on';
       setTiming(value);
@@ -431,7 +498,7 @@ Interactive Mode Commands:
     case '.verbose':
       if (parts.length < 2) {
         print('Usage: .verbose on|off');
-        return;
+        return false;
       }
       final value = parts[1].toLowerCase() == 'on';
       setVerbose(value);
@@ -441,112 +508,90 @@ Interactive Mode Commands:
     case '.quit':
     case '.exit':
       print('Goodbye!');
-      exit(0);
+      return true;
 
     default:
-      print('Unknown command: $cmd');
+      print('Unknown command: $keyword');
       print('Type .help for available commands');
   }
+  return false;
 }
 
-void outputResult(DataChunk result, String format) {
+/// Print [result] in [format]. Rows come from `Table.row`, which presents
+/// a decimal as a scaled `Decimal` (the column itself holds unscaled
+/// integers), so every format prints `1.50` rather than `150`.
+void outputResult(Table result, String format) {
+  final names = [for (final field in result.schema.fields) field.name];
+  final rows = result.toRows();
   switch (format) {
     case 'json':
-      outputJson(result);
+      outputJson(rows);
       break;
     case 'csv':
-      outputCsv(result);
+      // The library's writer: it quotes headers, carriage returns and every
+      // value type as reading the file back expects.
+      print(CsvWriter().writeTableToString(result));
       break;
     case 'table':
     default:
-      outputTable(result);
+      outputTable(names, rows);
       break;
   }
 }
 
-void outputTable(DataChunk result) {
-  if (result.rowCount == 0) {
+void outputTable(List<String> names, List<Map<String, dynamic>> rows) {
+  if (rows.isEmpty) {
     print('(0 rows)');
     return;
   }
 
   // Check if output is being piped (not a terminal)
-  final isInteractive = stdout.hasTerminal;
+  final interactive = stdout.hasTerminal;
 
   // Calculate column widths
   final widths = <int>[];
-  for (final column in result.columns) {
-    var maxWidth = column.name.length;
-    for (int i = 0; i < result.rowCount && i < 100; i++) {
-      final value = column[i]?.toString() ?? 'NULL';
-      maxWidth = maxWidth > value.length ? maxWidth : value.length;
+  for (final name in names) {
+    var width = name.length;
+    for (int i = 0; i < rows.length && i < 100; i++) {
+      final value = rows[i][name]?.toString() ?? 'NULL';
+      width = width > value.length ? width : value.length;
     }
-    widths.add(maxWidth.clamp(3, 50));
+    widths.add(width.clamp(3, 50));
   }
 
   // Print header
-  final header = result.columns
+  final header = names
       .asMap()
       .entries
-      .map((e) => e.value.name.padRight(widths[e.key]))
+      .map((entry) => entry.value.padRight(widths[entry.key]))
       .join(' | ');
   print(header);
-  print('-' * (header.length + (result.columns.length - 1) * 3));
+  print('-' * header.length);
 
   // Print rows - limit to 1000 for interactive display, all rows when piped
-  final maxRows = isInteractive && result.rowCount > 1000
-      ? 1000
-      : result.rowCount;
-  for (int row = 0; row < maxRows; row++) {
+  final limit = interactive && rows.length > 1000 ? 1000 : rows.length;
+  for (int row = 0; row < limit; row++) {
     final values = <String>[];
-    for (int col = 0; col < result.columns.length; col++) {
-      final value = result.columns[col][row];
-      final str = value?.toString() ?? 'NULL';
-      values.add(str.padRight(widths[col]));
+    for (int column = 0; column < names.length; column++) {
+      final text = rows[row][names[column]]?.toString() ?? 'NULL';
+      values.add(text.padRight(widths[column]));
     }
     print(values.join(' | '));
   }
 
-  if (isInteractive && result.rowCount > maxRows) {
-    print('... (${result.rowCount - maxRows} more rows)');
+  if (interactive && rows.length > limit) {
+    print('... (${rows.length - limit} more rows)');
   }
-  print('\n(${result.rowCount} rows)');
+  print('\n(${rows.length} rows)');
 }
 
-void outputJson(DataChunk result) {
-  final rows = <Map<String, dynamic>>[];
-
-  for (int row = 0; row < result.rowCount; row++) {
-    final rowMap = <String, dynamic>{};
-    for (final column in result.columns) {
-      rowMap[column.name] = column[row];
-    }
-    rows.add(rowMap);
-  }
-
-  print(JsonEncoder.withIndent('  ').convert(rows));
-  print('\n(${result.rowCount} rows)');
-}
-
-void outputCsv(DataChunk result) {
-  // Print header
-  print(result.columns.map((c) => c.name).join(','));
-
-  // Print rows
-  for (int row = 0; row < result.rowCount; row++) {
-    final values = result.columns
-        .map((c) {
-          final value = c[row];
-          if (value == null) return '';
-          if (value is String &&
-              (value.contains(',') ||
-                  value.contains('"') ||
-                  value.contains('\n'))) {
-            return '"${value.replaceAll('"', '""')}"';
-          }
-          return value.toString();
-        })
-        .join(',');
-    print(values);
-  }
+void outputJson(List<Map<String, dynamic>> rows) {
+  // Dates print as ISO-8601 and decimals (and BigInt) as their exact text;
+  // JSON numbers would round them through a double.
+  final encoder = JsonEncoder.withIndent(
+    '  ',
+    (value) => value is DateTime ? value.toIso8601String() : value.toString(),
+  );
+  print(encoder.convert(rows));
+  print('\n(${rows.length} rows)');
 }

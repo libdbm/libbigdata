@@ -1,14 +1,15 @@
 import 'dart:convert';
 
+import '../../core/result.dart';
 import '../../core/schema.dart';
 import '../../core/table.dart';
 
 /// A column-level Delta `delta.invariants` constraint: [predicate] is a SQL
 /// boolean expression that every row of [column]'s table must satisfy.
-class Invariant {
+final class Invariant {
   const Invariant(this.column, this.predicate);
 
-  /// The field whose metadata declared it (for error messages — the predicate
+  /// The field whose metadata declared it (for error messages: the predicate
   /// itself may reference any column).
   final String column;
 
@@ -18,7 +19,7 @@ class Invariant {
 
 /// Evaluates a Delta invariant against data on its way into a table.
 ///
-/// This is an injected seam rather than a direct call because evaluating SQL
+/// This is an injected boundary rather than a direct call because evaluating SQL
 /// needs the query engine, which sits ABOVE this layer: `sql/` already imports
 /// `formats/` (spill writes Parquet/Arrow), so importing it back from here
 /// would make the two modules mutually dependent. `SqlInvariantEvaluator` is
@@ -32,7 +33,9 @@ abstract interface class InvariantEvaluator {
   /// SQL `CHECK` semantics under three-valued logic: a row violates only when
   /// the predicate is FALSE. A NULL result is not a violation (it is unknown,
   /// not false), which is why this cannot be `table.rowCount - matches`.
-  Future<int> violations(Table table, String predicate);
+  ///
+  /// An [Err] of kind [Kind.invalid] when [predicate] cannot be evaluated.
+  Future<Result<int, ErrorDetails>> violations(Table table, String predicate);
 }
 
 /// The invariants [schema]'s fields declare, in field order.

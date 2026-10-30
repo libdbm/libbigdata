@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:libbigdata/libbigdata.dart';
 
+import 'results.dart';
 import 'synth.dart';
 
 /// End-to-end SQL-engine profiler over >1M-row synthesized tables. Covers the
@@ -18,7 +19,7 @@ Future<void> main(List<String> args) async {
   final fact2Path = '${work.path}/fact2.parquet';
 
   stderr.writeln('synthesizing $rows rows (+ parquet)...');
-  final engine = SqlEngine(allowExternalPaths: true);
+  final engine = SqlEngine.open(allowExternalPaths: true).ok;
   engine.registerTable('fact', synthTable(rows));
   engine.registerTable('dim', synthDim(1000));
   await synthParquet(factPath, rows);
@@ -42,7 +43,7 @@ Future<void> main(List<String> args) async {
   }
 
   Future<void> run(String sql) async {
-    await engine.execute(sql); // materialize
+    await engine.execute(sql).ok; // materialize
   }
 
   print('=== libbigdata SQL bench: $rows rows, $reps reps (median) ===');
@@ -72,6 +73,17 @@ Future<void> main(List<String> args) async {
     () => run('SELECT key FROM fact UNION SELECT key FROM dim'),
   );
   await bench(
+    'upper projection',
+    () => run('SELECT UPPER(category) AS u FROM fact'),
+  );
+  await bench(
+    'upper + group by',
+    () => run(
+      'SELECT u, COUNT(*) AS n FROM (SELECT UPPER(category) AS u FROM fact) AS s '
+      'GROUP BY u',
+    ),
+  );
+  await bench(
     'cte + group by',
     () => run(
       'WITH t AS (SELECT category, amount FROM fact WHERE amount > 100) '
@@ -79,9 +91,11 @@ Future<void> main(List<String> args) async {
     ),
   );
 
-  await engine.execute(
-    "CREATE OR REPLACE VIEW v AS (SELECT category, amount FROM fact WHERE flag = true)",
-  );
+  await engine
+      .execute(
+        "CREATE OR REPLACE VIEW v AS (SELECT category, amount FROM fact WHERE flag = true)",
+      )
+      .ok;
   await bench(
     'view + group by',
     () => run('SELECT category, COUNT(*) AS n FROM v GROUP BY category'),
@@ -103,15 +117,17 @@ Future<void> main(List<String> args) async {
   // Parquet pushdown: id is sequential, so a high-id filter prunes most groups.
   await bench('parquet pushdown', () async {
     ParquetReader.rowGroupsPruned = 0;
-    await engine.execute(
-      "SELECT COUNT(*) AS n FROM '$factPath' WHERE id >= ${rows - 50000}",
-    );
+    await engine
+        .execute(
+          "SELECT COUNT(*) AS n FROM '$factPath' WHERE id >= ${rows - 50000}",
+        )
+        .ok;
   });
   ParquetReader.rowGroupsPruned = 0;
   ParquetReader.columnsRead = 0;
-  await engine.execute(
-    "SELECT id FROM '$factPath' WHERE id >= ${rows - 50000}",
-  );
+  await engine
+      .execute("SELECT id FROM '$factPath' WHERE id >= ${rows - 50000}")
+      .ok;
   print(
     '  pushdown: rowGroupsPruned=${ParquetReader.rowGroupsPruned} '
     'columnsRead=${ParquetReader.columnsRead}',
@@ -120,13 +136,16 @@ Future<void> main(List<String> args) async {
   // Memory-bounded streaming scan+filter over the >1M-row parquet.
   await bench('executeStream scan', () async {
     var total = 0;
-    await for (final batch in engine.executeStream(
-      "SELECT id FROM '$factPath' WHERE amount > 900",
-    )) {
+    await for (final batch
+        in engine
+            .executeStream("SELECT id FROM '$factPath' WHERE amount > 900")
+            .ok) {
       total += batch.rowCount;
     }
     if (total < 0) throw StateError('unreachable');
   });
 
-  work.deleteSync(recursive: true);
+  for (final path in [factPath, fact2Path]) {
+    File(path).deleteSync();
+  }
 }

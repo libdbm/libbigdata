@@ -5,16 +5,26 @@ import 'rle_bitpacked.dart';
 import 'delta_binary_packed.dart';
 import 'delta_byte_array.dart';
 
-/// Whether [schema] annotates a BYTE_ARRAY as UTF8 text.
+/// Whether [schema] annotates a BYTE_ARRAY as UTF8 text: UTF8, or JSON and
+/// ENUM, which the spec defines as UTF8 too.
 ///
 /// The ONE place this is decided. A plain BYTE_ARRAY is binary and a DECIMAL
-/// holds two's-complement bytes, so neither may go through utf8 — and a column
+/// holds two's-complement bytes, so neither may go through utf8, and a column
 /// that IS text must not come back as bytes under a `string` dtype, which
 /// nothing downstream re-checks (validateColumns compares dtypes, not the values
 /// behind them).
-bool isUtf8(thrift.SchemaElement? schema) =>
-    schema?.convertedType == thrift.ConvertedType.utf8 ||
-    schema?.logicalType?.string != null;
+bool isUtf8(thrift.SchemaElement? schema) => switch (schema) {
+  null => false,
+  _ =>
+    const {
+          thrift.ConvertedType.utf8,
+          thrift.ConvertedType.json,
+          thrift.ConvertedType.enum_,
+        }.contains(schema.convertedType) ||
+        schema.logicalType?.string != null ||
+        schema.logicalType?.json != null ||
+        schema.logicalType?.enum_ != null,
+};
 
 /// [bytes] as the value [schema] calls for: text, or the raw bytes.
 Object byteArrayValue(Uint8List bytes, thrift.SchemaElement? schema) =>
@@ -116,7 +126,7 @@ class PlainDecoder extends ValueDecoder {
           final length = view.getInt32(offset, Endian.little);
           // The prefix is read SIGNED, so a negative length slips past the
           // bounds check below (`bytesLeft < -1` is false) and reaches
-          // `sublist(offset, offset - 1)` — a raw RangeError from deep inside
+          // `sublist(offset, offset - 1)`: a raw RangeError from deep inside
           // the decoder. It is malformed input, not truncation, so `tolerant`
           // must not swallow it either. (DeltaLengthByteArrayDecoder already
           // rejects this; the PLAIN path was missed.)
@@ -165,12 +175,28 @@ class DictionaryDecoder extends ValueDecoder {
   final thrift.SchemaElement? schema;
   List<dynamic> dictionary = [];
 
+  /// [dictionary] as a typed list for the numeric physical types (int32,
+  /// int64, float, double), so a typed read gathers values without boxing.
+  /// Null for every other type.
+  List<num>? typed;
+
   DictionaryDecoder(this.type, {this.schema});
 
   /// Set dictionary from dictionary page
   void setDictionary(Uint8List data, int count) {
     final decoder = PlainDecoder(type, schema: schema);
     dictionary = decoder.decode(data, count);
+    typed = switch (type) {
+      thrift.ParquetType.int32 => Int32List.fromList(dictionary.cast<int>()),
+      thrift.ParquetType.int64 => Int64List.fromList(dictionary.cast<int>()),
+      thrift.ParquetType.float => Float32List.fromList(
+        dictionary.cast<double>(),
+      ),
+      thrift.ParquetType.double => Float64List.fromList(
+        dictionary.cast<double>(),
+      ),
+      _ => null,
+    };
   }
 
   @override
@@ -191,6 +217,24 @@ class DictionaryDecoder extends ValueDecoder {
     return values;
   }
 
+  /// Decode up to [count] indices into [into] (index 0 on), returning how many
+  /// the page held. The typed counterpart of [decodeIndices].
+  int decodeIndicesInto(Uint8List data, int count, Int32List into) {
+    if (data.isEmpty) return 0;
+    final bitWidth = data[0];
+    if (bitWidth > 32) {
+      throw FormatException(
+        'Corrupt dictionary page: index bit width $bitWidth exceeds 32',
+      );
+    }
+    return RleBitpackedHybrid.decodeInto(
+      Uint8List.sublistView(data, 1),
+      bitWidth,
+      count,
+      into,
+    );
+  }
+
   /// Decode indices from RLE/Bit-packed hybrid
   List<int> decodeIndices(Uint8List data, int count) {
     // Dictionary indices are encoded using RLE/Bit-packed hybrid
@@ -201,29 +245,25 @@ class DictionaryDecoder extends ValueDecoder {
 
     final bitWidth = data[0];
     // A byte can claim up to 255; a dictionary index wider than 32 bits is
-    // corrupt. RleBitpackedHybrid would throw a raw ArgumentError — corrupt
-    // Parquet input surfaces as FormatException everywhere else (R29).
+    // corrupt. RleBitpackedHybrid would throw a raw ArgumentError: corrupt
+    // Parquet input surfaces as FormatException everywhere else.
     if (bitWidth > 32) {
       throw FormatException(
         'Corrupt dictionary page: index bit width $bitWidth exceeds 32',
       );
     }
-    final encodedData = data.sublist(1);
+    final encoded = data.sublist(1);
 
-    // Import the RLE decoder. A data page's index stream decodes whole runs and
-    // we keep only the first [count]; a final run can legitimately overrun
-    // [count], so bound only by the absolute page ceiling (OOM guard) here, not
-    // tightly by [count] (which the level decoders, where the stream length is
-    // exact, still do).
-    final indices = RleBitpackedHybrid.decode(
-      encodedData,
+    // A final run can legitimately overrun [count], so decoding stops at
+    // [count] (cutting that run) instead of rejecting it or expanding it.
+    return RleBitpackedHybrid.decode(
+      encoded,
       bitWidth,
       hasLength:
           false, // No length prefix for dictionary indices in data page v1
       maxValues: maxPageValues,
+      limit: count,
     );
-
-    return indices.take(count).toList();
   }
 }
 
@@ -239,6 +279,7 @@ class RleDecoder extends ValueDecoder {
       1,
       hasLength: true,
       maxValues: maxPageValues,
+      limit: count,
     );
     return [for (int i = 0; i < count && i < bits.length; i++) bits[i] != 0];
   }
@@ -308,7 +349,11 @@ class DecoderFactory {
       case thrift.Encoding.byteStreamSplit:
         return ByteStreamSplitDecoder(type, schema: schema);
       default:
-        return PlainDecoder(type, schema: schema, tolerant: tolerant);
+        // BIT_PACKED (levels only) and anything newer: decoding these bytes
+        // as PLAIN would return garbage values.
+        throw UnsupportedError(
+          'Parquet value encoding ${encoding.name} is not supported',
+        );
     }
   }
 }
@@ -332,29 +377,64 @@ class ByteStreamSplitDecoder extends ValueDecoder {
     ),
   };
 
-  @override
-  List<dynamic> decode(Uint8List data, int count) {
-    final w = _width;
-    if (w <= 0) {
+  /// The type width, after checking [data] holds [count] values of it.
+  int _check(Uint8List data, int count) {
+    final width = _width;
+    if (width <= 0) {
       throw const FormatException('BYTE_STREAM_SPLIT requires a type width');
     }
-    if (data.length < w * count) {
+    if (data.length < width * count) {
       throw FormatException(
-        'BYTE_STREAM_SPLIT truncated: need ${w * count} bytes, got ${data.length}',
+        'BYTE_STREAM_SPLIT truncated: need ${width * count} bytes, got ${data.length}',
       );
     }
+    return width;
+  }
+
+  /// Decode [count] values into [out] from [start] by writing each byte plane
+  /// straight into [out]'s bytes. [out] must be the typed list of this type
+  /// (Int32List for INT32, Float64List for DOUBLE, ...) on a little-endian
+  /// host; anything else throws [UnsupportedError].
+  void decodeInto(Uint8List data, int count, List<num> out, int start) {
+    final width = _check(data, count);
+    final matches = switch (type) {
+      thrift.ParquetType.int32 => out is Int32List,
+      thrift.ParquetType.int64 => out is Int64List,
+      thrift.ParquetType.float => out is Float32List,
+      thrift.ParquetType.double => out is Float64List,
+      _ => false,
+    };
+    if (!matches || Endian.host != Endian.little) {
+      throw UnsupportedError('typed BYTE_STREAM_SPLIT decode for $type');
+    }
+    final target = out as TypedData;
+    final bytes = target.buffer.asUint8List(
+      target.offsetInBytes + start * width,
+      count * width,
+    );
+    for (var j = 0; j < width; j++) {
+      final plane = j * count;
+      for (var i = 0; i < count; i++) {
+        bytes[i * width + j] = data[plane + i];
+      }
+    }
+  }
+
+  @override
+  List<dynamic> decode(Uint8List data, int count) {
+    final width = _check(data, count);
     final out = List<dynamic>.filled(count, null);
-    final scratch = Uint8List(w);
-    final sv = ByteData.view(scratch.buffer);
+    final scratch = Uint8List(width);
+    final view = ByteData.view(scratch.buffer);
     for (int i = 0; i < count; i++) {
-      for (int j = 0; j < w; j++) {
+      for (int j = 0; j < width; j++) {
         scratch[j] = data[j * count + i];
       }
       out[i] = switch (type) {
-        thrift.ParquetType.float => sv.getFloat32(0, Endian.little),
-        thrift.ParquetType.double => sv.getFloat64(0, Endian.little),
-        thrift.ParquetType.int32 => sv.getInt32(0, Endian.little),
-        thrift.ParquetType.int64 => sv.getInt64(0, Endian.little),
+        thrift.ParquetType.float => view.getFloat32(0, Endian.little),
+        thrift.ParquetType.double => view.getFloat64(0, Endian.little),
+        thrift.ParquetType.int32 => view.getInt32(0, Endian.little),
+        thrift.ParquetType.int64 => view.getInt64(0, Endian.little),
         _ => Uint8List.fromList(scratch), // FLBA: the raw W bytes
       };
     }

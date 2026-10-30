@@ -1,9 +1,12 @@
 import 'dart:typed_data';
 
+import '../../core/conversions.dart' show checkedDecimal;
 import '../../core/data_type.dart';
 import '../../core/limits.dart';
 import '../../core/schema.dart';
 import 'flatbuffers.dart';
+import '../../core/failure.dart';
+import '../../core/result.dart';
 
 /// Builds and parses the Apache Arrow IPC metadata messages (FlatBuffer encoded)
 /// per the Arrow `Message.fbs`/`Schema.fbs`/`File.fbs` schemas. Core types only.
@@ -13,6 +16,7 @@ const int metadataV5 = 4;
 
 // MessageHeader union codes (0 = NONE).
 const int headerSchema = 1;
+const int headerDictionaryBatch = 2;
 const int headerRecordBatch = 3;
 
 // Type union codes (0 = NONE).
@@ -30,17 +34,20 @@ const int _typeStruct = 13;
 const int _typeMap = 17;
 
 // Precision enum.
-const int _precSingle = 1;
-const int _precDouble = 2;
+const int _precisionSingle = 1;
+const int _precisionDouble = 2;
 
-// DateUnit: DAY=0, MILLISECOND=1.
+// DateUnit: DAY=0, MILLISECOND=1. The schema's default is MILLISECOND.
 const int _dateDay = 0;
-// TimeUnit: SECOND=0, MILLISECOND=1, MICROSECOND=2, NANOSECOND=3.
+const int _dateMilli = 1;
+// TimeUnit: SECOND=0, MILLISECOND=1, MICROSECOND=2, NANOSECOND=3. The schema's
+// default for a timestamp is SECOND.
+const int _timeSecond = 0;
 const int _timeMicro = 2;
 
 /// Metadata key carrying a timestamp column's Arrow TimeUnit so decode can scale
 /// it back to a DateTime (our writes always use MICROSECOND).
-const String tsUnitMeta = 'arrow.tsUnit';
+const String timeUnitMeta = 'arrow.tsUnit';
 
 /// Metadata key carrying a date column's Arrow DateUnit (DAY=0, MILLISECOND=1)
 /// so decode uses the DECLARED width instead of guessing from buffer length.
@@ -69,9 +76,9 @@ typedef BlockInfo = ({int offset, int metaLength, int bodyLength});
 
 /// Build a Schema message (FlatBuffer) for [fields].
 Uint8List buildSchemaMessage(List<Field> fields) {
-  final b = FbBuilder();
-  final schema = _buildSchema(b, fields);
-  return b.finish(_message(b, headerSchema, schema, 0));
+  final builder = FbBuilder();
+  final schema = _buildSchema(builder, fields);
+  return builder.finish(_message(builder, headerSchema, schema, 0));
 }
 
 /// Build a RecordBatch message for [numRows] with the given field [nodes] and
@@ -83,188 +90,197 @@ Uint8List buildRecordBatchMessage(
   int bodyLength, {
   int? codec,
 }) {
-  final b = FbBuilder();
-  final nodesVec = b.writeStructVector([
-    for (final n in nodes) _structFieldNode(n),
+  final builder = FbBuilder();
+  final nodeVector = builder.writeStructVector([
+    for (final node in nodes) _structFieldNode(node),
   ], 8);
-  final buffersVec = b.writeStructVector([
-    for (final bf in buffers) _structBuffer(bf),
+  final bufferVector = builder.writeStructVector([
+    for (final buffer in buffers) _structBuffer(buffer),
   ], 8);
   int? compression;
   if (codec != null) {
-    b.startTable(2);
-    b.addUint8(0, codec); // CompressionType (LZ4_FRAME=0 default, ZSTD=1)
+    builder.startTable(2);
+    builder.addUint8(0, codec); // CompressionType (LZ4_FRAME=0 default, ZSTD=1)
     // field 1 = method (BUFFER = 0, default, omitted)
-    compression = b.endTable();
+    compression = builder.endTable();
   }
-  b.startTable(4);
-  b.addInt64(0, numRows);
-  b.addOffset(1, nodesVec);
-  b.addOffset(2, buffersVec);
-  if (compression != null) b.addOffset(3, compression);
-  final rb = b.endTable();
-  return b.finish(_message(b, headerRecordBatch, rb, bodyLength));
+  builder.startTable(4);
+  builder.addInt64(0, numRows);
+  builder.addOffset(1, nodeVector);
+  builder.addOffset(2, bufferVector);
+  if (compression != null) builder.addOffset(3, compression);
+  final batch = builder.endTable();
+  return builder.finish(
+    _message(builder, headerRecordBatch, batch, bodyLength),
+  );
 }
 
 /// Build the IPC file Footer for [fields] and the record-batch [blocks].
 Uint8List buildFooter(List<Field> fields, List<BlockInfo> blocks) {
-  final b = FbBuilder();
-  final schema = _buildSchema(b, fields);
-  final batchesVec = b.writeStructVector([
-    for (final bk in blocks) _structBlock(bk),
+  final builder = FbBuilder();
+  final schema = _buildSchema(builder, fields);
+  final vector = builder.writeStructVector([
+    for (final block in blocks) _structBlock(block),
   ], 8);
-  b.startTable(5);
-  b.addInt16(0, metadataV5);
-  b.addOffset(1, schema);
+  builder.startTable(5);
+  builder.addInt16(0, metadataV5);
+  builder.addOffset(1, schema);
   // field 2 = dictionaries (omitted)
-  b.addOffset(3, batchesVec);
-  return b.finish(b.endTable());
+  builder.addOffset(3, vector);
+  return builder.finish(builder.endTable());
 }
 
-int _message(FbBuilder b, int headerType, int headerOffset, int bodyLength) {
-  b.startTable(5);
-  b.addInt16(0, metadataV5);
-  b.addUint8(1, headerType);
-  b.addOffset(2, headerOffset);
-  b.addInt64(3, bodyLength);
-  return b.endTable();
+int _message(FbBuilder builder, int type, int header, int bodyLength) {
+  builder.startTable(5);
+  builder.addInt16(0, metadataV5);
+  builder.addUint8(1, type);
+  builder.addOffset(2, header);
+  builder.addInt64(3, bodyLength);
+  return builder.endTable();
 }
 
-int _buildSchema(FbBuilder b, List<Field> fields) {
-  final fieldOffsets = [for (final f in fields) _buildField(b, f)];
-  final vec = b.writeOffsetVector(fieldOffsets);
-  b.startTable(4);
+int _buildSchema(FbBuilder builder, List<Field> fields) {
+  final offsets = [for (final field in fields) _buildField(builder, field)];
+  final vector = builder.writeOffsetVector(offsets);
+  builder.startTable(4);
   // field 0 = endianness (Little = 0, default, omitted)
-  b.addOffset(1, vec);
-  return b.endTable();
+  builder.addOffset(1, vector);
+  return builder.endTable();
 }
 
-int _buildField(FbBuilder b, Field f) {
-  final nameOffset = b.writeString(f.name);
+int _buildField(FbBuilder builder, Field field) {
+  final name = builder.writeString(field.name);
   // Children (built first, back-to-front) for nested types.
-  int? childrenVec;
-  if (f.children.isNotEmpty) {
-    final childOffsets = [for (final c in f.children) _buildField(b, c)];
-    childrenVec = b.writeOffsetVector(childOffsets);
+  int? children;
+  if (field.children.isNotEmpty) {
+    final offsets = [
+      for (final child in field.children) _buildField(builder, child),
+    ];
+    children = builder.writeOffsetVector(offsets);
   }
-  final (typeCode, typeOffset) = _buildType(b, f);
-  b.startTable(7);
-  b.addOffset(0, nameOffset);
-  b.addBool(1, f.nullable);
-  b.addUint8(2, typeCode);
-  b.addOffset(3, typeOffset);
+  final (code, type) = _buildType(builder, field);
+  builder.startTable(7);
+  builder.addOffset(0, name);
+  builder.addBool(1, field.nullable);
+  builder.addUint8(2, code);
+  builder.addOffset(3, type);
   // 4 dictionary
-  if (childrenVec != null) b.addOffset(5, childrenVec);
+  if (children != null) builder.addOffset(5, children);
   // 6 custom_metadata (omitted)
-  return b.endTable();
+  return builder.endTable();
 }
 
 /// Returns (Type union code, offset to the Type table). Decimal reads
-/// precision/scale off [f]; date/timestamp are normalized (date=DAY/int32,
+/// precision/scale off [field]; date/timestamp are normalized (date=DAY/int32,
 /// timestamp=MICROSECOND/int64).
-(int, int) _buildType(FbBuilder b, Field f) {
-  switch (f.dataType) {
+(int, int) _buildType(FbBuilder builder, Field field) {
+  switch (field.dataType) {
     case DataType.int8:
-      return (_typeInt, _int(b, 8));
+      return (_typeInt, _int(builder, 8));
     case DataType.int16:
-      return (_typeInt, _int(b, 16));
+      return (_typeInt, _int(builder, 16));
     case DataType.int32:
-      return (_typeInt, _int(b, 32));
+      return (_typeInt, _int(builder, 32));
     case DataType.int64:
-      return (_typeInt, _int(b, 64));
+      return (_typeInt, _int(builder, 64));
     case DataType.float32:
-      return (_typeFloat, _float(b, _precSingle));
+      return (_typeFloat, _float(builder, _precisionSingle));
     case DataType.float64:
-      return (_typeFloat, _float(b, _precDouble));
+      return (_typeFloat, _float(builder, _precisionDouble));
     case DataType.boolean:
-      b.startTable(0);
-      return (_typeBool, b.endTable());
+      builder.startTable(0);
+      return (_typeBool, builder.endTable());
     case DataType.string:
-      b.startTable(0);
-      return (_typeUtf8, b.endTable());
+      builder.startTable(0);
+      return (_typeUtf8, builder.endTable());
     case DataType.binary:
-      b.startTable(0);
-      return (_typeBinary, b.endTable());
+      builder.startTable(0);
+      return (_typeBinary, builder.endTable());
     case DataType.null_:
-      b.startTable(0);
-      return (_typeNull, b.endTable());
+      builder.startTable(0);
+      return (_typeNull, builder.endTable());
     case DataType.date:
-      return (_typeDate, _date(b, _dateDay));
+      return (_typeDate, _date(builder, _dateDay));
     case DataType.timestamp:
-      return (_typeTimestamp, _timestamp(b, _timeMicro));
+      return (_typeTimestamp, _timestamp(builder, _timeMicro));
     case DataType.decimal:
-      return (_typeDecimal, _decimal(b, f.precision ?? 38, f.scale ?? 0));
+      return (
+        _typeDecimal,
+        _decimal(builder, field.precision ?? 38, field.scale ?? 0),
+      );
     case DataType.list:
-      b.startTable(0);
-      return (_typeList, b.endTable());
+      builder.startTable(0);
+      return (_typeList, builder.endTable());
     case DataType.struct:
-      b.startTable(0);
-      return (_typeStruct, b.endTable());
+      builder.startTable(0);
+      return (_typeStruct, builder.endTable());
     case DataType.map:
-      b.startTable(1);
-      b.addBool(0, false); // keysSorted
-      return (_typeMap, b.endTable());
+      builder.startTable(1);
+      builder.addBool(0, false); // keysSorted
+      return (_typeMap, builder.endTable());
     default:
-      throw UnsupportedError(
-        'Arrow IPC does not yet support type "${f.dataType.name}"',
+      throw Failure.of(
+        Kind.unsupported,
+        'Arrow IPC does not yet support type "${field.dataType.name}"',
       );
   }
 }
 
-int _int(FbBuilder b, int bitWidth) {
-  b.startTable(2);
-  b.addInt32(0, bitWidth);
-  b.addBool(1, true); // signed
-  return b.endTable();
+int _int(FbBuilder builder, int bitWidth) {
+  builder.startTable(2);
+  builder.addInt32(0, bitWidth);
+  builder.addBool(1, true); // signed
+  return builder.endTable();
 }
 
-int _float(FbBuilder b, int precision) {
-  b.startTable(1);
-  b.addInt16(0, precision);
-  return b.endTable();
+int _float(FbBuilder builder, int precision) {
+  builder.startTable(1);
+  builder.addInt16(0, precision);
+  return builder.endTable();
 }
 
-int _date(FbBuilder b, int unit) {
-  b.startTable(1);
-  b.addInt16(0, unit);
-  return b.endTable();
+int _date(FbBuilder builder, int unit) {
+  builder.startTable(1);
+  // A missing unit means MILLISECOND, so DAY must always be written.
+  builder.addInt16(0, unit, _dateMilli);
+  return builder.endTable();
 }
 
-int _timestamp(FbBuilder b, int unit) {
-  b.startTable(2);
-  b.addInt16(0, unit);
+int _timestamp(FbBuilder builder, int unit) {
+  builder.startTable(2);
+  builder.addInt16(0, unit);
   // field 1 = timezone (offset/string, omitted -> naive UTC)
-  return b.endTable();
+  return builder.endTable();
 }
 
-int _decimal(FbBuilder b, int precision, int scale) {
-  b.startTable(3);
-  b.addInt32(0, precision);
-  b.addInt32(1, scale);
+int _decimal(FbBuilder builder, int precision, int scale) {
+  builder.startTable(3);
+  builder.addInt32(0, precision);
+  builder.addInt32(1, scale);
   // field 2 = bitWidth (default 128, omitted)
-  return b.endTable();
+  return builder.endTable();
 }
 
-Uint8List _structFieldNode(NodeInfo n) {
-  final bd = ByteData(16);
-  bd.setInt64(0, n.length, Endian.little);
-  bd.setInt64(8, n.nullCount, Endian.little);
-  return bd.buffer.asUint8List();
+Uint8List _structFieldNode(NodeInfo node) {
+  final data = ByteData(16);
+  data.setInt64(0, node.length, Endian.little);
+  data.setInt64(8, node.nullCount, Endian.little);
+  return data.buffer.asUint8List();
 }
 
-Uint8List _structBuffer(BufferInfo bf) {
-  final bd = ByteData(16);
-  bd.setInt64(0, bf.offset, Endian.little);
-  bd.setInt64(8, bf.length, Endian.little);
-  return bd.buffer.asUint8List();
+Uint8List _structBuffer(BufferInfo buffer) {
+  final data = ByteData(16);
+  data.setInt64(0, buffer.offset, Endian.little);
+  data.setInt64(8, buffer.length, Endian.little);
+  return data.buffer.asUint8List();
 }
 
-Uint8List _structBlock(BlockInfo bk) {
-  final bd = ByteData(24);
-  bd.setInt64(0, bk.offset, Endian.little);
-  bd.setInt32(8, bk.metaLength, Endian.little);
-  bd.setInt64(16, bk.bodyLength, Endian.little);
-  return bd.buffer.asUint8List();
+Uint8List _structBlock(BlockInfo block) {
+  final data = ByteData(24);
+  data.setInt64(0, block.offset, Endian.little);
+  data.setInt32(8, block.metaLength, Endian.little);
+  data.setInt64(16, block.bodyLength, Endian.little);
+  return data.buffer.asUint8List();
 }
 
 // ---------------------------------------------------------------------------
@@ -274,12 +290,12 @@ Uint8List _structBlock(BlockInfo bk) {
 /// A parsed Message header: which kind + the table position of the header.
 typedef ParsedMessage = ({int headerType, int headerTable, int bodyLength});
 
-ParsedMessage parseMessage(FbReader r) {
-  final m = r.root;
+ParsedMessage parseMessage(FbReader reader) {
+  final table = reader.root;
   return (
-    headerType: r.u8Field(m, 1, 0),
-    headerTable: r.offsetField(m, 2),
-    bodyLength: r.i64Field(m, 3, 0),
+    headerType: reader.u8Field(table, 1, 0),
+    headerTable: reader.offsetField(table, 2),
+    bodyLength: reader.i64Field(table, 3, 0),
   );
 }
 
@@ -292,15 +308,23 @@ class _SchemaBudget {
   int fields = 0;
 }
 
-/// Parse a Schema table at [schemaTable] into libbigdata [Field]s.
-List<Field> parseSchema(FbReader r, int schemaTable) {
-  final n = r.vectorLength(schemaTable, 1);
+/// Parse a Schema table at [table] into libbigdata [Field]s.
+List<Field> parseSchema(FbReader reader, int table) {
+  // Field 0: endianness, Little = 0. Big-endian buffers would decode as
+  // little-endian garbage.
+  if (reader.i16Field(table, 0, 0) != 0) {
+    throw Failure.of(
+      Kind.unsupported,
+      'Big-endian Arrow data is not supported',
+    );
+  }
+  final n = reader.vectorLength(table, 1);
   final budget = _SchemaBudget();
   return [
     for (int i = 0; i < n; i++)
       _parseField(
-        r,
-        r.offsetVectorElement(schemaTable, 1, i),
+        reader,
+        reader.offsetVectorElement(table, 1, i),
         'col$i',
         budget,
         1,
@@ -310,9 +334,9 @@ List<Field> parseSchema(FbReader r, int schemaTable) {
 
 /// Parse one Field table, recursing into children for nested types.
 Field _parseField(
-  FbReader r,
-  int ft,
-  String fallbackName,
+  FbReader reader,
+  int table,
+  String fallback,
   _SchemaBudget budget,
   int depth,
 ) {
@@ -326,22 +350,42 @@ Field _parseField(
       'Arrow schema declares more than $defaultMaxSchemaFields fields',
     );
   }
-  final name = r.stringField(ft, 0) ?? fallbackName;
-  final nullable = r.boolField(ft, 1, false);
-  final typeCode = r.u8Field(ft, 2, 0);
-  final typeTable = r.offsetField(ft, 3);
-  final parsed = _parseType(r, typeCode, typeTable);
-  final childCount = r.vectorLength(ft, 5);
+  final name = reader.stringField(table, 0) ?? fallback;
+  final nullable = reader.boolField(table, 1, false);
+  final code = reader.u8Field(table, 2, 0);
+  final typeTable = reader.offsetField(table, 3);
+  // Field 4: DictionaryEncoding. Its values arrive in dictionary batches,
+  // which this reader does not decode.
+  if (reader.offsetField(table, 4) != 0) {
+    throw Failure.of(
+      Kind.unsupported,
+      'Arrow column $name is dictionary-encoded, which is not supported',
+    );
+  }
+  final parsed = _parseType(reader, code, typeTable);
+  final count = reader.vectorLength(table, 5);
   final children = [
-    for (int i = 0; i < childCount; i++)
+    for (int i = 0; i < count; i++)
       _parseField(
-        r,
-        r.offsetVectorElement(ft, 5, i),
+        reader,
+        reader.offsetVectorElement(table, 5, i),
         'child$i',
         budget,
         depth + 1,
       ),
   ];
+  // Decoding indexes these children directly, so their shape is checked here.
+  final shaped = switch (parsed.type) {
+    DataType.list => children.length == 1,
+    DataType.map =>
+      children.length == 1 && children.single.children.length == 2,
+    _ => true,
+  };
+  if (!shaped) {
+    throw FormatException(
+      'Arrow ${parsed.type.name} field $name has ${children.length} children',
+    );
+  }
   return Field(
     name: name,
     dataType: parsed.type,
@@ -349,7 +393,7 @@ Field _parseField(
     precision: parsed.precision,
     scale: parsed.scale,
     metadata: {
-      if (parsed.tsUnit != null) tsUnitMeta: parsed.tsUnit,
+      if (parsed.timeUnit != null) timeUnitMeta: parsed.timeUnit,
       if (parsed.dateUnit != null) dateUnitMeta: parsed.dateUnit,
       if (parsed.decimalBits != null) decimalBitsMeta: parsed.decimalBits,
     },
@@ -361,29 +405,32 @@ typedef _ParsedType = ({
   DataType type,
   int? precision,
   int? scale,
-  int? tsUnit,
+  int? timeUnit,
   int? dateUnit,
   int? decimalBits,
 });
 
-_ParsedType _scalar(DataType t) => (
-  type: t,
+_ParsedType _scalar(DataType type) => (
+  type: type,
   precision: null,
   scale: null,
-  tsUnit: null,
+  timeUnit: null,
   dateUnit: null,
   decimalBits: null,
 );
 
-_ParsedType _parseType(FbReader r, int code, int typeTable) {
+_ParsedType _parseType(FbReader reader, int code, int table) {
   switch (code) {
     case _typeNull:
       return _scalar(DataType.null_);
     case _typeInt:
-      final bits = typeTable == 0 ? 32 : r.i32Field(typeTable, 0, 32);
-      final signed = typeTable == 0 ? true : r.boolField(typeTable, 1, false);
+      final bits = table == 0 ? 32 : reader.i32Field(table, 0, 32);
+      final signed = table == 0 ? true : reader.boolField(table, 1, false);
       if (!signed) {
-        throw UnsupportedError('Arrow IPC v1 does not support unsigned ints');
+        throw Failure.of(
+          Kind.unsupported,
+          'Arrow IPC v1 does not support unsigned ints',
+        );
       }
       switch (bits) {
         case 8:
@@ -395,13 +442,21 @@ _ParsedType _parseType(FbReader r, int code, int typeTable) {
         case 64:
           return _scalar(DataType.int64);
         default:
-          throw UnsupportedError('Arrow int bitWidth $bits');
+          throw FormatException('Arrow int bitWidth $bits');
       }
     case _typeFloat:
-      final prec = typeTable == 0 ? _precDouble : r.i16Field(typeTable, 0, 0);
-      if (prec == _precSingle) return _scalar(DataType.float32);
-      if (prec == _precDouble) return _scalar(DataType.float64);
-      throw UnsupportedError('Arrow float precision $prec (half unsupported)');
+      final precision = table == 0
+          ? _precisionDouble
+          : reader.i16Field(table, 0, 0);
+      if (precision == _precisionSingle) return _scalar(DataType.float32);
+      if (precision == _precisionDouble) return _scalar(DataType.float64);
+      if (precision != 0) {
+        throw FormatException('Arrow float precision $precision');
+      }
+      throw Failure.of(
+        Kind.unsupported,
+        'Arrow float precision $precision (half unsupported)',
+      );
     case _typeUtf8:
       return _scalar(DataType.string);
     case _typeBinary:
@@ -410,41 +465,44 @@ _ParsedType _parseType(FbReader r, int code, int typeTable) {
       return _scalar(DataType.boolean);
     case _typeDate:
       // unit (field 0) carried so decode picks 4- vs 8-byte elements from the
-      // DECLARATION, not a byte-length division. Default DAY.
+      // DECLARATION. A missing unit is null here, not the spec's MILLISECOND:
+      // earlier versions of this library wrote DAY by omitting it, and decode
+      // then tells the two apart by value width.
+      final unit = table == 0 ? -1 : reader.i16Field(table, 0, -1);
       return (
         type: DataType.date,
         precision: null,
         scale: null,
-        tsUnit: null,
-        dateUnit: typeTable == 0
-            ? _dateDay
-            : r.i16Field(typeTable, 0, _dateDay),
+        timeUnit: null,
+        dateUnit: unit < 0 ? null : unit,
         decimalBits: null,
       );
     case _typeTimestamp:
-      // unit (field 0) carried so decode can scale; default MICROSECOND.
-      final unit = typeTable == 0
-          ? _timeMicro
-          : r.i16Field(typeTable, 0, _timeMicro);
+      // unit (field 0) carried so decode can scale; missing means SECOND.
+      final unit = table == 0
+          ? _timeSecond
+          : reader.i16Field(table, 0, _timeSecond);
       return (
         type: DataType.timestamp,
         precision: null,
         scale: null,
-        tsUnit: unit,
+        timeUnit: unit,
         dateUnit: null,
         decimalBits: null,
       );
     case _typeDecimal:
-      final precision = typeTable == 0 ? 38 : r.i32Field(typeTable, 0, 38);
-      final scale = typeTable == 0 ? 0 : r.i32Field(typeTable, 1, 0);
+      final (:precision, :scale) = checkedDecimal(
+        table == 0 ? 38 : reader.i32Field(table, 0, 38),
+        table == 0 ? 0 : reader.i32Field(table, 1, 0),
+      );
       return (
         type: DataType.decimal,
         precision: precision,
         scale: scale,
-        tsUnit: null,
+        timeUnit: null,
         dateUnit: null,
         // bitWidth (field 2), default 128 per the spec.
-        decimalBits: typeTable == 0 ? 128 : r.i32Field(typeTable, 2, 128),
+        decimalBits: table == 0 ? 128 : reader.i32Field(table, 2, 128),
       );
     case _typeList:
       return _scalar(DataType.list);
@@ -453,46 +511,57 @@ _ParsedType _parseType(FbReader r, int code, int typeTable) {
     case _typeMap:
       return _scalar(DataType.map);
     default:
-      throw UnsupportedError('Arrow type code $code unsupported');
+      // 1 to 26 name real Arrow types this reader does not support; anything
+      // else (0 is NONE) is not a type at all.
+      if (code < 1 || code > 26) {
+        throw FormatException('Invalid Arrow type code $code');
+      }
+      throw Failure.of(Kind.unsupported, 'Arrow type code $code unsupported');
   }
 }
 
-/// Parse a RecordBatch table at [rbTable].
+/// Parse a RecordBatch table at [table].
 ({int length, List<NodeInfo> nodes, List<BufferInfo> buffers, int? codec})
-parseRecordBatch(FbReader r, int rbTable) {
-  final length = r.i64Field(rbTable, 0, 0);
+parseRecordBatch(FbReader reader, int table) {
+  final length = reader.i64Field(table, 0, 0);
   final nodes = <NodeInfo>[];
-  final nn = r.vectorLength(rbTable, 1);
-  for (int i = 0; i < nn; i++) {
-    final p = r.structVectorElement(rbTable, 1, i, 16);
-    nodes.add((length: r.i64(p), nullCount: r.i64(p + 8)));
+  final nodeTotal = reader.vectorLength(table, 1);
+  for (int i = 0; i < nodeTotal; i++) {
+    final position = reader.structVectorElement(table, 1, i, 16);
+    nodes.add((
+      length: reader.i64(position),
+      nullCount: reader.i64(position + 8),
+    ));
   }
   final buffers = <BufferInfo>[];
-  final bn = r.vectorLength(rbTable, 2);
-  for (int i = 0; i < bn; i++) {
-    final p = r.structVectorElement(rbTable, 2, i, 16);
-    buffers.add((offset: r.i64(p), length: r.i64(p + 8)));
+  final bufferTotal = reader.vectorLength(table, 2);
+  for (int i = 0; i < bufferTotal; i++) {
+    final position = reader.structVectorElement(table, 2, i, 16);
+    buffers.add((
+      offset: reader.i64(position),
+      length: reader.i64(position + 8),
+    ));
   }
-  final comp = r.offsetField(rbTable, 3);
-  final codec = comp == 0
+  final compression = reader.offsetField(table, 3);
+  final codec = compression == 0
       ? null
-      : r.u8Field(comp, 0, 0); // default 0 = LZ4_FRAME
+      : reader.u8Field(compression, 0, 0); // default 0 = LZ4_FRAME
   return (length: length, nodes: nodes, buffers: buffers, codec: codec);
 }
 
 /// Parse the IPC Footer.
-({List<Field> fields, List<BlockInfo> batches}) parseFooter(FbReader r) {
-  final f = r.root;
-  final schemaTable = r.offsetField(f, 1);
-  final fields = parseSchema(r, schemaTable);
+({List<Field> fields, List<BlockInfo> batches}) parseFooter(FbReader reader) {
+  final footer = reader.root;
+  final schemaTable = reader.offsetField(footer, 1);
+  final fields = parseSchema(reader, schemaTable);
   final batches = <BlockInfo>[];
-  final n = r.vectorLength(f, 3);
-  for (int i = 0; i < n; i++) {
-    final p = r.structVectorElement(f, 3, i, 24);
+  final count = reader.vectorLength(footer, 3);
+  for (int i = 0; i < count; i++) {
+    final position = reader.structVectorElement(footer, 3, i, 24);
     batches.add((
-      offset: r.i64(p),
-      metaLength: r.i32(p + 8),
-      bodyLength: r.i64(p + 16),
+      offset: reader.i64(position),
+      metaLength: reader.i32(position + 8),
+      bodyLength: reader.i64(position + 16),
     ));
   }
   return (fields: fields, batches: batches);

@@ -3,13 +3,15 @@ import 'dart:io';
 import 'package:libbigdata/libbigdata.dart';
 import 'package:test/test.dart';
 
+import 'support/results.dart';
+
 /// Planner group-by-expression + order-by-group-key binding (Round 48 deferred).
 void main() {
   late Directory dir;
   late SqlEngine engine;
   setUp(() {
     dir = Directory.systemTemp.createTempSync('gbplan_');
-    engine = SqlEngine(spillDir: dir.path);
+    engine = SqlEngine.open(spillDir: dir.path).ok;
     engine.registerTable(
       't',
       Table(
@@ -41,7 +43,7 @@ void main() {
   });
 
   Future<List<Map<String, Object?>>> rows(String sql) async =>
-      (await engine.execute(sql)).toRows();
+      (await engine.execute(sql).ok).toRows();
 
   test('GROUP BY <expr> with the expr in SELECT binds', () async {
     final r = await rows(
@@ -66,7 +68,7 @@ void main() {
       'SELECT COUNT(*) AS c FROM t GROUP BY k ORDER BY k DESC',
     );
     expect(r.length, 6);
-    // 6 singleton groups; the count is 1 each — the assertion is that it BINDS
+    // 6 singleton groups; the count is 1 each: the assertion is that it BINDS
     // and orders (no "Unknown column: k").
     expect(r.every((row) => row['c'] == 1), isTrue);
     expect(r.first.containsKey('k'), isFalse); // k trimmed from the output

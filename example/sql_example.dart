@@ -6,7 +6,14 @@ void main() async {
   print('=== BigData SQL Engine Example ===\n');
 
   // Create SQL engine
-  final engine = SqlEngine();
+  final SqlEngine engine;
+  switch (SqlEngine.open()) {
+    case Ok(:final value):
+      engine = value;
+    case Err(:final error):
+      print('Could not open the engine: $error');
+      return;
+  }
 
   // Create sample data
   final schema = Schema(
@@ -79,7 +86,7 @@ void main() async {
   print('1. Basic SELECT:');
   print('   SELECT * FROM employees LIMIT 3\n');
   var result = await engine.execute('SELECT * FROM employees LIMIT 3');
-  _printTable(result);
+  _show(result);
 
   // Example 2: WHERE clause
   print('\n2. WHERE clause:');
@@ -89,7 +96,7 @@ void main() async {
   result = await engine.execute(
     "SELECT name, age FROM employees WHERE department = 'Engineering'",
   );
-  _printTable(result);
+  _show(result);
 
   // Example 3: Aggregation
   print('\n3. Aggregation:');
@@ -99,7 +106,7 @@ void main() async {
   result = await engine.execute(
     'SELECT COUNT(*) as total, AVG(salary) as avg_salary FROM employees',
   );
-  _printTable(result);
+  _show(result);
 
   // Example 4: GROUP BY
   print('\n4. GROUP BY:');
@@ -113,7 +120,7 @@ void main() async {
     FROM employees 
     GROUP BY department
   ''');
-  _printTable(result);
+  _show(result);
 
   // Example 5: ORDER BY and LIMIT
   print('\n5. ORDER BY and LIMIT:');
@@ -121,7 +128,7 @@ void main() async {
   result = await engine.execute(
     'SELECT name, salary FROM employees ORDER BY salary DESC LIMIT 3',
   );
-  _printTable(result);
+  _show(result);
 
   // Example 6: WITH clause (CTE)
   print('\n6. WITH clause (Common Table Expression):');
@@ -139,7 +146,7 @@ void main() async {
     FROM high_earners 
     GROUP BY department
   ''');
-  _printTable(result);
+  _show(result);
 
   // Example 7: File as table (like DuckDB)
   print('\n7. Query files directly (if files exist):');
@@ -160,7 +167,17 @@ void main() async {
   print(
     '   DataFrame pipeline: filter(age > 30) -> select -> orderBy -> limit(3)\n',
   );
-  _printTable(dfResult);
+  _show(dfResult);
+}
+
+/// Print a query's table, or why it failed.
+void _show(Result<Table, ErrorDetails> result) {
+  switch (result) {
+    case Ok(:final value):
+      _printTable(value);
+    case Err(:final error):
+      print('   failed: $error');
+  }
 }
 
 void _printTable(Table table) {

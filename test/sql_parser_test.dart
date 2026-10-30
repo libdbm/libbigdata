@@ -5,7 +5,9 @@ import 'package:libbigdata/src/sql/ast/ast.dart';
 import 'package:libbigdata/src/sql/parser/sql_parser.dart';
 import 'package:test/test.dart';
 
-/// Direct SQL-parser / semantics tests — the parser (997 LOC) had no dedicated
+import 'support/results.dart';
+
+/// Direct SQL-parser / semantics tests: the parser (997 LOC) had no dedicated
 /// suite, so case-sensitivity and grammar-gap bugs shipped untested. Covers the
 /// Phase-1 correctness fixes.
 void main() {
@@ -13,7 +15,7 @@ void main() {
   late SqlEngine engine;
   setUp(() {
     dir = Directory.systemTemp.createTempSync('sqlparse_');
-    engine = SqlEngine(spillDir: dir.path);
+    engine = SqlEngine.open(spillDir: dir.path).ok;
   });
   tearDown(() async {
     await engine.dispose();
@@ -29,7 +31,7 @@ void main() {
   );
 
   Future<List<int>> col(String sql) async =>
-      (await engine.execute(sql)).column('n')!.toList().cast<int>();
+      (await engine.execute(sql).ok).column('n')!.toList().cast<int>();
 
   group('CB1 set-op keyword case', () {
     setUp(() {
@@ -137,20 +139,20 @@ void main() {
     setUp(() => engine.registerTable('g', grouped()));
 
     test('a bare top-level aggregate still works', () async {
-      final r = await engine.execute('SELECT SUM(n) AS s FROM g');
+      final r = await engine.execute('SELECT SUM(n) AS s FROM g').ok;
       expect(r.column('s')!.toList().first, BigInt.from(6));
     });
 
     test('an aggregate nested in arithmetic is hoisted', () async {
-      final r = await engine.execute('SELECT SUM(n) + 1 AS s FROM g');
+      final r = await engine.execute('SELECT SUM(n) + 1 AS s FROM g').ok;
       expect(r.column('s')!.toList().first, BigInt.from(7));
     });
 
     test('a nested aggregate under GROUP BY is hoisted', () async {
       // Was silently dropped, then rejected; now computed per group.
-      final r = await engine.execute(
-        'SELECT k, SUM(n) * 100 AS s FROM g GROUP BY k ORDER BY k',
-      );
+      final r = await engine
+          .execute('SELECT k, SUM(n) * 100 AS s FROM g GROUP BY k ORDER BY k')
+          .ok;
       expect(r.column('s')!.toList(), [BigInt.from(300), BigInt.from(300)]);
     });
   });
@@ -158,15 +160,16 @@ void main() {
   group('CB9 float literals', () {
     setUp(() => engine.registerTable('t', ints('t', [1])));
 
-    Future<double> f(String expr) async =>
-        (await engine.execute(
-              'SELECT $expr AS n FROM t',
-            )).column('n')!.toList().first
-            as double;
+    Future<Object?> f(String expr) async =>
+        (await engine.execute('SELECT $expr AS n FROM t').ok)
+            .toRows()
+            .first['n'];
 
+    // A point without an exponent is an exact DECIMAL (DuckDB); an exponent
+    // makes a double.
     test('leading-dot, trailing-dot, and exponent forms parse', () async {
-      expect(await f('.5'), 0.5);
-      expect(await f('1.'), 1.0);
+      expect('${await f('.5')}', '0.5');
+      expect('${await f('1.')}', '1');
       expect(await f('1e3'), 1000.0);
       expect(await f('1.5E-1'), closeTo(0.15, 1e-12));
     });
@@ -184,7 +187,7 @@ void main() {
             .expression;
 
     /// Asserts `sql` parses to a left-nested tree whose outermost operator is
-    /// [operator] — i.e. `a OP b OP c` groups as `(a OP b) OP c`. Under
+    /// [operator], i.e. `a OP b OP c` groups as `(a OP b) OP c`. Under
     /// right-association the nesting flips to the `right` branch.
     void nestsLeft(String sql, String operator) {
       final root = expression(sql) as BinaryExpression;
@@ -192,7 +195,7 @@ void main() {
       expect(
         root.left,
         isA<BinaryExpression>(),
-        reason: '$sql: must nest left — (a $operator b) $operator c',
+        reason: '$sql: must nest left, as (a $operator b) $operator c',
       );
       expect(
         root.right,
@@ -221,7 +224,7 @@ void main() {
     });
 
     test('mixed + and - fold left in source order', () {
-      // (a + b) - c  — the operator comes from the separator, so a fold that
+      // (a + b) - c: the operator comes from the separator, so a fold that
       // reuses one operator for the whole chain would yield (a + b) + c.
       final root = expression('a + b - c') as BinaryExpression;
       expect(root.operator, '-');
@@ -229,7 +232,7 @@ void main() {
     });
 
     test('* binds tighter than + (precedence, not associativity)', () {
-      // a + (b * c) — the multiplicative subtree hangs off the RIGHT here.
+      // a + (b * c): the multiplicative subtree hangs off the RIGHT here.
       final root = expression('a + b * c') as BinaryExpression;
       expect(root.operator, '+');
       expect(root.left, isA<ColumnExpression>());
@@ -244,7 +247,7 @@ void main() {
   });
 
   // Multi-element list productions. Each is built by the same separated-list
-  // combinator, so these pin the element COUNT and ORDER — a list silently
+  // combinator, so these pin the element COUNT and ORDER: a list silently
   // truncated to its first element, or one that leaks separators in as
   // elements, fails here.
   group('multi-element list productions', () {
@@ -307,6 +310,42 @@ void main() {
               as InExpression;
       expect(in_.subquery, isNotNull);
       expect(in_.values, isEmpty);
+    });
+
+    test('NOT IN (SELECT ...) parses to the negated subquery form', () {
+      final in_ =
+          select('SELECT a FROM t WHERE a NOT IN (SELECT b FROM u)').where!
+              as InExpression;
+      expect(in_.subquery, isNotNull);
+      expect(in_.negated, isTrue);
+    });
+
+    test('a list holding a scalar subquery stays a list', () {
+      final in_ =
+          select('SELECT a FROM t WHERE a IN ((SELECT b FROM u), 2)').where!
+              as InExpression;
+      expect(in_.subquery, isNull);
+      expect(in_.values.length, 2);
+    });
+
+    test('nested IN lists parse in linear time', () {
+      // Each IN used to be parsed twice (list, then subquery), doubling the
+      // work per level: 30 levels took hours.
+      final watch = Stopwatch()..start();
+      final sql = 'SELECT ${'1 IN (' * 30}1,${')' * 30}';
+      expect(() => SqlParser().parse(sql), throwsFormatException);
+      expect(watch.elapsedMilliseconds, lessThan(500));
+    });
+
+    test('IN without parentheses is rejected', () {
+      expect(
+        () => SqlParser().parse('SELECT a FROM t WHERE a IN b'),
+        throwsFormatException,
+      );
+      expect(
+        () => SqlParser().parse('SELECT a FROM t WHERE a NOT IN b'),
+        throwsFormatException,
+      );
     });
 
     test('EXISTS parses to an ExistsExpression', () {
@@ -426,7 +465,7 @@ void main() {
 
   // ---- Relocated: doubled-quote escape (from regression_test.dart) ----
   test('parser handles a doubled-quote escape in a WHERE string', () async {
-    final engine = SqlEngine();
+    final engine = SqlEngine.open().ok;
     engine.registerTable(
       'p',
       Table(
@@ -445,7 +484,7 @@ void main() {
       ),
     );
     // The 'it''s' literal must parse to the value it's (was truncated to "it").
-    final t = await engine.execute("SELECT s FROM p WHERE s = 'it''s'");
+    final t = await engine.execute("SELECT s FROM p WHERE s = 'it''s'").ok;
     expect(t.toRows().map((r) => r['s']).toList(), ["it's"]);
   });
 
@@ -473,13 +512,13 @@ void main() {
     });
 
     test('a TRUE literal is true even when followed by whitespace', () async {
-      final r = await engine.execute('SELECT true AS v FROM t');
+      final r = await engine.execute('SELECT true AS v FROM t').ok;
       expect(r.column('v')!.toList(), [true, true]);
-      final c = await engine.execute(
-        'SELECT CASE WHEN true THEN 5 END AS v FROM t',
-      );
+      final c = await engine
+          .execute('SELECT CASE WHEN true THEN 5 END AS v FROM t')
+          .ok;
       expect(c.column('v')!.toList(), [5, 5]);
-      final f = await engine.execute('SELECT false AS v FROM t');
+      final f = await engine.execute('SELECT false AS v FROM t').ok;
       expect(f.column('v')!.toList(), [false, false]);
     });
 
@@ -488,7 +527,7 @@ void main() {
         'SELECT a, b FROM t LEFT  OUTER JOIN u ON t.a = u.b',
         'SELECT a, b FROM t LEFT\nOUTER JOIN u ON t.a = u.b',
       ]) {
-        final r = await engine.execute(sql);
+        final r = await engine.execute(sql).ok;
         // The null-padded row proves the join stayed LEFT (INNER drops it).
         expect(r.rowCount, 2, reason: sql);
         expect(r.toRows().any((row) => row['b'] == null), isTrue, reason: sql);
@@ -500,16 +539,16 @@ void main() {
         'SELECT a FROM t UNION  ALL SELECT a FROM t',
         'SELECT a FROM t UNION\nALL SELECT a FROM t',
       ]) {
-        final r = await engine.execute(sql);
+        final r = await engine.execute(sql).ok;
         expect(r.rowCount, 4, reason: '$sql must not dedup as plain UNION');
       }
     });
 
     test('CAST keeps its target type when followed by whitespace', () async {
-      final r = await engine.execute(
-        "SELECT CAST('12' AS INTEGER ) AS v FROM t",
-      );
-      expect(r.schema.fields.single.dataType, DataType.int64);
+      final r = await engine
+          .execute("SELECT CAST('12' AS INTEGER ) AS v FROM t")
+          .ok;
+      expect(r.schema.fields.single.dataType, DataType.int32);
       expect(r.column('v')!.toList(), [12, 12]);
     });
   });
@@ -518,7 +557,7 @@ void main() {
     setUp(() => engine.registerTable('t', ints('t', [1])));
 
     Future<Table> one(String expr) =>
-        engine.execute('SELECT $expr AS v FROM t');
+        engine.execute('SELECT $expr AS v FROM t').ok;
 
     test('CAST AS DECIMAL of an int is exact (was float64)', () async {
       // float64 would round 9007199254740993 down to ...992.
@@ -546,14 +585,14 @@ void main() {
 
     test('a value with more fractional digits than s fails loud', () async {
       await expectLater(
-        one("CAST('1.234' AS DECIMAL(10,2))"),
-        throwsA(isA<FormatException>()),
+        engine.execute("SELECT CAST('1.234' AS DECIMAL(10,2)) AS v FROM t"),
+        failsWith(Kind.invalid),
       );
     });
 
     test('CAST AS INT parses', () async {
       final r = await one("CAST('12' AS INT)");
-      expect(r.schema.fields.single.dataType, DataType.int64);
+      expect(r.schema.fields.single.dataType, DataType.int32);
       expect(r.column('v')!.toList().single, 12);
     });
   });
@@ -566,22 +605,23 @@ void main() {
       () async {
         await expectLater(
           engine.execute('SELECT n FROM t WHERE n IS 5'),
-          throwsA(isA<UnsupportedError>()),
+          failsWith(Kind.unsupported),
         );
         await expectLater(
           engine.execute('SELECT n FROM t WHERE n IS NOT 5'),
-          throwsA(isA<UnsupportedError>()),
+          failsWith(Kind.unsupported),
         );
       },
     );
 
     test('IS NULL / IS NOT NULL / IS TRUE keep working', () async {
       expect(
-        (await engine.execute('SELECT n FROM t WHERE n IS NULL')).rowCount,
+        (await engine.execute('SELECT n FROM t WHERE n IS NULL').ok).rowCount,
         0,
       );
       expect(
-        (await engine.execute('SELECT n FROM t WHERE n IS NOT NULL')).rowCount,
+        (await engine.execute('SELECT n FROM t WHERE n IS NOT NULL').ok)
+            .rowCount,
         2,
       );
     });
@@ -610,9 +650,9 @@ void main() {
     test('duplicate unaliased aggregates get distinct names', () async {
       // The aggregating projection skipped _uniquifyAuto, emitting a
       // duplicate-name schema that broke by-name access and subqueries.
-      final r = await engine.execute('SELECT COUNT(a), COUNT(b) FROM t2');
+      final r = await engine.execute('SELECT COUNT(a), COUNT(b) FROM t2').ok;
       expect(r.schema.fields.map((f) => f.name).toSet().length, 2);
-      final m = await engine.execute('SELECT MAX(a), MAX(b) FROM t2');
+      final m = await engine.execute('SELECT MAX(a), MAX(b) FROM t2').ok;
       expect(m.schema.fields.map((f) => f.name).toList(), ['MAX', 'MAX_2']);
       expect(m.toRows().single, {'MAX': 2, 'MAX_2': 4});
     });
@@ -620,7 +660,7 @@ void main() {
 
   group('set-op heterogeneous branch types (audit 7)', () {
     // A logical column ref carries a `string` PLACEHOLDER type, and
-    // _bindSetOperation used to run commonType() against it — pairing a
+    // _bindSetOperation used to run commonType() against it: pairing a
     // literal/CAST branch with a bare-column branch injected a stringifying
     // CAST into a valid all-numeric set operation. Reconciliation belongs to
     // the physical layer, which sees real types.
@@ -633,35 +673,37 @@ void main() {
         'SELECT 1 AS n FROM t UNION SELECT n FROM t',
         'SELECT n FROM t UNION SELECT 1 FROM t',
       ]) {
-        final r = await engine.execute(sql);
+        final r = await engine.execute(sql).ok;
         expect(r.schema.fields.single.dataType, DataType.int64, reason: sql);
       }
     });
 
     test('aliased literal UNION ALL column stays numeric', () async {
-      final r = await engine.execute(
-        'SELECT 100 AS n FROM t UNION ALL SELECT n FROM t',
-      );
+      final r = await engine
+          .execute('SELECT 100 AS n FROM t UNION ALL SELECT n FROM t')
+          .ok;
       expect(r.schema.fields.single.dataType, DataType.int64);
       expect(r.column('n')!.toList().cast<int>()..sort(), [5, 10, 100, 100]);
     });
 
     test('CAST branch UNION column stays numeric', () async {
-      final r = await engine.execute(
-        'SELECT CAST(n AS INTEGER) AS n FROM t UNION SELECT n FROM t',
-      );
+      final r = await engine
+          .execute(
+            'SELECT CAST(n AS INTEGER) AS n FROM t UNION SELECT n FROM t',
+          )
+          .ok;
       expect(r.schema.fields.single.dataType, DataType.int64);
       expect(r.column('n')!.toList().toSet(), {5, 10});
     });
 
     test('INTERSECT and EXCEPT with a literal branch stay numeric', () async {
-      final i = await engine.execute(
-        'SELECT 5 AS n FROM t INTERSECT SELECT n FROM t',
-      );
+      final i = await engine
+          .execute('SELECT 5 AS n FROM t INTERSECT SELECT n FROM t')
+          .ok;
       expect(i.column('n')!.toList(), [5]);
-      final e = await engine.execute(
-        'SELECT n FROM t EXCEPT SELECT 5 AS n FROM t',
-      );
+      final e = await engine
+          .execute('SELECT n FROM t EXCEPT SELECT 5 AS n FROM t')
+          .ok;
       expect(e.column('n')!.toList(), [10]);
     });
 
@@ -669,9 +711,9 @@ void main() {
       // logical.Aggregate.schema dropped non-column group keys, so this valid
       // query failed the set-op arity check ("0 vs 1 columns").
       engine.registerTable('g', ints('g', [1, 2, 3, 4]));
-      final r = await engine.execute(
-        'SELECT * FROM g GROUP BY n % 2 UNION SELECT n FROM t',
-      );
+      final r = await engine
+          .execute('SELECT * FROM g GROUP BY n % 2 UNION SELECT n FROM t')
+          .ok;
       expect(r.column('group0')!.toList().toSet(), {0, 1, 5, 10});
     });
 
@@ -697,12 +739,217 @@ void main() {
           ),
         ),
       );
-      final r = await engine.execute(
-        "SELECT v NOT LIKE 'x%' AS m FROM s UNION ALL "
-        'SELECT n > 5 AS m FROM t',
-      );
+      final r = await engine
+          .execute(
+            "SELECT v NOT LIKE 'x%' AS m FROM s UNION ALL "
+            'SELECT n > 5 AS m FROM t',
+          )
+          .ok;
       expect(r.schema.fields.single.dataType, DataType.boolean);
       expect(r.column('m')!.toList(), [false, true, false, true]);
+    });
+  });
+
+  group('expression nesting limit', () {
+    final parser = SqlParser();
+
+    test('2000 nested CASE expressions throw FormatException', () {
+      final sql =
+          'SELECT ${'CASE WHEN a = 1 THEN ' * 2000}1${' END' * 2000} FROM t';
+      expect(() => parser.parse(sql), throwsA(isA<FormatException>()));
+    });
+
+    test('CASE nesting past the limit is rejected before parsing', () {
+      final sql =
+          'SELECT ${'CASE WHEN a = 1 THEN ' * 300}1${' END' * 300} FROM t';
+      expect(
+        () => parser.parse(sql),
+        throwsA(
+          isA<FormatException>().having(
+            (error) => error.message,
+            'message',
+            contains('300 levels'),
+          ),
+        ),
+      );
+    });
+
+    // The grammar takes one NOT and one sign per level, so these chains are a
+    // parse error rather than recursion; kept so a grammar change cannot
+    // reintroduce unbounded depth.
+    test('2000 chained NOT throw FormatException', () {
+      final sql = 'SELECT * FROM t WHERE ${'NOT ' * 2000}a = 1';
+      expect(() => parser.parse(sql), throwsA(isA<FormatException>()));
+    });
+
+    test('2000 chained unary minus throw FormatException', () {
+      final sql = 'SELECT ${'- ' * 2000}1 FROM t';
+      expect(() => parser.parse(sql), throwsA(isA<FormatException>()));
+    });
+
+    test('modest nesting still parses', () {
+      final sql =
+          'SELECT ${'CASE WHEN a = 1 THEN ' * 200}1${' END' * 200} FROM t '
+          'WHERE NOT (${'(' * 50}a = 1${')' * 50})';
+      expect(parser.parse(sql), isA<SelectStatement>());
+    });
+
+    // Each level used to parse its inner subquery twice (once as the left side
+    // of a JOIN that never came), so time doubled per level.
+    test('nested derived tables parse in linear time', () {
+      for (final depth in [20, 250]) {
+        final sql =
+            'SELECT * FROM ${'(SELECT * FROM ' * depth}t${') x' * depth}';
+        final watch = Stopwatch()..start();
+        expect(parser.parse(sql), isA<SelectStatement>());
+        expect(
+          watch.elapsedMilliseconds,
+          lessThan(1000),
+          reason: 'depth $depth',
+        );
+      }
+    });
+
+    test('keywords inside identifiers and strings are not counted', () {
+      final sql =
+          "SELECT \"case\", 'CASE CASE CASE', notes, endpoint FROM t "
+          "WHERE NOT a = 1";
+      expect(parser.parse(sql), isA<SelectStatement>());
+    });
+  });
+
+  group('double-quoted identifiers and comments', () {
+    late SqlEngine engine;
+    setUp(() {
+      engine = SqlEngine.open(spillDir: dir.path).ok;
+      engine.registerTable(
+        't',
+        Table(
+          name: 't',
+          schema: Schema(
+            fields: [
+              Field(name: 'id', dataType: DataType.int64),
+              Field(name: 'name', dataType: DataType.string),
+              Field(name: 'two words', dataType: DataType.string),
+            ],
+          ),
+          columns: [
+            NumericColumn.int64(name: 'id', values: [1, 2], nullable: false),
+            ListColumn<String>(
+              name: 'name',
+              dataType: DataType.string,
+              data: ['a', 'b'],
+            ),
+            ListColumn<String>(
+              name: 'two words',
+              dataType: DataType.string,
+              data: ['x', 'y'],
+            ),
+          ],
+        ),
+      );
+    });
+    tearDown(() => engine.dispose());
+
+    test('"name" is a column, not a string', () async {
+      final t = await engine.execute('SELECT "name" FROM t ORDER BY id').ok;
+      expect(t.column('name')!.toList(), ['a', 'b']);
+    });
+
+    test('a quoted identifier may hold a space', () async {
+      final t = await engine.execute('SELECT "two words" AS w FROM t').ok;
+      expect(t.column('w')!.toList(), ['x', 'y']);
+    });
+
+    test("'text' is still a string", () async {
+      final t = await engine.execute("SELECT 'name' AS s FROM t").ok;
+      expect(t.column('s')!.toList(), ['name', 'name']);
+    });
+
+    test('an unknown quoted column suggests single quotes', () async {
+      await expectLater(
+        engine.execute('SELECT "hello" FROM t'),
+        failsWith(Kind.invalid, contains("'hello'")),
+      );
+    });
+
+    test('a -- comment runs to the end of the line', () async {
+      final t = await engine.execute('SELECT id --1\nFROM t ORDER BY id').ok;
+      expect(t.column('id')!.toList(), [1, 2]);
+    });
+
+    test('a /* */ comment is whitespace', () async {
+      final t = await engine
+          .execute('SELECT /* a, b */ id FROM /* the table */ t ORDER BY id')
+          .ok;
+      expect(t.column('id')!.toList(), [1, 2]);
+    });
+
+    test('comment markers inside strings are text', () async {
+      final t = await engine
+          .execute(
+            "SELECT '--not a comment' AS a, '/* nor this */' AS b FROM t",
+          )
+          .ok;
+      expect(t.column('a')![0], '--not a comment');
+      expect(t.column('b')![0], '/* nor this */');
+    });
+
+    test('parentheses inside a comment do not count toward nesting', () {
+      final sql = 'SELECT /* ${'(' * 300} */ 1';
+      expect(SqlParser().parse(sql), isA<SelectStatement>());
+    });
+
+    test('an unterminated block comment is a parse error', () {
+      expect(
+        () => SqlParser().parse('SELECT 1 /* never closed'),
+        throwsA(isA<FormatException>()),
+      );
+    });
+  });
+
+  group('join conditions', () {
+    final parser = SqlParser();
+
+    for (final type in [
+      '',
+      'INNER ',
+      'LEFT ',
+      'LEFT OUTER ',
+      'RIGHT ',
+      'FULL OUTER ',
+    ]) {
+      test('${type}JOIN without ON or USING throws FormatException', () {
+        expect(
+          () => parser.parse('SELECT * FROM a ${type}JOIN b'),
+          throwsA(
+            isA<FormatException>().having(
+              (error) => error.message,
+              'message',
+              contains('ON or USING'),
+            ),
+          ),
+        );
+      });
+    }
+
+    test('outer joins with ON or USING still parse', () {
+      expect(
+        parser.parse('SELECT * FROM a LEFT JOIN b ON a.id = b.id'),
+        isA<SelectStatement>(),
+      );
+      expect(
+        parser.parse('SELECT * FROM a FULL JOIN b USING (id)'),
+        isA<SelectStatement>(),
+      );
+    });
+
+    test('CROSS JOIN and comma joins need no condition', () {
+      expect(
+        parser.parse('SELECT * FROM a CROSS JOIN b'),
+        isA<SelectStatement>(),
+      );
+      expect(parser.parse('SELECT * FROM a, b'), isA<SelectStatement>());
     });
   });
 }

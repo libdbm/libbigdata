@@ -4,5 +4,7 @@
 tags:
   perf:
     skip: "perf/profiling suite (>1M rows); run with: dart test -t perf --run-skipped"
+  fuzz:
+    skip: "decoder mutation runs (10,000 inputs per format); run with: dart test -t fuzz --run-skipped"
   interop:
     skip: "external-engine interop (needs local python+spark/delta-rs/pyiceberg); run with: dart test -t interop --run-skipped"

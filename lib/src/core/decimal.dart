@@ -5,14 +5,14 @@ import 'conversions.dart';
 /// An exact decimal number: an [unscaled] integer and a [scale] (the number of
 /// digits to the right of the point), so `Decimal(BigInt.from(150), 2)` is 1.50.
 ///
-/// Columns store decimals unscaled, with the scale on their [Field] — a [Column]
+/// Columns store decimals unscaled, with the scale on their [Field]: a [Column]
 /// alone cannot render one. This is the value a [Table] hands back, where the
 /// schema supplies the scale.
 ///
 /// Exact by construction: unlike a double it never rounds, so a 64-bit id or a
 /// money amount survives a mixed integer/float column intact.
 @immutable
-class Decimal implements Comparable<Decimal> {
+final class Decimal implements Comparable<Decimal> {
   /// The value as an integer, before applying [scale].
   final BigInt unscaled;
 
@@ -28,7 +28,7 @@ class Decimal implements Comparable<Decimal> {
     return Decimal(parts.unscaled, parts.scale);
   }
 
-  /// The nearest double. LOSSY above 2^53 — the whole point of this type is to
+  /// The nearest double. LOSSY above 2^53: the whole point of this type is to
   /// avoid that, so prefer [toString] or [unscaled] when exactness matters.
   double toDouble() =>
       scale == 0 ? unscaled.toDouble() : double.parse(toString());
@@ -61,14 +61,14 @@ class Decimal implements Comparable<Decimal> {
   }
 
   /// Value equality: 1.5 == 1.50. (Java's BigDecimal famously differs here,
-  /// requiring equal scales — a long-standing source of surprise.)
+  /// requiring equal scales: a long-standing source of surprise.)
   @override
   bool operator ==(Object other) => other is Decimal && compareTo(other) == 0;
 
   @override
   int get hashCode {
-    final n = normalized;
-    return Object.hash(n.unscaled, n.scale);
+    final normal = normalized;
+    return Object.hash(normal.unscaled, normal.scale);
   }
 
   /// The human/Spark-readable form: `Decimal(BigInt.from(12345), 2)` → "123.45".

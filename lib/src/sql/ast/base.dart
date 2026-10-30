@@ -1,40 +1,48 @@
-/// Base AST node definitions
-abstract class ASTNode {
-  R accept<R>(ASTVisitor<R> visitor);
-}
+import 'expressions.dart';
+import 'statements.dart';
+import 'tables.dart';
 
-/// Base class for SQL statements
-abstract class Statement extends ASTNode {}
+/// Base class for SQL statements. Queries ([QueryStatement],
+/// [SelectStatement]) accept a [StatementVisitor]; DML and DDL statements are
+/// executed directly by the engine and accept no visitor.
+abstract class Statement {}
 
 /// Base class for SQL expressions
-abstract class Expression extends ASTNode {}
+abstract class Expression {
+  R accept<R>(ExpressionVisitor<R> visitor);
+}
 
 /// Base class for table references
-abstract class TableReference extends ASTNode {}
+abstract class TableReference {
+  R accept<R>(TableVisitor<R> visitor);
+}
 
-/// AST visitor interface
-abstract class ASTVisitor<R> {
-  R visitQueryStatement(covariant Statement statement);
-  R visitSelectStatement(covariant Statement statement);
-  R visitInsertStatement(covariant Statement statement);
-  R visitCreateTableStatement(covariant Statement statement);
-  R visitExpression(covariant Expression expression);
-  R visitColumnExpression(covariant Expression expression);
-  R visitLiteralExpression(covariant Expression expression);
-  R visitBinaryExpression(covariant Expression expression);
-  R visitUnaryExpression(covariant Expression expression);
-  R visitFunctionExpression(covariant Expression expression);
-  R visitCaseExpression(covariant Expression expression);
-  R visitInExpression(covariant Expression expression);
-  R visitBetweenExpression(covariant Expression expression);
-  R visitExistsExpression(covariant Expression expression);
-  R visitSubqueryExpression(covariant Expression expression);
-  R visitCastExpression(covariant Expression expression);
-  R visitWindowExpression(covariant Expression expression);
-  R visitTableReference(covariant TableReference table);
-  R visitSimpleTable(covariant TableReference table);
-  R visitJoinedTable(covariant TableReference table);
-  R visitSubqueryTable(covariant TableReference table);
-  R visitTableFunction(covariant TableReference table);
-  R visitValuesTable(covariant TableReference table);
+/// Visitor over query statements
+abstract interface class StatementVisitor<R> {
+  R visitQueryStatement(QueryStatement statement);
+  R visitSelectStatement(SelectStatement statement);
+}
+
+/// Visitor over expressions
+abstract interface class ExpressionVisitor<R> {
+  R visitStarExpression(StarExpression expression);
+  R visitQualifiedStarExpression(QualifiedStarExpression expression);
+  R visitColumnExpression(ColumnExpression expression);
+  R visitLiteralExpression(LiteralExpression expression);
+  R visitBinaryExpression(BinaryExpression expression);
+  R visitUnaryExpression(UnaryExpression expression);
+  R visitFunctionExpression(FunctionExpression expression);
+  R visitCaseExpression(CaseExpression expression);
+  R visitInExpression(InExpression expression);
+  R visitExistsExpression(ExistsExpression expression);
+  R visitSubqueryExpression(SubqueryExpression expression);
+  R visitCastExpression(CastExpression expression);
+}
+
+/// Visitor over table references
+abstract interface class TableVisitor<R> {
+  R visitSimpleTable(SimpleTable table);
+  R visitJoinedTable(JoinedTable table);
+  R visitSubqueryTable(SubqueryTable table);
+  R visitValuesTable(ValuesTable table);
 }

@@ -28,23 +28,23 @@ Future<void> main() async {
       .orderBy('salary', ascending: false)
       .limit(3)
       .execute();
-  print(senior.describe());
+  _show(senior);
 
   print('=== 3. AND / OR in a predicate ===');
-  // AND binds tighter than OR. Parentheses are NOT supported; chain filter()
-  // calls instead, which compose as AND.
+  // A predicate is a SQL expression: AND binds tighter than OR, parentheses
+  // group, strings are single-quoted and `==` is `=`.
   final picked = await employees
-      .filter('dept == "eng" AND salary >= 100')
+      .filter("(dept = 'eng' OR dept = 'sales') AND salary >= 100")
       .execute();
-  print(picked.describe());
+  _show(picked);
 
-  print('=== 4. withColumn: flat operator precedence ===');
-  // Operators apply left to right, so 'salary + 10 * 2' is (salary + 10) * 2.
+  print('=== 4. withColumn: standard operator precedence ===');
+  // As in SQL, '*' binds tighter than '+': 'salary + 10 * 2' is salary + 20.
   final bonused = await employees
       .select(['name', 'salary'])
       .withColumn('adjusted', 'salary + 10 * 2')
       .execute();
-  print(bonused.describe());
+  _show(bonused);
 
   print('=== 5. groupBy + agg ===');
   // Note: the output column keeps the INPUT column's name, so 'salary' below
@@ -54,7 +54,7 @@ Future<void> main() async {
       .agg({'salary': 'sum', 'age': 'avg'})
       .rename({'salary': 'total_salary', 'age': 'avg_age'})
       .execute();
-  print(byDept.describe());
+  _show(byDept);
 
   print('=== 6. join ===');
   final departments = DataFrame.fromRows([
@@ -65,53 +65,98 @@ Future<void> main() async {
       .select(['name', 'dept'])
       .join(departments, 'dept', type: JoinType.left)
       .execute();
-  print(located.describe());
+  _show(located);
 
   print('=== 7. Terminal operations ===');
+  // Every terminal returns a Result: Ok with the value, or Err with why not.
   print('count():  ${await employees.count()}');
-  print('head(2):  ${(await employees.head(2)).toRows()}');
-  print('toList(): ${(await employees.select(['name']).toList())}\n');
+  if (await employees.head(2) case Ok(:final value)) {
+    print('head(2):  ${value.toRows()}');
+  }
+  print('toList(): ${await employees.select(['name']).toList()}\n');
 
   print('=== 8. Bounded execution ===');
-  try {
-    await employees.execute(maxRows: 2);
-  } on StateError catch (e) {
-    print('execute(maxRows: 2) rejected as expected: ${e.message}\n');
+  switch (await employees.execute(maxRows: 2)) {
+    case Ok():
+      print('execute(maxRows: 2) unexpectedly succeeded');
+    case Err(:final error):
+      print('execute(maxRows: 2) rejected as expected: $error');
   }
+  // EngineOptions tunes the blocking operators; here the sort never spills.
+  final sorted = await employees
+      .orderBy('salary')
+      .execute(options: const EngineOptions(spillThresholdBytes: 0));
+  _show(sorted);
 
-  print('=== 9. Round-trip through a file, read back lazily ===');
+  print('=== 9. Round-trip through a file ===');
   final directory = await Directory.systemTemp.createTemp('libbigdata_example');
   try {
     final path = '${directory.path}/employees.csv';
-    await employees.writeCsv(path);
+    if (await employees.writeCsv(path) case Err(:final error)) {
+      print('write failed: $error');
+      return;
+    }
 
-    // A file-backed DataFrame is lazy: the filter and limit reach the scan, so
-    // this does not decode the whole file.
-    final reloaded = await DataFrameIO.readCsv(path);
-    final top = await reloaded
-        .filter('salary >= 90')
-        .orderBy('salary', ascending: false)
-        .head(2);
-    print(top.describe());
-    print(
-      'rows matching filter: ${await reloaded.filter('dept == "eng"').count()}',
-    );
+    // readCsv is lazy: it reads the header and an inference sample here, and
+    // the file is scanned when a terminal runs, under its maxRows/maxBytes
+    // caps. Reading returns a Result too.
+    switch (await DataFrameIO.readCsv(path)) {
+      case Ok(value: final reloaded):
+        final top = await reloaded
+            .filter('salary >= 90')
+            .orderBy('salary', ascending: false)
+            .head(2);
+        _show(top);
+        print(
+          'rows matching filter: '
+          '${await reloaded.filter("dept = 'eng'").count()}',
+        );
+      case Err(:final error):
+        print('read failed: $error');
+    }
   } finally {
     await directory.delete(recursive: true);
   }
 
   print('\n=== 10. Handing off to SQL for what DataFrame does not cover ===');
-  final engine = SqlEngine();
+  final SqlEngine engine;
+  switch (SqlEngine.open()) {
+    case Ok(:final value):
+      engine = value;
+    case Err(:final error):
+      print('Could not open the engine: $error');
+      return;
+  }
   try {
-    await engine.registerDataFrame('employees', employees);
+    if (await engine.registerDataFrame('employees', employees) case Err(
+      :final error,
+    )) {
+      print('Could not register the frame: $error');
+      return;
+    }
     // Two aggregates over one column, aliased output, and HAVING: all of these
     // need SQL.
     final result = await engine.sql(
       'SELECT dept, MIN(salary) AS lo, MAX(salary) AS hi '
       'FROM employees GROUP BY dept HAVING MAX(salary) > 80',
     );
-    print((await result.execute()).describe());
+    switch (result) {
+      case Ok(:final value):
+        _show(await value.execute());
+      case Err(:final error):
+        print('query failed: $error');
+    }
   } finally {
     await engine.dispose();
+  }
+}
+
+/// Print a terminal operation's table, or why it failed.
+void _show(Result<Table, ErrorDetails> result) {
+  switch (result) {
+    case Ok(:final value):
+      print(value.describe());
+    case Err(:final error):
+      print('failed: $error');
   }
 }

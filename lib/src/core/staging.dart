@@ -2,7 +2,7 @@ import 'dart:io';
 
 /// Delete the files a FAILED transaction staged (data/manifest/DV files that no
 /// committed metadata references). Returns the subset that could NOT be removed,
-/// each annotated with its error — empty on full success. NEVER throws.
+/// each annotated with its error: empty on full success. NEVER throws.
 ///
 /// The single shared primitive under the Delta and Iceberg writers' cleanup: the
 /// file-deletion loop is identical, but the POLICY on a partial failure differs,
@@ -15,8 +15,8 @@ Future<List<String>> deleteStaged(Iterable<String> paths) async {
     try {
       final file = File(path);
       if (await file.exists()) await file.delete();
-    } catch (e) {
-      failed.add('$path ($e)');
+    } catch (error) {
+      failed.add('$path ($error)');
     }
   }
   return failed;

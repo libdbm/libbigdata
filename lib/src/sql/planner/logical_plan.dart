@@ -1,6 +1,7 @@
 import '../../core/schema.dart';
 import '../../core/data_type.dart';
 import '../../core/row_filter.dart';
+import '../catalog/table_catalog.dart';
 
 /// Logical plan nodes represent the logical operations in a query
 abstract class LogicalPlan {
@@ -101,12 +102,18 @@ class Join extends LogicalPlan {
   final LogicalExpression? condition;
   final List<String>? usingColumns;
 
+  /// The qualifiers given to the columns of the left and the right side that
+  /// carry none (a DataFrame join names its sides, as SQL's scan aliases
+  /// do), or null to leave both sides as they are.
+  final (String, String)? sides;
+
   Join({
     required this.left,
     required this.right,
     required this.joinType,
     this.condition,
     this.usingColumns,
+    this.sides,
   });
 
   @override
@@ -114,9 +121,10 @@ class Join extends LogicalPlan {
     // A semi/anti join filters the left side; the right contributes no column.
     if (semiLike(joinType)) return left.schema;
 
-    // Combine schemas from both sides
-    final leftSchema = left.schema;
-    final rightSchema = right.schema;
+    // Combine schemas from both sides, each qualified by its side (as the
+    // physical join's inputs are).
+    final leftSchema = _side(left.schema, sides?.$1);
+    final rightSchema = _side(right.schema, sides?.$2);
 
     final fields = <Field>[];
     fields.addAll(leftSchema.fields);
@@ -135,6 +143,18 @@ class Join extends LogicalPlan {
     return Schema(fields: fields);
   }
 
+  /// [schema] with the fields that carry no qualifier qualified by [name], or
+  /// [schema] itself when [name] is null.
+  static Schema _side(Schema schema, String? name) => name == null
+      ? schema
+      : Schema(
+          fields: [
+            for (final f in schema.fields)
+              f.qualifier == null ? f.copyWith(qualifier: name) : f,
+          ],
+          metadata: schema.metadata,
+        );
+
   @override
   List<LogicalPlan> get children => [left, right];
 
@@ -142,7 +162,7 @@ class Join extends LogicalPlan {
   R accept<R>(LogicalPlanVisitor<R> visitor) => visitor.visitJoin(this);
 }
 
-/// How a join pairs its two inputs. The last three emit LEFT COLUMNS ONLY — they
+/// How a join pairs its two inputs. The last three emit LEFT COLUMNS ONLY; they
 /// filter the left side by whether the right has a match, rather than combining
 /// the two.
 ///
@@ -189,17 +209,18 @@ class Aggregate extends LogicalPlan {
     final fields = <Field>[];
 
     // Add grouping columns. An EXPRESSION key (`GROUP BY k % 2`) is emitted by
-    // the physical aggregate as `group$i` — dropping it here left this schema
+    // the physical aggregate as `group$i`: dropping it here left this schema
     // short a column, so a set-op branch over `SELECT * … GROUP BY <expr>`
     // failed its arity check on a valid query. Names must match the planner's
     // _groupKeyName / the physical aggregate's _groupName.
     for (int i = 0; i < groupBy.length; i++) {
-      final expr = groupBy[i];
+      final key = groupBy[i];
       fields.add(
         Field(
-          name: expr is ColumnExpression ? expr.name : 'group$i',
-          dataType: expr.dataType,
-          nullable: expr.nullable,
+          name: key is ColumnExpression ? key.name : 'group$i',
+          qualifier: key is ColumnExpression ? key.table : null,
+          dataType: key.dataType,
+          nullable: key.nullable,
         ),
       );
     }
@@ -298,83 +319,22 @@ class SetOperation extends LogicalPlan {
 
 enum SetOpType { union, intersect, except }
 
-/// Window operations
-class Window extends LogicalPlan {
-  final LogicalPlan input;
-  final List<WindowExpression> windowExpressions;
-  final List<String> aliases;
+/// UNION ALL of any number of [inputs], in order. A chain of UNION and UNION
+/// ALL is planned as one of these (with a [Distinct] over the prefix that a
+/// distinct UNION ends), so neither planning nor execution nests per branch.
+class Union extends LogicalPlan {
+  final List<LogicalPlan> inputs;
 
-  Window({
-    required this.input,
-    required this.windowExpressions,
-    required this.aliases,
-  });
+  Union(this.inputs);
 
   @override
-  Schema get schema {
-    final inputSchema = input.schema;
-    final fields = List<Field>.from(inputSchema.fields);
-
-    // Add window function columns
-    for (int i = 0; i < windowExpressions.length; i++) {
-      fields.add(
-        Field(
-          name: aliases[i],
-          dataType: windowExpressions[i].dataType,
-          nullable: true,
-        ),
-      );
-    }
-
-    return Schema(fields: fields);
-  }
+  Schema get schema => inputs.first.schema;
 
   @override
-  List<LogicalPlan> get children => [input];
+  List<LogicalPlan> get children => inputs;
 
   @override
-  R accept<R>(LogicalPlanVisitor<R> visitor) => visitor.visitWindow(this);
-}
-
-class WindowExpression {
-  final AggregateFunction function;
-  final List<LogicalExpression> partitionBy;
-  final List<SortExpression> orderBy;
-  final WindowFrame? frame;
-
-  WindowExpression({
-    required this.function,
-    this.partitionBy = const [],
-    this.orderBy = const [],
-    this.frame,
-  });
-
-  DataType get dataType => function.dataType;
-}
-
-class WindowFrame {
-  final WindowFrameType type;
-  final WindowFrameBound start;
-  final WindowFrameBound end;
-
-  WindowFrame({required this.type, required this.start, required this.end});
-}
-
-enum WindowFrameType { rows, range, groups }
-
-class WindowFrameBound {
-  final WindowBoundType type;
-  final int? offset;
-
-  WindowFrameBound(this.type, [this.offset]);
-}
-
-enum WindowBoundType {
-  unboundedPreceding,
-  preceding,
-  currentRow,
-  following,
-  unboundedFollowing,
+  R accept<R>(LogicalPlanVisitor<R> visitor) => visitor.visitUnion(this);
 }
 
 /// Distinct - Remove duplicates
@@ -391,6 +351,26 @@ class Distinct extends LogicalPlan {
 
   @override
   R accept<R>(LogicalPlanVisitor<R> visitor) => visitor.visitDistinct(this);
+}
+
+/// Sample - exactly `round(n * fraction)` of the n input rows, chosen
+/// uniformly and, with a [seed], reproducibly. The input rows decide the
+/// sample, so no filter is pushed below it.
+class Sample extends LogicalPlan {
+  final LogicalPlan input;
+  final double fraction;
+  final int? seed;
+
+  Sample({required this.input, required this.fraction, this.seed});
+
+  @override
+  Schema get schema => input.schema;
+
+  @override
+  List<LogicalPlan> get children => [input];
+
+  @override
+  R accept<R>(LogicalPlanVisitor<R> visitor) => visitor.visitSample(this);
 }
 
 /// A derived relation (subquery in FROM, or a future VIEW) referenced under an
@@ -412,6 +392,18 @@ class AliasScope extends LogicalPlan {
   R accept<R>(LogicalPlanVisitor<R> visitor) => visitor.visitAliasScope(this);
 }
 
+/// A registered DataFrame's plan, read by a query under [alias] as a table
+/// is. Its scans name tables and lazy sources in [catalog], the frame's own,
+/// so they never meet the names of the catalog the query runs in. Unlike a
+/// subquery's [AliasScope], the optimizer rules see through it: a query's
+/// WHERE prunes the frame's file scans and a query's columns narrow them, as
+/// they would if the frame's operations were written in the query.
+class Frame extends AliasScope {
+  final TableCatalog catalog;
+
+  Frame({required super.alias, required super.input, required this.catalog});
+}
+
 /// Values - VALUES clause
 class Values extends LogicalPlan {
   final List<List<LogicalExpression>> rows;
@@ -428,6 +420,13 @@ class Values extends LogicalPlan {
   @override
   R accept<R>(LogicalPlanVisitor<R> visitor) => visitor.visitValues(this);
 }
+
+/// The ANDed parts of [expression]: `a = b AND c = d` is two. One splitter for
+/// the filter pushdown and the join-key extraction.
+List<LogicalExpression> conjuncts(LogicalExpression expression) =>
+    expression is BinaryExpression && expression.operator == BinaryOperator.and
+    ? [...conjuncts(expression.left), ...conjuncts(expression.right)]
+    : [expression];
 
 /// Logical expressions
 abstract class LogicalExpression {
@@ -489,7 +488,7 @@ class InExpression extends LogicalExpression {
   @override
   DataType get dataType => DataType.boolean;
 
-  /// A NULL anywhere — probe or list — makes the result UNKNOWN.
+  /// A NULL anywhere (probe or list) makes the result UNKNOWN.
   @override
   bool get nullable => true;
 }
@@ -559,7 +558,35 @@ enum BinaryOperator {
   notLike,
   // Null test (right operand ignored)
   isNull,
-  isNotNull,
+  isNotNull;
+
+  /// The operator a SQL [token] names (case-insensitive), or an
+  /// [ArgumentError] for an unknown one. The one table for the SQL planner and
+  /// the DataFrame expression compiler.
+  static BinaryOperator parse(String token) =>
+      _tokens[token.toUpperCase()] ??
+      (throw ArgumentError('Unknown operator: $token'));
+
+  static const _tokens = {
+    '+': add,
+    '-': subtract,
+    '*': multiply,
+    '/': divide,
+    '%': modulo,
+    '=': eq,
+    '<>': neq,
+    '!=': neq,
+    '<': lt,
+    '<=': lte,
+    '>': gt,
+    '>=': gte,
+    'AND': and,
+    'OR': or,
+    'LIKE': like,
+    'NOT LIKE': notLike,
+    'IS': isNull,
+    'IS NOT': isNotNull,
+  };
 }
 
 /// Aggregate expressions
@@ -586,12 +613,6 @@ class AggregateFunction {
   final DataType dataType;
 
   AggregateFunction(this.name, this.dataType);
-
-  static final count = AggregateFunction('COUNT', DataType.int64);
-  static final sum = AggregateFunction('SUM', DataType.float64);
-  static final avg = AggregateFunction('AVG', DataType.float64);
-  static final min = AggregateFunction('MIN', DataType.float64);
-  static final max = AggregateFunction('MAX', DataType.float64);
 }
 
 /// Function call
@@ -668,8 +689,9 @@ abstract class LogicalPlanVisitor<R> {
   R visitSort(Sort node);
   R visitLimit(Limit node);
   R visitSetOperation(SetOperation node);
-  R visitWindow(Window node);
+  R visitUnion(Union node);
   R visitDistinct(Distinct node);
+  R visitSample(Sample node);
   R visitValues(Values node);
   R visitAliasScope(AliasScope node);
 }

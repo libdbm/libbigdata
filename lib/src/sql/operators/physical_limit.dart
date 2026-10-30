@@ -54,6 +54,7 @@ class LimitIterator extends RecordBatchIterator {
 
   @override
   Future<RecordBatch?> next() async {
+    await pause();
     // Check if we've hit the limit
     if (limit != null && _rowsReturned >= limit!) {
       return null;

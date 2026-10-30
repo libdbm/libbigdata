@@ -8,8 +8,7 @@ class QueryStatement extends Statement {
 
   QueryStatement({this.ctes = const [], required this.select});
 
-  @override
-  R accept<R>(ASTVisitor<R> visitor) => visitor.visitQueryStatement(this);
+  R accept<R>(StatementVisitor<R> visitor) => visitor.visitQueryStatement(this);
 }
 
 /// Common Table Expression (WITH clause)
@@ -43,7 +42,7 @@ class SelectStatement extends Statement {
   /// is a select-core; the planner folds them left-associatively with INTERSECT
   /// binding tighter than UNION/EXCEPT, then applies [orderBy]/[limit] over the
   /// whole result. Empty for a plain SELECT.
-  final List<SetOperation> setOps;
+  final List<SetOperation> operations;
 
   SelectStatement({
     this.distinct = false,
@@ -55,11 +54,11 @@ class SelectStatement extends Statement {
     this.orderBy = const [],
     this.limit,
     this.offset,
-    this.setOps = const [],
+    this.operations = const [],
   });
 
-  @override
-  R accept<R>(ASTVisitor<R> visitor) => visitor.visitSelectStatement(this);
+  R accept<R>(StatementVisitor<R> visitor) =>
+      visitor.visitSelectStatement(this);
 }
 
 /// INSERT statement appending literal rows to a Delta table path. Executed
@@ -78,10 +77,6 @@ class InsertStatement extends Statement {
     this.columns = const [],
     required this.values,
   });
-
-  @override
-  R accept<R>(ASTVisitor<R> visitor) =>
-      throw UnsupportedError('INSERT is executed directly, not visited');
 }
 
 /// UPDATE statement targeting a Delta table path. Executed directly by the
@@ -96,10 +91,6 @@ class UpdateStatement extends Statement {
     required this.assignments,
     this.where,
   });
-
-  @override
-  R accept<R>(ASTVisitor<R> visitor) =>
-      throw UnsupportedError('UPDATE is executed directly, not visited');
 }
 
 class UpdateAssignment {
@@ -114,7 +105,8 @@ class MergeStatement extends Statement {
   final String targetPath;
   final String? sourcePath; // file-path source, or
   final SelectStatement? sourceQuery; // subquery source
-  final List<String> onKeys; // equi-key column names
+  final List<String> onKeys; // equi-key column names, on the target
+  final List<String> sourceKeys; // the same keys' names on the source
   final bool matchedUpdateAll;
   final bool matchedDelete;
   final bool notMatchedInsert;
@@ -124,34 +116,15 @@ class MergeStatement extends Statement {
     this.sourcePath,
     this.sourceQuery,
     required this.onKeys,
+    List<String>? sourceKeys,
     this.matchedUpdateAll = false,
     this.matchedDelete = false,
     this.notMatchedInsert = false,
-  });
-
-  @override
-  R accept<R>(ASTVisitor<R> visitor) =>
-      throw UnsupportedError('MERGE is executed directly, not visited');
+  }) : sourceKeys = sourceKeys ?? onKeys;
 }
 
-/// CREATE TABLE statement
-class CreateTableStatement extends Statement {
-  final String tableName;
-  final List<ColumnDefinition> columns;
-  final bool ifNotExists;
-
-  CreateTableStatement({
-    required this.tableName,
-    required this.columns,
-    this.ifNotExists = false,
-  });
-
-  @override
-  R accept<R>(ASTVisitor<R> visitor) => visitor.visitCreateTableStatement(this);
-}
-
-/// CREATE VIEW statement. A view is a persisted named query — when referenced it
-/// materializes like a CTE. Executed directly by the engine (DDL), not visited.
+/// CREATE VIEW statement. A view is a persisted named query, when referenced it
+/// materializes like a CTE. Executed directly by the engine (DDL).
 class CreateViewStatement extends Statement {
   final String name;
   final List<String> columns;
@@ -166,10 +139,6 @@ class CreateViewStatement extends Statement {
     this.orReplace = false,
     this.ifNotExists = false,
   });
-
-  @override
-  R accept<R>(ASTVisitor<R> visitor) =>
-      throw UnsupportedError('CREATE VIEW is executed directly, not visited');
 }
 
 /// DROP VIEW statement. Executed directly by the engine (DDL).
@@ -178,27 +147,6 @@ class DropViewStatement extends Statement {
   final bool ifExists;
 
   DropViewStatement({required this.name, this.ifExists = false});
-
-  @override
-  R accept<R>(ASTVisitor<R> visitor) =>
-      throw UnsupportedError('DROP VIEW is executed directly, not visited');
-}
-
-/// Column definition for CREATE TABLE
-class ColumnDefinition {
-  final String name;
-  final String dataType;
-  final bool nullable;
-  final Expression? defaultValue;
-  final bool primaryKey;
-
-  ColumnDefinition({
-    required this.name,
-    required this.dataType,
-    this.nullable = true,
-    this.defaultValue,
-    this.primaryKey = false,
-  });
 }
 
 /// SELECT list item

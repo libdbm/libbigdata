@@ -16,25 +16,26 @@ around. For usage see [DATAFRAME.md](DATAFRAME.md) and [SQL.md](SQL.md).
 - [Pushdown](#pushdown)
 - [Formats layer](#formats-layer)
 - [Table formats and commit coordination](#table-formats-and-commit-coordination)
+- [Errors](#errors)
 - [Design principles](#design-principles)
 
 ## Shape of the codebase
 
-Roughly 45,500 lines of Dart under `lib/`, with a single public API in
+Roughly 52,000 lines of Dart under `lib/`, with a single public API in
 `lib/libbigdata.dart`. Everything else is under `lib/src/` and private.
 
 | Area | Share | Contents |
 |---|---|---|
-| `src/formats` | ~55% | parquet, delta, iceberg, csv, arrow, avro, json, dataset |
-| `src/sql` | ~29% | parser, ast, planner, operators, execution, exec |
-| `src/core` | ~10% | data model plus cross-cutting policy |
-| `src/api` | ~4% | `dataframe.dart`, `io_extensions.dart` |
+| `src/formats` | ~53% | parquet, delta, iceberg, csv, arrow, avro, json, dataset |
+| `src/sql` | ~30% | parser, ast, planner, operators, execution, exec |
+| `src/core` | ~12% | data model plus cross-cutting policy |
+| `src/api` | ~4% | `dataframe.dart`, `operations.dart`, `io_extensions.dart` |
 | `src/util` | <1% | parallelism, line splitting, logging config |
 
 The weighting is the main thing to take from this table. libbigdata is more a
 file-format library with a query engine attached than a query engine with
 readers attached. Parquet alone is the deepest subtree in the project, split
-into `core/`, `thrift/`, `reader/`, `writer/`, `encoding/`, `schema/` and
+into `thrift/`, `reader/`, `writer/`, `encoding/`, `schema/` and
 `filter/`.
 
 ## Data model
@@ -47,6 +48,8 @@ Table
  |- Schema -> List<Field> (name, DataType, nullable, metadata)
  `- List<Column>          (one per field, all the same length)
       |- NumericColumn -> TypedData buffer + Uint8List null bitmap
+      |- StringColumn  -> UTF-8 bytes + Int32List offsets + null bitmap
+      |- BoolColumn    -> one bit a value + null bitmap
       `- ListColumn    -> boxed List<T?> + a hasNulls flag
 ```
 
@@ -61,18 +64,30 @@ from equality and `hashCode`: the join `qualifier`, `children` for nested types,
 `precision`/`scale` for decimals, and the Iceberg field `id`. `Schema.resolve`
 fails loud on an ambiguous name rather than picking one.
 
-**`Column<T>`** (`core/column.dart`) is the abstract columnar contract:
+**`Column<T>`** (`core/column.dart`) is the sealed columnar contract:
 `length`, `hasNulls`, `operator []`, `slice`, `filter`, `toList`, `stats` and
-`memoryUsage`. There are two implementations, and the split matters:
+`memoryUsage`. It has four public types, each `abstract final`, built through
+copying factories and read through safe members:
 
 - `NumericColumn<T extends num>` is the typed path, holding one `TypedData`
   buffer plus an optional `Uint8List` null bitmap at one bit per row. Its
   per-width factories range-check before storing, because narrow typed lists
-  silently wrap on overflow rather than throwing.
-- `ListColumn<T>` is the boxed fallback for strings, nested values and anything
-  without a typed buffer. It stores only a `hasNulls` flag rather than the null
+  silently wrap on overflow rather than throwing. `buffer` and `nullBitmap`
+  are unmodifiable views.
+- `StringColumn` holds its strings as one UTF-8 buffer with an offset per row,
+  and compares and hashes the bytes without building Dart strings.
+- `BoolColumn` holds one bit a value.
+- `ListColumn<T>` is the boxed fallback for nested values and anything without
+  a typed layout. It stores only a `hasNulls` flag rather than the null
   positions, deliberately: a set of null indices would be invisible to
   `memoryUsage` and would therefore defeat spill budgeting.
+
+Each type's implementation is a vector class (`NumericVector`,
+`StringVector`, `BoolVector`, `ListVector`) in `core/column_impl.dart`, a part
+of the same library, which the package export hides. Only the vectors can
+adopt an existing buffer without copying or hand out their live buffers, so
+the readers, the kernels and the writers use them, and code outside the
+package cannot.
 
 **`Decimal`** (`core/decimal.dart`) is a `BigInt` unscaled value plus a scale.
 Columns store the unscaled value while the scale lives on the `Field`, which is
@@ -80,7 +95,7 @@ why a `Column` alone cannot render a decimal. This split is the root of a
 recurring class of bug, so decimal handling is worth touching carefully.
 
 **`Table`** (`core/table.dart`) is a name, a schema, and one column per field,
-validated on construction. Slicing is zero-copy.
+validated on construction. Slicing copies only the rows it keeps.
 
 ## Query pipeline
 
@@ -90,7 +105,7 @@ SQL text
    v  SqlParser (petitparser)
 AST                        src/sql/ast/
    |
-   v  LogicalPlanBuilder (an ASTVisitor)
+   v  LogicalPlanBuilder (a StatementVisitor and TableVisitor)
 Logical plan               src/sql/planner/logical_plan.dart
    |
    v  PushDownFilter, then PushDownProjection
@@ -105,7 +120,10 @@ RecordBatch stream
 
 `SqlEngine` (`sql/execution/sql_engine.dart`) is the entry point and owns a
 `TableCatalog`, a `SqlParser`, a `QueryPlanner` and a per-engine spill
-directory. `QueryPlanner.plan` runs the three stages above explicitly.
+directory. `QueryPlanner.plan` builds the logical plan and hands it to
+`QueryPlanner.lower`, which runs the two pushdown rules and the physical
+builder. `lower` is the single entry point for every logical plan, whether a
+statement or a DataFrame built it.
 
 The abstract execution contract does not live in `physical_plan.dart` but in
 `sql/execution/exec_core.dart`, which defines `PhysicalPlan`,
@@ -122,9 +140,9 @@ plan is a chain of `next()` calls rather than a materialized dataflow. Operators
 call into a vectorized kernel layer (`sql/exec/kernels.dart`) for the primitives:
 `gather`, `concat`, mask application.
 
-Operators are split across two locations. Scan, filter, projection and hash join
-live in `planner/physical_plan.dart`; aggregate, sort, limit and set operations
-live in `sql/operators/`, which is assembled as a single Dart library from
+Operators are split across two locations. Scan, filter and projection live in
+`planner/physical_plan.dart` (the file scan in `planner/file_scan.dart`); hash
+join, aggregate, sort, limit, sample and set operations live in `sql/operators/`, which is assembled as a single Dart library from
 `part` files under `physical_operators.dart`. The filesystem boundary there is
 finer-grained than the language boundary.
 
@@ -156,28 +174,31 @@ A `DataFrame` is a source table, a list of `Operation` nodes, and a schema. Each
 builder method returns a new DataFrame with one more operation appended; nothing
 executes.
 
-`Operation` has two methods:
-
-- `toPhysical(input, groupKeys, ctx)` folds the operation into the growing
-  physical plan, returning `null` if it cannot be a plan node.
-- `apply(table, ctx)` is the imperative fallback.
-
-`DataFrame._buildPlan` folds every operation through `toPhysical` into one
-physical plan. `GroupByOperation` produces no node of its own and instead
-stashes group keys for the following aggregate. When `toPhysical` returns
-`null`, currently only for `sample`, the plan so far is materialized, `apply`
-runs imperatively, and fusion restarts from a fresh table scan. So the accurate
-statement is one physical plan per unfusible boundary, not strictly one per
-DataFrame.
+`DataFrame._buildPlan` turns the operations into one logical plan over a scan
+of the source, in a catalog of its own, and lowers it with `QueryPlanner.lower`,
+the entry point SQL uses, so the same optimizer rules and physical builder run.
+Most operations have `Operation.lower(input)`, which returns their logical node
+(`Projection`, `Filter`, `Sort`, `Limit`, `Distinct`, `Aggregate`, `Sample`).
+`GroupByOperation` has no node of its own: its columns are the keys of the
+`AggregateOperation` that must follow it. A join or union lowers the other frame
+into the same catalog and combines the two plans into a `USING` `Join` or a
+`Union`, so a pushed filter or projection reaches both sides. `sample` lowers
+to a `Sample` node, which `PhysicalSample` runs: it buffers its input under the
+memory budget and the options' `maxMaterializedBytes` (which `_buildPlan` sets
+to the tighter of it and the caller's `maxBytes`), then emits the seeded
+partial Fisher-Yates choice of `round(n * fraction)` rows. `PushDownFilter`
+does not cross a `Sample`, since pruning its input would change the rows it
+keeps.
 
 The lazy file path works through `DataFrame.scan`, which seeds the operation
-list with a `ScanOperation`. That operation is always the plan root and throws
-if it is ever applied or folded; `_buildPlan` special-cases it into a
+list with a `ScanOperation`. That operation is always the plan root;
+`_buildPlan` registers the file as a lazy source and scans it, which lowers to a
 `PhysicalFileScan`. This is what lets `readParquet(p).filter(...).head(n)`
 stream and stop early instead of decoding the whole file.
 
-The relationship runs both ways: `SqlEngine.sql` returns a `DataFrame`, and a
-DataFrame can be registered as a SQL table.
+The relationship runs both ways: `SqlEngine.sql` returns a `DataFrame` (as a
+`Result`), and a DataFrame can be registered with SQL as a view over its
+logical plan.
 
 ## Memory, spilling and limits
 
@@ -226,14 +247,18 @@ is format-neutral. The Parquet-side file of the same name is a thin adapter that
 supplies statistics-to-bounds conversion, so core never depends on Parquet
 thrift definitions.
 
-Only Parquet uses the predicate: `ParquetReader` prunes row groups against
+Parquet uses the predicate: `ParquetReader` prunes row groups against
 per-column statistics on both the eager and streaming paths, and applies
-projection to decode fewer leaf columns. CSV and JSON apply projection only and
-rely on the plan's exact filter operator for correctness.
+projection to decode fewer leaf columns. The Delta, Iceberg and dataset scans
+also use it to skip whole files before reading them as Parquet. CSV, JSON and
+Arrow apply projection only and rely on the plan's exact filter operator for
+correctness.
 
 ## Formats layer
 
-Format dispatch is centralized in `openScan(path)` (`formats/scan.dart`), an
+Format dispatch is centralized in `openScan(path)` (`formats/scan.dart`). A
+directory holding a `_delta_log` is a Delta table and one holding
+`metadata/*.metadata.json` an Iceberg table; anything else goes through an
 extension-based switch over Parquet, CSV, JSON Lines, JSON and Arrow. It raises
 an `ArgumentError` on anything else rather than falling through to a default
 format. Every entry point routes through it.
@@ -257,7 +282,7 @@ byte-stream-split).
 ## Table formats and commit coordination
 
 Delta Lake and Iceberg both need atomic commits, so both are built on an
-injectable coordinator seam rather than a hardcoded filesystem protocol.
+injectable coordinator boundary rather than a hardcoded filesystem protocol.
 
 The shared primitive is `LocalCatalog` (`core/local_catalog.dart`), a
 lock-guarded JSON registry mapping a table key to its current version and
@@ -273,18 +298,43 @@ catalog and a backend.
 
 Both document the same honest scope, which is worth repeating here. On a bare
 filesystem the compare-and-swap window is narrowed but not closed. The
-coordinator interface exists as the injection seam for a real catalog such as
+coordinator interface exists as the injection boundary for a real catalog such as
 REST, Glue or Hive.
 
 The commit outcome taxonomy is deliberately three-valued, and callers are
 expected to distinguish the cases:
 
-- **Success.**
-- **Conflict** (`CommitConflict`, `IcebergCommitConflict`): the commit
-  definitively did not land. Retry and clean up staged files.
-- **Indeterminate** (`DeltaCommitIndeterminate`, `IcebergCommitIndeterminate`):
-  the outcome is unknown, typically a lost catalog response. Inspect the
-  pointer. Do not blindly retry, and do not delete staged files.
+- **Success**: `Ok` with the committed version.
+- **Conflict** (`Err` of `Kind.conflict`): the commit definitively did not
+  land. The writer has cleaned up its staged files; retry.
+- **Indeterminate** (`Err` of `Kind.indeterminate`): the outcome is unknown,
+  typically a lost catalog response. The writer keeps its staged files. Inspect
+  the pointer; do not blindly retry.
+
+## Errors
+
+Every public entry point that can fail in an expected way returns a
+`Result<T, ErrorDetails>` (`core/result.dart`). Internal code keeps throwing:
+an expected failure is raised as the internal `Failure` exception (carrying the
+`ErrorDetails`) where it is detected, and converted once at the public method.
+Nothing a `Result` method raises escapes it. Two conversions exist
+(`core/failure.dart`):
+
+- `capture`, for readers, writers and commits: a `Failure` keeps its kind, a
+  `FormatException` is `corrupt`, a file-system exception is `missing` or `io`,
+  a `TimeoutException` is `timeout`. Anything else, an `Error` included (a bug,
+  or a failure in caller-supplied code such as a predicate or a custom
+  coordinator), is reported as a fallback kind (`corrupt` for readers,
+  `invalid` otherwise; `unsupported` for an `UnsupportedError`) with the error
+  as the cause, and logged with its stack trace.
+- `report`, for the SQL engine and DataFrame terminals, whose input
+  (SQL text, predicate strings) is untrusted: the same, except that a
+  `FormatException` is the expression's, so `invalid`.
+
+Argument preconditions are the exception: they are checked before the
+converted body runs, so they still throw (`size <= 0`, `retain < 1`,
+`rowGroupSize <= 0`, a second `ParquetWriter.open`, `batchSize <= 0`, a
+disposed engine).
 
 ## Design principles
 
@@ -302,7 +352,7 @@ The recurring commitments in the codebase, as actually implemented:
 5. **Spill rather than fail.** Blocking operators degrade to disk past the
    memory budget.
 6. **Honest scope.** Where a guarantee cannot be made on a bare filesystem, it
-   is documented as such and an injection seam is provided instead of an
+   is documented as such and an injection boundary is provided instead of an
    implied guarantee.
 
 ## More

@@ -15,16 +15,16 @@ class Protocol {
     this.writerFeatures,
   });
 
-  factory Protocol.fromJson(Map<String, dynamic> j) => Protocol(
-    j['minReaderVersion'] as int,
-    j['minWriterVersion'] as int,
-    readerFeatures: (j['readerFeatures'] as List?)?.cast<String>(),
-    writerFeatures: (j['writerFeatures'] as List?)?.cast<String>(),
+  factory Protocol.fromJson(Map<String, dynamic> json) => Protocol(
+    json['minReaderVersion'] as int,
+    json['minWriterVersion'] as int,
+    readerFeatures: (json['readerFeatures'] as List?)?.cast<String>(),
+    writerFeatures: (json['writerFeatures'] as List?)?.cast<String>(),
   );
 
   /// Reader features this library understands (under the table-features protocol,
-  /// minReaderVersion 3). Anything outside this set — or a legacy reader version
-  /// implying an unsupported capability (v2 = column mapping) — is rejected.
+  /// minReaderVersion 3). Anything outside this set, or a legacy reader version
+  /// implying an unsupported capability (v2 = column mapping): is rejected.
   static const supportedReaderFeatures = {'deletionVectors'};
 
   /// Writer features this library understands (table-features, minWriterVersion 7).
@@ -37,15 +37,15 @@ class Protocol {
   /// `null` if this library can safely READ a table with this protocol, else a
   /// human-readable reason it cannot. Fail-closed: an unknown reader feature or a
   /// reader version implying an unsupported capability (e.g. column mapping)
-  /// would otherwise be read with ordinary name/Parquet semantics — plausible but
+  /// would otherwise be read with ordinary name/Parquet semantics: plausible but
   /// WRONG data.
   String? readerUnsupported() {
-    if (minReaderVersion <= 1) return null; // basic Parquet — fully supported
+    if (minReaderVersion <= 1) return null; // basic Parquet: fully supported
     if (minReaderVersion == 3) {
       // Table-features protocol: every listed reader feature must be recognized.
-      for (final f in readerFeatures ?? const <String>[]) {
-        if (!supportedReaderFeatures.contains(f)) {
-          return 'unsupported reader feature "$f"';
+      for (final feature in readerFeatures ?? const <String>[]) {
+        if (!supportedReaderFeatures.contains(feature)) {
+          return 'unsupported reader feature "$feature"';
         }
       }
       return null;
@@ -57,13 +57,13 @@ class Protocol {
   /// `null` if this library can safely WRITE (mutate) a table with this protocol,
   /// else why not. Mutating a table whose writer features we don't enforce (CHECK
   /// constraints, generated columns, column mapping, …) could violate its
-  /// invariants — fail closed.
+  /// invariants: fail closed.
   String? writerUnsupported() {
     if (minWriterVersion <= 2) return null; // basic + appendOnly/invariants
     if (minWriterVersion == 7) {
-      for (final f in writerFeatures ?? const <String>[]) {
-        if (!supportedWriterFeatures.contains(f)) {
-          return 'unsupported writer feature "$f"';
+      for (final feature in writerFeatures ?? const <String>[]) {
+        if (!supportedWriterFeatures.contains(feature)) {
+          return 'unsupported writer feature "$feature"';
         }
       }
       return null;
@@ -100,15 +100,15 @@ class Metadata {
     this.createdTime,
   });
 
-  factory Metadata.fromJson(Map<String, dynamic> j) => Metadata(
-    id: j['id'] as String,
-    name: j['name'] as String?,
-    schemaString: j['schemaString'] as String,
+  factory Metadata.fromJson(Map<String, dynamic> json) => Metadata(
+    id: json['id'] as String,
+    name: json['name'] as String?,
+    schemaString: json['schemaString'] as String,
     partitionColumns:
-        (j['partitionColumns'] as List?)?.cast<String>() ?? const [],
+        (json['partitionColumns'] as List?)?.cast<String>() ?? const [],
     configuration:
-        (j['configuration'] as Map?)?.cast<String, String>() ?? const {},
-    createdTime: j['createdTime'] as int?,
+        (json['configuration'] as Map?)?.cast<String, String>() ?? const {},
+    createdTime: json['createdTime'] as int?,
   );
 
   Map<String, dynamic> toJson() => {
@@ -141,13 +141,13 @@ class DeletionVectorDescriptor {
     required this.cardinality,
   });
 
-  factory DeletionVectorDescriptor.fromJson(Map<String, dynamic> j) =>
+  factory DeletionVectorDescriptor.fromJson(Map<String, dynamic> json) =>
       DeletionVectorDescriptor(
-        storageType: j['storageType'] as String,
-        pathOrInlineDv: j['pathOrInlineDv'] as String,
-        offset: j['offset'] as int?,
-        sizeInBytes: j['sizeInBytes'] as int,
-        cardinality: j['cardinality'] as int,
+        storageType: json['storageType'] as String,
+        pathOrInlineDv: json['pathOrInlineDv'] as String,
+        offset: json['offset'] as int?,
+        sizeInBytes: json['sizeInBytes'] as int,
+        cardinality: json['cardinality'] as int,
       );
 
   Map<String, dynamic> toJson() => {
@@ -179,18 +179,18 @@ class AddFile {
     this.deletionVector,
   });
 
-  factory AddFile.fromJson(Map<String, dynamic> j) => AddFile(
-    path: j['path'] as String,
+  factory AddFile.fromJson(Map<String, dynamic> json) => AddFile(
+    path: json['path'] as String,
     partitionValues:
-        (j['partitionValues'] as Map?)?.cast<String, String>() ?? const {},
-    size: (j['size'] as num?)?.toInt() ?? 0,
-    modificationTime: (j['modificationTime'] as num?)?.toInt() ?? 0,
-    dataChange: j['dataChange'] as bool? ?? true,
-    stats: j['stats'] as String?,
-    deletionVector: j['deletionVector'] == null
+        (json['partitionValues'] as Map?)?.cast<String, String>() ?? const {},
+    size: (json['size'] as num?)?.toInt() ?? 0,
+    modificationTime: (json['modificationTime'] as num?)?.toInt() ?? 0,
+    dataChange: json['dataChange'] as bool? ?? true,
+    stats: json['stats'] as String?,
+    deletionVector: json['deletionVector'] == null
         ? null
         : DeletionVectorDescriptor.fromJson(
-            (j['deletionVector'] as Map).cast<String, dynamic>(),
+            (json['deletionVector'] as Map).cast<String, dynamic>(),
           ),
   );
 
@@ -212,14 +212,14 @@ class AddFile {
       : '$path|${deletionVector!.storageType}${deletionVector!.pathOrInlineDv}'
             '@${deletionVector!.offset}';
 
-  AddFile withDeletionVector(DeletionVectorDescriptor? dv) => AddFile(
+  AddFile withDeletionVector(DeletionVectorDescriptor? vector) => AddFile(
     path: path,
     partitionValues: partitionValues,
     size: size,
     modificationTime: modificationTime,
     dataChange: dataChange,
     stats: stats,
-    deletionVector: dv,
+    deletionVector: vector,
   );
 }
 
@@ -237,14 +237,14 @@ class RemoveFile {
     this.deletionVector,
   });
 
-  factory RemoveFile.fromJson(Map<String, dynamic> j) => RemoveFile(
-    path: j['path'] as String,
-    deletionTimestamp: (j['deletionTimestamp'] as num?)?.toInt(),
-    dataChange: j['dataChange'] as bool? ?? true,
-    deletionVector: j['deletionVector'] == null
+  factory RemoveFile.fromJson(Map<String, dynamic> json) => RemoveFile(
+    path: json['path'] as String,
+    deletionTimestamp: (json['deletionTimestamp'] as num?)?.toInt(),
+    dataChange: json['dataChange'] as bool? ?? true,
+    deletionVector: json['deletionVector'] == null
         ? null
         : DeletionVectorDescriptor.fromJson(
-            (j['deletionVector'] as Map).cast<String, dynamic>(),
+            (json['deletionVector'] as Map).cast<String, dynamic>(),
           ),
   );
 

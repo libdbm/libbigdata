@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 import 'dart:math' as math;
 
+import 'byte_reader.dart';
 import 'rle_bitpacked.dart' show maxPageValues;
 
 /// Delta Binary Packed decoder for integers
@@ -9,13 +10,95 @@ class DeltaBinaryPackedDecoder {
   /// Decode delta binary packed data
   /// [bits] is the column's physical width. Delta arithmetic wraps in the TYPE's
   /// width per the spec, so an INT32 column must reconstruct with 32-bit
-  /// wrapping — the default 64 keeps INT64 (and the DELTA_*_BYTE_ARRAY length
+  /// wrapping: the default 64 keeps INT64 (and the DELTA_*_BYTE_ARRAY length
   /// streams, whose values are small and positive) exactly as before.
   static List<int> decode(Uint8List data, int count, {int bits = 64}) {
     if (data.isEmpty || count == 0) {
       return [];
     }
-    return decodeFrom(ByteReader(data), count, bits: bits);
+    return decodeFrom(
+      ByteReader(data, label: 'DELTA_BINARY_PACKED stream'),
+      count,
+      bits: bits,
+    );
+  }
+
+  /// Decode up to [count] values from [data] straight into [into] at [start],
+  /// returning how many the stream held. The typed counterpart of [decode],
+  /// with its checks: the header is validated, values past [count] are not
+  /// materialized but their bytes must be present, and [bits] sets the
+  /// wrapping width. The running value stays in a local and each miniblock is
+  /// unpacked inline from the bytes.
+  static int decodeInto(
+    Uint8List data,
+    int count,
+    Int64List into,
+    int start, {
+    int bits = 64,
+  }) {
+    if (data.isEmpty || count == 0) return 0;
+    final reader = ByteReader(data, label: 'DELTA_BINARY_PACKED stream');
+    final (
+      miniblocks: miniblocksPerBlock,
+      span: valuesPerMiniblock,
+      total: totalValues,
+    ) = _header(
+      reader,
+    );
+    var last = reader.readZigzag();
+    into[start] = last;
+    var written = 1;
+    if (totalValues <= 1) return written;
+
+    final widths = Uint8List(miniblocksPerBlock);
+    final bytes = reader.data;
+    var read = 1;
+    while (read < totalValues) {
+      final minDelta = reader.readZigzag();
+      for (var i = 0; i < miniblocksPerBlock; i++) {
+        widths[i] = _width(reader.readByte(), bits);
+      }
+      for (var i = 0; i < miniblocksPerBlock && read < totalValues; i++) {
+        final width = widths[i];
+        final span = math.min(valuesPerMiniblock, totalValues - read);
+        final want = math.min(span, count - written);
+        final size = (valuesPerMiniblock * width + 7) ~/ 8;
+        if (reader.position + size > bytes.length) {
+          throw const FormatException(
+            'Truncated DELTA_BINARY_PACKED stream: not enough bytes for '
+            'bit-packed data',
+          );
+        }
+        if (width > 56) {
+          // Rare: a delta wider than the inline buffer holds.
+          final deltas = reader.readBitPacked(valuesPerMiniblock, width);
+          for (var k = 0; k < want; k++) {
+            final value = last + minDelta + deltas[k];
+            last = bits == 64 ? value : value.toSigned(bits);
+            into[start + written++] = last;
+          }
+        } else {
+          final mask = (1 << width) - 1;
+          var position = reader.position;
+          var buffer = 0;
+          var held = 0;
+          for (var k = 0; k < want; k++) {
+            while (held < width) {
+              buffer |= bytes[position++] << held;
+              held += 8;
+            }
+            final value = last + minDelta + (buffer & mask);
+            buffer >>>= width;
+            held -= width;
+            last = bits == 64 ? value : value.toSigned(bits);
+            into[start + written++] = last;
+          }
+          reader.position += size;
+        }
+        read += span;
+      }
+    }
+    return written;
   }
 
   /// Decode a delta binary packed stream from a shared [reader], advancing its
@@ -24,166 +107,94 @@ class DeltaBinaryPackedDecoder {
   static List<int> decodeFrom(ByteReader reader, int count, {int bits = 64}) {
     // Header: block size, miniblocks per block, total value count, first value.
     // All four are untrusted ULEB128s; validate before deriving sizes from them.
-    final blockSize = reader.readUleb128();
-    final miniblocksPerBlock = reader.readUleb128();
-    final totalValues = reader.readUleb128();
-    if (miniblocksPerBlock <= 0) {
-      throw const FormatException(
-        'DELTA_BINARY_PACKED: miniblocks-per-block must be positive',
-      );
-    }
-    if (totalValues < 0 || totalValues > maxPageValues) {
-      throw FormatException(
-        'DELTA_BINARY_PACKED: implausible value count $totalValues',
-      );
-    }
-    final firstValue = reader.readZigzagVarlong();
+    final (
+      miniblocks: miniblocksPerBlock,
+      span: valuesPerMiniblock,
+      total: totalValues,
+    ) = _header(
+      reader,
+    );
+    final first = reader.readZigzag();
 
-    final values = <int>[firstValue];
+    final values = <int>[first];
     if (totalValues <= 1) {
       return values.length > count ? values.sublist(0, count) : values;
     }
 
-    final valuesPerMiniblock = blockSize ~/ miniblocksPerBlock;
-    if (valuesPerMiniblock <= 0 || valuesPerMiniblock > maxPageValues) {
-      throw FormatException(
-        'DELTA_BINARY_PACKED: implausible miniblock size $valuesPerMiniblock',
-      );
-    }
     int read = 1;
 
     // Each block: one min delta, then a bit width per miniblock, then the
     // miniblock bodies. Every present miniblock body packs exactly
     // valuesPerMiniblock values (zero-padded), so it is byte aligned.
     while (read < totalValues) {
-      final minDelta = reader.readZigzagVarlong();
-      final bitWidths = [
-        for (int i = 0; i < miniblocksPerBlock; i++) reader.readByte(),
+      final minDelta = reader.readZigzag();
+      final widths = [
+        for (int i = 0; i < miniblocksPerBlock; i++)
+          _width(reader.readByte(), bits),
       ];
 
       for (int i = 0; i < miniblocksPerBlock && read < totalValues; i++) {
-        final deltas = reader.readBitPacked(valuesPerMiniblock, bitWidths[i]);
-        for (final delta in deltas) {
-          if (read >= totalValues) break;
-          final next = values.last + minDelta + delta;
+        final width = widths[i];
+        final span = math.min(valuesPerMiniblock, totalValues - read);
+        // Only materialize up to [count]. A width-0 miniblock reads no input,
+        // so expanding it would let a few header bytes claim 2^27 values; the
+        // rest of the stream is still consumed so the reader ends at its end.
+        final want = math.min(span, count - values.length);
+        final deltas = (width == 0 || want <= 0)
+            ? null
+            : reader.readBitPacked(valuesPerMiniblock, width);
+        if (deltas == null) reader.skipBitPacked(valuesPerMiniblock, width);
+        for (int k = 0; k < want; k++) {
+          final next = values.last + minDelta + (deltas?[k] ?? 0);
           // Wrap in the column's width, mirroring the encoder: the spec makes
           // this arithmetic 2's-complement wrapping, and for INT32 the sum can
           // legitimately leave int32 range on the way back.
           values.add(bits == 64 ? next : next.toSigned(bits));
-          read++;
         }
+        read += span;
       }
     }
 
     return values.length > count ? values.sublist(0, count) : values;
   }
-}
 
-/// Helper class for reading bytes and various encodings
-class ByteReader {
-  final Uint8List data;
-  int position = 0;
-
-  ByteReader(this.data);
-
-  bool hasMore() => position < data.length;
-
-  int readByte() {
-    if (position >= data.length) {
-      throw const FormatException(
-        'Truncated DELTA_BINARY_PACKED stream: not enough bytes to read',
+  /// Read and check the stream header: block size, miniblocks per block and
+  /// total value count, all untrusted. The spec requires the block size to be
+  /// a multiple of 128 and each miniblock a multiple of 32 values. A stream
+  /// of more than one value has blocks, each with a width byte per miniblock,
+  /// so there cannot be more miniblocks than bytes left (which bounds the
+  /// width table this header sizes).
+  static ({int miniblocks, int span, int total}) _header(ByteReader reader) {
+    final block = reader.readVarint();
+    final miniblocks = reader.readVarint();
+    final total = reader.readVarint();
+    if (total < 0 || total > maxPageValues) {
+      throw FormatException(
+        'DELTA_BINARY_PACKED: implausible value count $total',
       );
     }
-    return data[position++];
-  }
-
-  /// Read ULEB128 encoded integer.
-  ///
-  /// A varint that runs off the end of the buffer is TRUNCATED input, not a
-  /// smaller number: returning the bits gathered so far handed back a
-  /// fabricated value and left the caller to misinterpret it downstream. Fail
-  /// loud, like [readByte] and [readBitPacked] in this class already do.
-  int readUleb128() {
-    int result = 0;
-    int shift = 0;
-    var terminated = false;
-
-    while (position < data.length) {
-      final byte = data[position++];
-      result |= (byte & 0x7F) << shift;
-
-      if ((byte & 0x80) == 0) {
-        terminated = true;
-        break;
-      }
-
-      shift += 7;
-      if (shift > 63) {
-        // Allow up to 64-bit integers
-        throw FormatException('ULEB128 too large');
-      }
-    }
-    if (!terminated) {
-      throw const FormatException(
-        'Truncated DELTA_BINARY_PACKED stream: a ULEB128 ran past the end of '
-        'the buffer with its continuation bit still set',
+    if (miniblocks <= 0 ||
+        (total > 1 && miniblocks > reader.data.length - reader.position) ||
+        block <= 0 ||
+        block % 128 != 0 ||
+        block > maxPageValues ||
+        block % miniblocks != 0 ||
+        (block ~/ miniblocks) % 32 != 0) {
+      throw FormatException(
+        'DELTA_BINARY_PACKED: invalid header (block size $block, '
+        '$miniblocks miniblocks)',
       );
     }
-
-    return result;
+    return (miniblocks: miniblocks, span: block ~/ miniblocks, total: total);
   }
 
-  /// Read zigzag encoded varlong
-  int readZigzagVarlong() {
-    final encoded = readUleb128();
-    // Decode zigzag: (n >>> 1) ^ -(n & 1). The shift MUST be unsigned: zigzag
-    // maps int64 onto uint64, so a value with bit 63 set reads back as a
-    // negative Dart int, and an arithmetic `>>` would smear the sign bit across
-    // the result. Reached whenever a value or delta is >= 2^62 (the encoder's
-    // `n << 1` overflows into that range) — the other zigzag decoders in this
-    // codebase (Avro, thrift compact) all use `>>>`.
-    return (encoded >>> 1) ^ -(encoded & 1);
-  }
-
-  /// Read bit-packed integers
-  List<int> readBitPacked(int count, int bitWidth) {
-    if (bitWidth == 0) {
-      return List.filled(count, 0);
+  /// A miniblock bit width, which cannot exceed the column's width [bits].
+  static int _width(int width, int bits) {
+    if (width > bits) {
+      throw FormatException(
+        'DELTA_BINARY_PACKED: bit width $width exceeds the $bits-bit type',
+      );
     }
-
-    final values = <int>[];
-    int currentByte = 0;
-    int bitsInByte = 0;
-    int currentValue = 0;
-    int bitsInValue = 0;
-
-    for (int i = 0; i < count; i++) {
-      while (bitsInValue < bitWidth) {
-        if (bitsInByte == 0) {
-          if (position >= data.length) {
-            throw const FormatException(
-              'Truncated DELTA_BINARY_PACKED stream: not enough bytes for '
-              'bit-packed data',
-            );
-          }
-          currentByte = data[position++];
-          bitsInByte = 8;
-        }
-
-        final bitsToTake = math.min(bitWidth - bitsInValue, bitsInByte);
-        final mask = (1 << bitsToTake) - 1;
-
-        currentValue |= ((currentByte & mask) << bitsInValue);
-        currentByte >>= bitsToTake;
-        bitsInByte -= bitsToTake;
-        bitsInValue += bitsToTake;
-      }
-
-      values.add(currentValue);
-      currentValue = 0;
-      bitsInValue = 0;
-    }
-
-    return values;
+    return width;
   }
 }
